@@ -40,39 +40,39 @@ export default function PerformanceChart({ data }: Props) {
   return (
     <ResponsiveContainer width="100%" height={300}>
       <LineChart data={chartData} margin={{ top: 5, right: 20, left: 5, bottom: 5 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" vertical={false} />
+        <CartesianGrid strokeDasharray="3 3" stroke="#1a2030" vertical={false} />
         <XAxis
           dataKey="date"
           tickFormatter={fmtDate}
-          tick={{ fill: '#6b7280', fontSize: 11 }}
+          tick={{ fill: '#475569', fontSize: 11 }}
           tickLine={false}
-          axisLine={{ stroke: '#1f2937' }}
+          axisLine={{ stroke: '#1a2030' }}
           interval="preserveStartEnd"
           minTickGap={60}
         />
         <YAxis
           tickFormatter={(v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`}
-          tick={{ fill: '#6b7280', fontSize: 11 }}
+          tick={{ fill: '#475569', fontSize: 11 }}
           tickLine={false}
           axisLine={false}
           width={58}
         />
-        <ReferenceLine y={0} stroke="#374151" strokeDasharray="4 2" />
+        <ReferenceLine y={0} stroke="#1e293b" strokeDasharray="4 2" />
         <Tooltip
           contentStyle={{
-            backgroundColor: '#111827',
-            border: '1px solid #374151',
+            backgroundColor: '#0d1117',
+            border: '1px solid #1a2030',
             borderRadius: 6,
             fontSize: 12,
           }}
-          labelStyle={{ color: '#9ca3af', marginBottom: 4 }}
+          labelStyle={{ color: '#64748b', marginBottom: 4 }}
           formatter={(value: number, name: string) => [
             `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`,
             name,
           ]}
           labelFormatter={fmtDate}
         />
-        <Legend wrapperStyle={{ fontSize: 12, color: '#9ca3af', paddingTop: 12 }} />
+        <Legend wrapperStyle={{ fontSize: 12, color: '#64748b', paddingTop: 12 }} />
         <Line
           type="monotone"
           dataKey="Portfolio"

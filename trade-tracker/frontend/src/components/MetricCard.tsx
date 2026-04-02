@@ -9,17 +9,45 @@ interface MetricCardProps {
 export default function MetricCard({ label, value, subValue, positive }: MetricCardProps) {
   const valueColor =
     positive == null
-      ? 'text-white'
+      ? '#e2e8f0'
       : positive
-      ? 'text-emerald-400'
-      : 'text-red-400'
+      ? '#4ade80'
+      : '#f87171'
 
   return (
-    <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
-      <p className="text-xs text-gray-500 uppercase tracking-wider mb-1.5">{label}</p>
-      <p className={`text-xl font-semibold tabular-nums ${valueColor}`}>{value ?? '—'}</p>
+    <div
+      style={{
+        backgroundColor: '#0d1117',
+        border: '1px solid #1a2030',
+        borderRadius: 8,
+        padding: '16px',
+      }}
+    >
+      <p
+        style={{
+          fontSize: 10,
+          letterSpacing: '0.08em',
+          textTransform: 'uppercase',
+          color: '#64748b',
+          marginBottom: 8,
+          fontWeight: 500,
+        }}
+      >
+        {label}
+      </p>
+      <p
+        style={{
+          fontSize: 22,
+          fontWeight: 600,
+          color: valueColor,
+          fontVariantNumeric: 'tabular-nums',
+          lineHeight: 1.2,
+        }}
+      >
+        {value ?? '—'}
+      </p>
       {subValue != null && (
-        <p className="text-xs text-gray-500 mt-1">{subValue}</p>
+        <p style={{ fontSize: 11, color: '#475569', marginTop: 4 }}>{subValue}</p>
       )}
     </div>
   )

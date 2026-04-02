@@ -147,24 +147,31 @@ export default function Dashboard() {
             <button
               onClick={syncTrades}
               disabled={syncing}
-              className="px-3 py-1.5 rounded text-xs font-medium border border-gray-700 text-gray-400 hover:text-white hover:border-gray-500 disabled:opacity-50 transition-colors"
+              className="px-3 py-1.5 rounded text-xs font-medium transition-colors disabled:opacity-50"
+              style={{ border: '1px solid #1a2030', color: '#64748b' }}
+              onMouseOver={e => { if (!syncing) (e.currentTarget as HTMLButtonElement).style.color = '#e2e8f0' }}
+              onMouseOut={e => (e.currentTarget as HTMLButtonElement).style.color = '#64748b'}
             >
               {syncing ? 'Syncing...' : '↻ Sync Trades'}
             </button>
-            {syncMsg && <p className="text-xs text-gray-500 mt-0.5">{syncMsg}</p>}
+            {syncMsg && <p className="text-xs mt-0.5" style={{ color: '#64748b' }}>{syncMsg}</p>}
           </div>
 
         {/* Period selector */}
-        <div className="flex bg-gray-900 border border-gray-800 rounded-lg p-1 gap-0.5">
+        <div
+          className="flex rounded-lg p-1 gap-0.5"
+          style={{ backgroundColor: '#0d1117', border: '1px solid #1a2030' }}
+        >
           {PERIODS.map((p) => (
             <button
               key={p.value}
               onClick={() => setPeriod(p.value)}
-              className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
+              className="px-3 py-1.5 rounded text-sm font-medium transition-colors"
+              style={
                 period === p.value
-                  ? 'bg-blue-600 text-white'
-                  : 'text-gray-400 hover:text-white'
-              }`}
+                  ? { backgroundColor: '#2563eb', color: '#fff' }
+                  : { color: '#64748b' }
+              }
             >
               {p.label}
             </button>
@@ -176,7 +183,10 @@ export default function Dashboard() {
       {/* Source + account toggles */}
       <div className="flex flex-wrap gap-2 mb-6">
         {/* Source filter */}
-        <div className="flex bg-gray-900 border border-gray-800 rounded-lg p-1 gap-0.5 text-xs">
+        <div
+          className="flex rounded-lg p-1 gap-0.5 text-xs"
+          style={{ backgroundColor: '#0d1117', border: '1px solid #1a2030' }}
+        >
           {(['all', 'ibkr', 'fidelity'] as const).map((s) => (
             <button
               key={s}
@@ -184,11 +194,12 @@ export default function Dashboard() {
                 setSourceFilter(s)
                 setSelectedAccount(null)
               }}
-              className={`px-3 py-1.5 rounded capitalize transition-colors ${
+              style={
                 sourceFilter === s && !selectedAccount
-                  ? 'bg-gray-700 text-white font-medium'
-                  : 'text-gray-400 hover:text-white'
-              }`}
+                  ? { backgroundColor: '#1e293b', color: '#e2e8f0' }
+                  : { color: '#64748b' }
+              }
+              className="px-3 py-1.5 rounded capitalize transition-colors hover:text-white font-medium"
             >
               {s === 'all' ? 'All Accounts' : s === 'ibkr' ? 'IBKR' : 'Fidelity'}
             </button>
@@ -202,14 +213,15 @@ export default function Dashboard() {
             onClick={() =>
               setSelectedAccount(selectedAccount === a.account_id ? null : a.account_id)
             }
-            className={`px-3 py-1.5 rounded-lg border text-xs transition-colors ${
+            className="px-3 py-1.5 rounded-lg text-xs transition-colors"
+            style={
               selectedAccount === a.account_id
-                ? 'bg-blue-600/20 border-blue-500/50 text-blue-300 font-medium'
-                : 'border-gray-700 text-gray-400 hover:text-white hover:border-gray-500'
-            }`}
+                ? { backgroundColor: 'rgba(59,130,246,0.15)', border: '1px solid rgba(59,130,246,0.4)', color: '#93c5fd' }
+                : { border: '1px solid #1a2030', color: '#64748b' }
+            }
           >
             {a.account_id}
-            <span className="ml-1 text-gray-600">
+            <span style={{ color: '#374151' }} className="ml-1">
               · {a.source === 'ibkr' ? 'IB' : 'Fidelity'}
             </span>
           </button>
@@ -217,7 +229,10 @@ export default function Dashboard() {
       </div>
 
       {error && (
-        <div className="bg-red-950/50 border border-red-800/50 text-red-300 px-4 py-3 rounded-lg mb-6 text-sm">
+        <div
+          className="px-4 py-3 rounded-lg mb-6 text-sm"
+          style={{ backgroundColor: 'rgba(127,29,29,0.3)', border: '1px solid rgba(185,28,28,0.4)', color: '#fca5a5' }}
+        >
           {error}
         </div>
       )}
@@ -314,13 +329,16 @@ export default function Dashboard() {
       </div>
 
       {/* Performance chart */}
-      <div className="bg-gray-900 rounded-lg border border-gray-800 p-5 mb-6">
+      <div
+        className="rounded-lg p-5 mb-6"
+        style={{ backgroundColor: '#0d1117', border: '1px solid #1a2030' }}
+      >
         <div className="flex items-center justify-between mb-4">
-          <h3 className="text-sm font-medium text-gray-200">Performance vs SPY</h3>
-          <span className="text-xs text-gray-600">Cumulative % return from period start</span>
+          <h3 className="text-sm font-medium" style={{ color: '#e2e8f0' }}>Performance vs SPY</h3>
+          <span className="text-xs" style={{ color: '#374151' }}>Cumulative % return from period start</span>
         </div>
         {chartLoading ? (
-          <div className="h-64 flex items-center justify-center text-gray-600 text-sm">
+          <div className="h-64 flex items-center justify-center text-sm" style={{ color: '#374151' }}>
             Loading...
           </div>
         ) : (
@@ -329,18 +347,21 @@ export default function Dashboard() {
       </div>
 
       {/* Open positions */}
-      <div className="bg-gray-900 rounded-lg border border-gray-800 p-5">
+      <div
+        className="rounded-lg p-5"
+        style={{ backgroundColor: '#0d1117', border: '1px solid #1a2030' }}
+      >
         <div className="flex items-center justify-between mb-4">
-          <h3 className="text-sm font-medium text-gray-200">
+          <h3 className="text-sm font-medium" style={{ color: '#e2e8f0' }}>
             Open Positions
-            <span className="ml-2 text-gray-600 font-normal">({filteredPositions.length})</span>
+            <span className="ml-2 font-normal" style={{ color: '#374151' }}>({filteredPositions.length})</span>
           </h3>
           {selectedAccount && (
-            <span className="text-xs text-blue-400">{selectedAccount}</span>
+            <span className="text-xs" style={{ color: '#60a5fa' }}>{selectedAccount}</span>
           )}
         </div>
         {loading ? (
-          <div className="text-gray-600 text-sm py-4">Loading...</div>
+          <div className="text-sm py-4" style={{ color: '#374151' }}>Loading...</div>
         ) : (
           <PositionsTable positions={filteredPositions} />
         )}

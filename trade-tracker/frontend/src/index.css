@@ -6,20 +6,33 @@ body {
   background-color: #07080d;
   color: #e2e8f0;
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Card style */
+.card {
+  background-color: #0d1117;
+  border: 1px solid #1a2030;
+  border-radius: 8px;
 }
 
 /* Scrollbar styling */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 5px;
+  height: 5px;
 }
 ::-webkit-scrollbar-track {
-  background: #111827;
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #374151;
-  border-radius: 3px;
+  background: #1e2d40;
+  border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #4b5563;
+  background: #2d3f55;
+}
+
+/* Table row hover */
+tr:hover td {
+  background-color: rgba(255,255,255,0.02);
 }
