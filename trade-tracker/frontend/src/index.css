@@ -3,17 +3,10 @@
 @tailwind utilities;
 
 body {
-  background-color: #07080d;
-  color: #e2e8f0;
+  background-color: #e8edf5;
+  color: #1a2744;
   font-family: 'Inter', system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
-}
-
-/* Card style */
-.card {
-  background-color: #0d1117;
-  border: 1px solid #1a2030;
-  border-radius: 8px;
 }
 
 /* Scrollbar styling */
@@ -25,14 +18,14 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #1e2d40;
+  background: #c4d0e0;
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #2d3f55;
+  background: #a0b0c4;
 }
 
 /* Table row hover */
 tr:hover td {
-  background-color: rgba(255,255,255,0.02);
+  background-color: rgba(37, 99, 235, 0.03);
 }

@@ -2,34 +2,34 @@ interface MetricCardProps {
   label: string
   value: string | null
   subValue?: string | null
-  /** true = green, false = red, null/undefined = white (neutral) */
+  /** true = green, false = red, null/undefined = default dark */
   positive?: boolean | null
 }
 
 export default function MetricCard({ label, value, subValue, positive }: MetricCardProps) {
   const valueColor =
     positive == null
-      ? '#e2e8f0'
+      ? '#1a2744'
       : positive
-      ? '#4ade80'
-      : '#f87171'
+      ? '#16a34a'
+      : '#dc2626'
 
   return (
     <div
       style={{
-        backgroundColor: '#0d1117',
-        border: '1px solid #1a2030',
-        borderRadius: 8,
-        padding: '16px',
+        backgroundColor: '#ffffff',
+        border: '1px solid #d0dce8',
+        borderRadius: 10,
+        padding: '16px 18px',
       }}
     >
       <p
         style={{
-          fontSize: 10,
-          letterSpacing: '0.08em',
+          fontSize: 11,
+          letterSpacing: '0.06em',
           textTransform: 'uppercase',
-          color: '#64748b',
-          marginBottom: 8,
+          color: '#6b7a99',
+          marginBottom: 6,
           fontWeight: 500,
         }}
       >
@@ -38,7 +38,7 @@ export default function MetricCard({ label, value, subValue, positive }: MetricC
       <p
         style={{
           fontSize: 22,
-          fontWeight: 600,
+          fontWeight: 700,
           color: valueColor,
           fontVariantNumeric: 'tabular-nums',
           lineHeight: 1.2,
@@ -47,7 +47,7 @@ export default function MetricCard({ label, value, subValue, positive }: MetricC
         {value ?? '—'}
       </p>
       {subValue != null && (
-        <p style={{ fontSize: 11, color: '#475569', marginTop: 4 }}>{subValue}</p>
+        <p style={{ fontSize: 11, color: '#9ca3af', marginTop: 4 }}>{subValue}</p>
       )}
     </div>
   )

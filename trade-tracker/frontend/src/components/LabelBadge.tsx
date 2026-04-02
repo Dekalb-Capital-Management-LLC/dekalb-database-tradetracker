@@ -1,16 +1,28 @@
-const COLORS: Record<string, string> = {
-  'event-driven': 'bg-purple-900/60 text-purple-300 border-purple-700/50',
-  'hedge':        'bg-yellow-900/60 text-yellow-300 border-yellow-700/50',
-  'long-term':    'bg-blue-900/60  text-blue-300  border-blue-700/50',
-  'short-term':   'bg-orange-900/60 text-orange-300 border-orange-700/50',
-  'unclassified': 'bg-gray-800     text-gray-400  border-gray-700',
+const COLORS: Record<string, { bg: string; color: string; border: string }> = {
+  'event-driven': { bg: '#f3e8ff', color: '#7c3aed', border: '#ddd6fe' },
+  'hedge':        { bg: '#fefce8', color: '#a16207', border: '#fde68a' },
+  'long-term':    { bg: '#eff6ff', color: '#1d4ed8', border: '#bfdbfe' },
+  'short-term':   { bg: '#fff7ed', color: '#c2410c', border: '#fed7aa' },
+  'unclassified': { bg: '#f8fafc', color: '#94a3b8', border: '#e2e8f0' },
 }
 
 export default function LabelBadge({ label }: { label: string | null }) {
-  if (!label) return <span className="text-gray-700 text-xs">—</span>
-  const cls = COLORS[label] ?? 'bg-gray-800 text-gray-400 border-gray-700'
+  if (!label) return <span style={{ color: '#c0ccd8', fontSize: 12 }}>—</span>
+  const c = COLORS[label] ?? { bg: '#f8fafc', color: '#94a3b8', border: '#e2e8f0' }
   return (
-    <span className={`inline-block text-xs px-2 py-0.5 rounded border ${cls} whitespace-nowrap`}>
+    <span
+      style={{
+        display: 'inline-block',
+        fontSize: 11,
+        padding: '2px 8px',
+        borderRadius: 6,
+        backgroundColor: c.bg,
+        color: c.color,
+        border: `1px solid ${c.border}`,
+        whiteSpace: 'nowrap',
+        fontWeight: 500,
+      }}
+    >
       {label}
     </span>
   )

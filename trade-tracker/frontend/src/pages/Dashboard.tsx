@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { Search, RefreshCw } from 'lucide-react'
 import type {
   AccountSummary,
   PerformancePoint,
@@ -40,10 +41,36 @@ function fmtNum(n: number | null | undefined, decimals = 2, suffix = '') {
   return `${Number(n).toFixed(decimals)}${suffix}`
 }
 
+/* ── card shell ── */
+function Card({ title, children, action }: { title: string; children: React.ReactNode; action?: React.ReactNode }) {
+  return (
+    <div
+      className="flex flex-col"
+      style={{
+        backgroundColor: '#ffffff',
+        border: '1px solid #d0dce8',
+        borderRadius: 12,
+        overflow: 'hidden',
+      }}
+    >
+      <div
+        className="flex items-center justify-between px-5 pt-4 pb-3"
+        style={{ borderBottom: '1px solid #edf2f7' }}
+      >
+        <h3 className="font-semibold text-sm" style={{ color: '#1a2744' }}>{title}</h3>
+        {action}
+      </div>
+      <div className="flex-1 overflow-auto p-5">
+        {children}
+      </div>
+    </div>
+  )
+}
+
 export default function Dashboard() {
   const [period, setPeriod] = useState<Period>('ytd')
-  const [sourceFilter, setSourceFilter] = useState<'all' | 'ibkr' | 'fidelity'>('all')
   const [selectedAccount, setSelectedAccount] = useState<string | null>(null)
+  const [symbolSearch, setSymbolSearch] = useState('')
 
   const [summary, setSummary] = useState<PortfolioSummary | null>(null)
   const [metrics, setMetrics] = useState<PortfolioMetrics | null>(null)
@@ -56,10 +83,6 @@ export default function Dashboard() {
 
   const accounts: AccountSummary[] = summary?.accounts ?? []
 
-  const visibleAccounts = accounts.filter(
-    (a) => sourceFilter === 'all' || a.source === sourceFilter
-  )
-
   const accountParam = selectedAccount ? `&account_id=${encodeURIComponent(selectedAccount)}` : ''
 
   function loadSummary() {
@@ -69,7 +92,6 @@ export default function Dashboard() {
       .finally(() => setLoading(false))
   }
 
-  // Load summary on mount + auto-refresh every 60s
   useEffect(() => {
     loadSummary()
     const id = setInterval(loadSummary, 60_000)
@@ -81,17 +103,15 @@ export default function Dashboard() {
     setSyncMsg(null)
     try {
       const res = await post<{ inserted: number; skipped: number }>('/ibkr/sync/trades')
-      setSyncMsg(`Synced: ${res.inserted} new, ${res.skipped} skipped`)
+      setSyncMsg(`${res.inserted} new, ${res.skipped} skipped`)
       await loadSummary()
     } catch (e: any) {
-      setSyncMsg(`Sync failed: ${e.message}`)
+      setSyncMsg(`Failed: ${e.message}`)
     } finally {
       setSyncing(false)
     }
   }
 
-  // Load metrics + performance when period or account changes
-  // Metrics failure is non-fatal — just show dashes, no red error bar
   useEffect(() => {
     setChartLoading(true)
     Promise.allSettled([
@@ -107,7 +127,6 @@ export default function Dashboard() {
       .finally(() => setChartLoading(false))
   }, [period, selectedAccount])
 
-  // Active account data for top-line numbers
   const activeAccount: AccountSummary | null =
     selectedAccount ? accounts.find((a) => a.account_id === selectedAccount) ?? null : null
 
@@ -117,254 +136,246 @@ export default function Dashboard() {
   const unrealizedPnl = activeAccount?.total_unrealized_pnl ?? summary?.total_unrealized_pnl
   const realizedPnl = activeAccount?.total_realized_pnl ?? summary?.total_realized_pnl
 
-  // Filter positions by source/account
   const allPositions: PositionSummary[] = summary?.positions ?? []
   const filteredPositions = allPositions.filter((p) => {
-    if (selectedAccount) return p.account_id === selectedAccount
-    if (sourceFilter !== 'all') {
-      const acct = accounts.find((a) => a.account_id === p.account_id)
-      return acct?.source === sourceFilter
-    }
-    return true
+    const matchAccount = selectedAccount ? p.account_id === selectedAccount : true
+    const matchSymbol = symbolSearch.trim()
+      ? p.symbol.toUpperCase().includes(symbolSearch.trim().toUpperCase())
+      : true
+    return matchAccount && matchSymbol
   })
 
-  return (
-    <div className="p-6 max-w-screen-xl mx-auto">
-      {/* Page header */}
-      <div className="flex items-start justify-between mb-6">
-        <div>
-          <h2 className="text-xl font-semibold text-white">Portfolio Overview</h2>
-          {summary && (
-            <p className="text-xs text-gray-500 mt-0.5">
-              As of {new Date(summary.as_of).toLocaleString()}
-            </p>
-          )}
-        </div>
+  /* ── Tab bar: Overview + per-account ── */
+  const tabs = [
+    { key: null, label: 'Overview' },
+    ...accounts.map((a) => ({ key: a.account_id, label: a.account_id })),
+  ]
 
-        <div className="flex items-center gap-3">
-          {/* Sync IBKR trades */}
-          <div className="flex flex-col items-end">
+  return (
+    <div className="flex flex-col h-full">
+      {/* Page header */}
+      <div
+        className="px-8 pt-6 pb-0 shrink-0"
+        style={{ backgroundColor: 'transparent' }}
+      >
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-2xl font-bold" style={{ color: '#1a2744' }}>Dashboard</h2>
+          <div className="flex items-center gap-3">
+            {syncMsg && (
+              <span className="text-xs" style={{ color: '#6b7a99' }}>{syncMsg}</span>
+            )}
             <button
               onClick={syncTrades}
               disabled={syncing}
-              className="px-3 py-1.5 rounded text-xs font-medium transition-colors disabled:opacity-50"
-              style={{ border: '1px solid #1a2030', color: '#64748b' }}
-              onMouseOver={e => { if (!syncing) (e.currentTarget as HTMLButtonElement).style.color = '#e2e8f0' }}
-              onMouseOut={e => (e.currentTarget as HTMLButtonElement).style.color = '#64748b'}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors disabled:opacity-50"
+              style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8', color: '#374151' }}
             >
-              {syncing ? 'Syncing...' : '↻ Sync Trades'}
+              <RefreshCw size={13} className={syncing ? 'animate-spin' : ''} />
+              {syncing ? 'Syncing...' : 'Sync Trades'}
             </button>
-            {syncMsg && <p className="text-xs mt-0.5" style={{ color: '#64748b' }}>{syncMsg}</p>}
+          </div>
+        </div>
+
+        {/* Tab bar */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1">
+            {tabs.map((tab) => {
+              const isActive = selectedAccount === tab.key
+              return (
+                <button
+                  key={tab.key ?? 'overview'}
+                  onClick={() => setSelectedAccount(tab.key)}
+                  className="px-4 py-2 text-sm font-medium transition-colors relative"
+                  style={{ color: isActive ? '#1a2744' : '#6b7a99' }}
+                >
+                  {tab.label}
+                  {isActive && (
+                    <span
+                      className="absolute bottom-0 left-0 right-0 h-0.5 rounded-t"
+                      style={{ backgroundColor: '#1a2744' }}
+                    />
+                  )}
+                </button>
+              )
+            })}
           </div>
 
-        {/* Period selector */}
-        <div
-          className="flex rounded-lg p-1 gap-0.5"
-          style={{ backgroundColor: '#0d1117', border: '1px solid #1a2030' }}
-        >
-          {PERIODS.map((p) => (
-            <button
-              key={p.value}
-              onClick={() => setPeriod(p.value)}
-              className="px-3 py-1.5 rounded text-sm font-medium transition-colors"
-              style={
-                period === p.value
-                  ? { backgroundColor: '#2563eb', color: '#fff' }
-                  : { color: '#64748b' }
-              }
+          {/* Search + period */}
+          <div className="flex items-center gap-2 mb-1">
+            {/* Period pills */}
+            <div
+              className="flex items-center rounded-lg p-0.5"
+              style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8' }}
             >
-              {p.label}
-            </button>
-          ))}
-        </div>
+              {PERIODS.map((p) => (
+                <button
+                  key={p.value}
+                  onClick={() => setPeriod(p.value)}
+                  className="px-3 py-1 rounded-md text-xs font-medium transition-colors"
+                  style={
+                    period === p.value
+                      ? { backgroundColor: '#1a2744', color: '#ffffff' }
+                      : { color: '#6b7a99' }
+                  }
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Search */}
+            <div
+              className="flex items-center gap-2 px-3 py-1.5 rounded-lg"
+              style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8', minWidth: 180 }}
+            >
+              <Search size={13} color="#9ca3af" />
+              <input
+                type="text"
+                placeholder="Search for..."
+                value={symbolSearch}
+                onChange={(e) => setSymbolSearch(e.target.value)}
+                className="text-sm bg-transparent outline-none w-full"
+                style={{ color: '#1a2744' }}
+              />
+            </div>
+          </div>
         </div>
       </div>
 
-      {/* Source + account toggles */}
-      <div className="flex flex-wrap gap-2 mb-6">
-        {/* Source filter */}
-        <div
-          className="flex rounded-lg p-1 gap-0.5 text-xs"
-          style={{ backgroundColor: '#0d1117', border: '1px solid #1a2030' }}
-        >
-          {(['all', 'ibkr', 'fidelity'] as const).map((s) => (
-            <button
-              key={s}
-              onClick={() => {
-                setSourceFilter(s)
-                setSelectedAccount(null)
-              }}
-              style={
-                sourceFilter === s && !selectedAccount
-                  ? { backgroundColor: '#1e293b', color: '#e2e8f0' }
-                  : { color: '#64748b' }
-              }
-              className="px-3 py-1.5 rounded capitalize transition-colors hover:text-white font-medium"
-            >
-              {s === 'all' ? 'All Accounts' : s === 'ibkr' ? 'IBKR' : 'Fidelity'}
-            </button>
-          ))}
-        </div>
-
-        {/* Per-account chips */}
-        {visibleAccounts.map((a) => (
-          <button
-            key={a.account_id}
-            onClick={() =>
-              setSelectedAccount(selectedAccount === a.account_id ? null : a.account_id)
-            }
-            className="px-3 py-1.5 rounded-lg text-xs transition-colors"
-            style={
-              selectedAccount === a.account_id
-                ? { backgroundColor: 'rgba(59,130,246,0.15)', border: '1px solid rgba(59,130,246,0.4)', color: '#93c5fd' }
-                : { border: '1px solid #1a2030', color: '#64748b' }
-            }
-          >
-            {a.account_id}
-            <span style={{ color: '#374151' }} className="ml-1">
-              · {a.source === 'ibkr' ? 'IB' : 'Fidelity'}
-            </span>
-          </button>
-        ))}
-      </div>
-
+      {/* Error bar */}
       {error && (
         <div
-          className="px-4 py-3 rounded-lg mb-6 text-sm"
-          style={{ backgroundColor: 'rgba(127,29,29,0.3)', border: '1px solid rgba(185,28,28,0.4)', color: '#fca5a5' }}
+          className="mx-8 mt-3 px-4 py-2.5 rounded-lg text-sm"
+          style={{ backgroundColor: '#fef2f2', border: '1px solid #fecaca', color: '#dc2626' }}
         >
           {error}
         </div>
       )}
 
-      {/* Top-line metrics row 1 */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-3">
-        <MetricCard
-          label="Portfolio Value"
-          value={loading ? '...' : (fmt$(equityValue != null ? Number(equityValue) : null) ?? '—')}
-        />
-        <MetricCard
-          label="Today's P&L"
-          value={loading ? '...' : (fmt$(dayPnl != null ? Number(dayPnl) : null) ?? '—')}
-          subValue={fmtPct(dayPnlPct != null ? Number(dayPnlPct) : null)}
-          positive={dayPnl == null ? null : Number(dayPnl) >= 0}
-        />
-        <MetricCard
-          label="Unrealized P&L"
-          value={loading ? '...' : (fmt$(unrealizedPnl != null ? Number(unrealizedPnl) : null) ?? '—')}
-          positive={unrealizedPnl == null ? null : Number(unrealizedPnl) >= 0}
-        />
-        <MetricCard
-          label="Realized P&L"
-          value={loading ? '...' : (fmt$(realizedPnl != null ? Number(realizedPnl) : null) ?? '—')}
-          positive={realizedPnl == null ? null : Number(realizedPnl) >= 0}
-        />
-        <MetricCard
-          label={`Return (${period.toUpperCase()})`}
-          value={
-            chartLoading
-              ? '...'
-              : fmtPct(metrics?.total_return_pct != null ? Number(metrics.total_return_pct) : null) ?? '—'
+      {/* 2×2 grid */}
+      <div className="flex-1 grid grid-cols-2 grid-rows-2 gap-4 p-6 pt-4 min-h-0">
+        {/* Top-left: Performance Graph */}
+        <Card
+          title="Performance Graph"
+          action={
+            <span className="text-xs" style={{ color: '#9ca3af' }}>
+              Cumulative % vs SPY
+            </span>
           }
-          subValue={
-            metrics?.spy_return_pct != null
-              ? `SPY: ${fmtPct(Number(metrics.spy_return_pct))}`
-              : undefined
-          }
-          positive={
-            metrics?.total_return_pct == null ? null : Number(metrics.total_return_pct) >= 0
-          }
-        />
-        <MetricCard
-          label="Max Drawdown"
-          value={
-            chartLoading
-              ? '...'
-              : fmtNum(metrics?.max_drawdown_pct != null ? Number(metrics.max_drawdown_pct) : null, 2, '%') ?? '—'
-          }
-          positive={false}
-        />
-      </div>
-
-      {/* Metrics row 2 */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
-        <MetricCard
-          label="Beta (vs SPY)"
-          value={
-            chartLoading
-              ? '...'
-              : fmtNum(metrics?.beta != null ? Number(metrics.beta) : null) ?? '—'
-          }
-        />
-        <MetricCard
-          label="Std Dev (Annual)"
-          value={
-            chartLoading
-              ? '...'
-              : fmtNum(metrics?.std_dev_annualized != null ? Number(metrics.std_dev_annualized) : null, 2, '%') ?? '—'
-          }
-        />
-        <MetricCard
-          label="Sharpe Ratio"
-          value={
-            chartLoading
-              ? '...'
-              : fmtNum(metrics?.sharpe_ratio != null ? Number(metrics.sharpe_ratio) : null) ?? '—'
-          }
-          positive={
-            metrics?.sharpe_ratio == null ? null : Number(metrics.sharpe_ratio) >= 1
-          }
-        />
-        <MetricCard
-          label="Win Rate"
-          value={
-            chartLoading
-              ? '...'
-              : fmtNum(metrics?.win_rate != null ? Number(metrics.win_rate) : null, 1, '%') ?? '—'
-          }
-          positive={
-            metrics?.win_rate == null ? null : Number(metrics.win_rate) >= 50
-          }
-        />
-      </div>
-
-      {/* Performance chart */}
-      <div
-        className="rounded-lg p-5 mb-6"
-        style={{ backgroundColor: '#0d1117', border: '1px solid #1a2030' }}
-      >
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-sm font-medium" style={{ color: '#e2e8f0' }}>Performance vs SPY</h3>
-          <span className="text-xs" style={{ color: '#374151' }}>Cumulative % return from period start</span>
-        </div>
-        {chartLoading ? (
-          <div className="h-64 flex items-center justify-center text-sm" style={{ color: '#374151' }}>
-            Loading...
-          </div>
-        ) : (
-          <PerformanceChart data={performance} />
-        )}
-      </div>
-
-      {/* Open positions */}
-      <div
-        className="rounded-lg p-5"
-        style={{ backgroundColor: '#0d1117', border: '1px solid #1a2030' }}
-      >
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-sm font-medium" style={{ color: '#e2e8f0' }}>
-            Open Positions
-            <span className="ml-2 font-normal" style={{ color: '#374151' }}>({filteredPositions.length})</span>
-          </h3>
-          {selectedAccount && (
-            <span className="text-xs" style={{ color: '#60a5fa' }}>{selectedAccount}</span>
+        >
+          {chartLoading ? (
+            <div className="h-full flex items-center justify-center text-sm" style={{ color: '#9ca3af' }}>
+              Loading...
+            </div>
+          ) : (
+            <PerformanceChart data={performance} />
           )}
-        </div>
-        {loading ? (
-          <div className="text-sm py-4" style={{ color: '#374151' }}>Loading...</div>
-        ) : (
-          <PositionsTable positions={filteredPositions} />
-        )}
+        </Card>
+
+        {/* Top-right: Portfolio Metrics */}
+        <Card title="Portfolio Metrics">
+          <div className="grid grid-cols-2 gap-3">
+            <MetricCard
+              label="Portfolio Value"
+              value={loading ? '...' : (fmt$(equityValue != null ? Number(equityValue) : null) ?? '—')}
+            />
+            <MetricCard
+              label="Today's P&L"
+              value={loading ? '...' : (fmt$(dayPnl != null ? Number(dayPnl) : null) ?? '—')}
+              subValue={fmtPct(dayPnlPct != null ? Number(dayPnlPct) : null)}
+              positive={dayPnl == null ? null : Number(dayPnl) >= 0}
+            />
+            <MetricCard
+              label="Unrealized P&L"
+              value={loading ? '...' : (fmt$(unrealizedPnl != null ? Number(unrealizedPnl) : null) ?? '—')}
+              positive={unrealizedPnl == null ? null : Number(unrealizedPnl) >= 0}
+            />
+            <MetricCard
+              label="Realized P&L"
+              value={loading ? '...' : (fmt$(realizedPnl != null ? Number(realizedPnl) : null) ?? '—')}
+              positive={realizedPnl == null ? null : Number(realizedPnl) >= 0}
+            />
+            <MetricCard
+              label={`Return (${period.toUpperCase()})`}
+              value={
+                chartLoading
+                  ? '...'
+                  : fmtPct(metrics?.total_return_pct != null ? Number(metrics.total_return_pct) : null) ?? '—'
+              }
+              subValue={
+                metrics?.spy_return_pct != null
+                  ? `SPY: ${fmtPct(Number(metrics.spy_return_pct))}`
+                  : undefined
+              }
+              positive={metrics?.total_return_pct == null ? null : Number(metrics.total_return_pct) >= 0}
+            />
+            <MetricCard
+              label="Max Drawdown"
+              value={
+                chartLoading
+                  ? '...'
+                  : fmtNum(metrics?.max_drawdown_pct != null ? Number(metrics.max_drawdown_pct) : null, 2, '%') ?? '—'
+              }
+              positive={false}
+            />
+          </div>
+        </Card>
+
+        {/* Bottom-left: Trade Reports */}
+        <Card title="Trade Reports">
+          <div className="grid grid-cols-2 gap-3">
+            <MetricCard
+              label="Sharpe Ratio"
+              value={
+                chartLoading
+                  ? '...'
+                  : fmtNum(metrics?.sharpe_ratio != null ? Number(metrics.sharpe_ratio) : null) ?? '—'
+              }
+              positive={metrics?.sharpe_ratio == null ? null : Number(metrics.sharpe_ratio) >= 1}
+            />
+            <MetricCard
+              label="Win Rate"
+              value={
+                chartLoading
+                  ? '...'
+                  : fmtNum(metrics?.win_rate != null ? Number(metrics.win_rate) : null, 1, '%') ?? '—'
+              }
+              positive={metrics?.win_rate == null ? null : Number(metrics.win_rate) >= 50}
+            />
+            <MetricCard
+              label="Beta (vs SPY)"
+              value={
+                chartLoading
+                  ? '...'
+                  : fmtNum(metrics?.beta != null ? Number(metrics.beta) : null) ?? '—'
+              }
+            />
+            <MetricCard
+              label="Std Dev (Annual)"
+              value={
+                chartLoading
+                  ? '...'
+                  : fmtNum(metrics?.std_dev_annualized != null ? Number(metrics.std_dev_annualized) : null, 2, '%') ?? '—'
+              }
+            />
+          </div>
+        </Card>
+
+        {/* Bottom-right: Current Positions */}
+        <Card
+          title="Current Positions"
+          action={
+            <span className="text-xs font-normal" style={{ color: '#9ca3af' }}>
+              {filteredPositions.length} open
+            </span>
+          }
+        >
+          {loading ? (
+            <div className="text-sm" style={{ color: '#9ca3af' }}>Loading...</div>
+          ) : (
+            <PositionsTable positions={filteredPositions} />
+          )}
+        </Card>
       </div>
     </div>
   )
