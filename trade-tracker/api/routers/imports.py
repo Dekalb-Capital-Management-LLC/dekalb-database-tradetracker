@@ -45,14 +45,29 @@ async def upload_fidelity_csv(
     Trades are parsed and inserted into the trades table.
     Labels are NOT set on import - use PATCH /trades/{id}/label to label them.
     """
-    if not file.filename or not file.filename.endswith(".csv"):
-        raise HTTPException(status_code=400, detail="File must be a .csv")
+    fname = (file.filename or "").lower()
+    if not (fname.endswith(".csv") or fname.endswith(".xlsx")):
+        raise HTTPException(status_code=400, detail="File must be a .csv or .xlsx")
 
     raw_bytes = await file.read()
-    try:
-        csv_text = raw_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        csv_text = raw_bytes.decode("latin-1")  # Fidelity sometimes exports latin-1
+
+    if fname.endswith(".xlsx"):
+        import io as _io
+        import openpyxl
+        wb = openpyxl.load_workbook(_io.BytesIO(raw_bytes), data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        lines = []
+        for row in rows:
+            lines.append(",".join(
+                (str(cell) if cell is not None else "") for cell in row
+            ))
+        csv_text = "\n".join(lines)
+    else:
+        try:
+            csv_text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            csv_text = raw_bytes.decode("latin-1")
 
     # Create import audit row first (we need the import_id for FK)
     import_id = await pool.fetchval(

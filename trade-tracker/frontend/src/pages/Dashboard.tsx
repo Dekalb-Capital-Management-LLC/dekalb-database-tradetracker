@@ -7,7 +7,7 @@ import type {
   PortfolioSummary,
   PositionSummary,
 } from '../types'
-import { get } from '../api/client'
+import { get, post } from '../api/client'
 import MetricCard from '../components/MetricCard'
 import PerformanceChart from '../components/PerformanceChart'
 import PositionsTable from '../components/PositionsTable'
@@ -51,6 +51,8 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [chartLoading, setChartLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [syncing, setSyncing] = useState(false)
+  const [syncMsg, setSyncMsg] = useState<string | null>(null)
 
   const accounts: AccountSummary[] = summary?.accounts ?? []
 
@@ -60,13 +62,33 @@ export default function Dashboard() {
 
   const accountParam = selectedAccount ? `&account_id=${encodeURIComponent(selectedAccount)}` : ''
 
-  // Load summary once on mount
-  useEffect(() => {
-    get<PortfolioSummary>('/portfolio/summary')
+  function loadSummary() {
+    return get<PortfolioSummary>('/portfolio/summary')
       .then(setSummary)
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
+  }
+
+  // Load summary on mount + auto-refresh every 60s
+  useEffect(() => {
+    loadSummary()
+    const id = setInterval(loadSummary, 60_000)
+    return () => clearInterval(id)
   }, [])
+
+  async function syncTrades() {
+    setSyncing(true)
+    setSyncMsg(null)
+    try {
+      const res = await post<{ inserted: number; skipped: number }>('/ibkr/sync/trades')
+      setSyncMsg(`Synced: ${res.inserted} new, ${res.skipped} skipped`)
+      await loadSummary()
+    } catch (e: any) {
+      setSyncMsg(`Sync failed: ${e.message}`)
+    } finally {
+      setSyncing(false)
+    }
+  }
 
   // Load metrics + performance when period or account changes
   // Metrics failure is non-fatal — just show dashes, no red error bar
@@ -119,6 +141,19 @@ export default function Dashboard() {
           )}
         </div>
 
+        <div className="flex items-center gap-3">
+          {/* Sync IBKR trades */}
+          <div className="flex flex-col items-end">
+            <button
+              onClick={syncTrades}
+              disabled={syncing}
+              className="px-3 py-1.5 rounded text-xs font-medium border border-gray-700 text-gray-400 hover:text-white hover:border-gray-500 disabled:opacity-50 transition-colors"
+            >
+              {syncing ? 'Syncing...' : '↻ Sync Trades'}
+            </button>
+            {syncMsg && <p className="text-xs text-gray-500 mt-0.5">{syncMsg}</p>}
+          </div>
+
         {/* Period selector */}
         <div className="flex bg-gray-900 border border-gray-800 rounded-lg p-1 gap-0.5">
           {PERIODS.map((p) => (
@@ -134,6 +169,7 @@ export default function Dashboard() {
               {p.label}
             </button>
           ))}
+        </div>
         </div>
       </div>
 

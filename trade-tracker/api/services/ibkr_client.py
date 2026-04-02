@@ -326,19 +326,20 @@ class IBKRClient:
     # ------------------------------------------------------------------
 
     def get_account_summary(self, account_id: str) -> Optional[dict]:
-        # /portfolio endpoints require /portfolio/subaccounts first
-        self._get("/portfolio/subaccounts")
+        # Must call /portfolio/accounts before other /portfolio endpoints
+        self._get("/portfolio/accounts")
         return self._get(f"/portfolio/{account_id}/summary")
 
     def get_positions(self, account_id: str) -> list[dict]:
-        self._get("/portfolio/subaccounts")
+        self._get("/portfolio/accounts")
         data = self._get(f"/portfolio/{account_id}/positions/0")
         if data is None:
             return []
         return data if isinstance(data, list) else []
 
     def get_recent_trades(self, account_id: str) -> list[dict]:
-        data = self._get("/iserver/account/trades")
+        # days=7 fetches up to 7 days of fills (IBKR max for this endpoint)
+        data = self._get("/iserver/account/trades", params={"days": 7})
         if data is None:
             return []
         return data if isinstance(data, list) else []

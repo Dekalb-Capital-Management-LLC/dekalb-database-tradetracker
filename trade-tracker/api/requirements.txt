@@ -6,8 +6,11 @@ python-multipart==0.0.9     # required for UploadFile (CSV import)
 # Database
 asyncpg==0.29.0
 
-# Market data
+# Market data (historical bars + SPY benchmark only — live prices from IBKR)
 yfinance==0.2.54
+
+# XLSX import support
+openpyxl==3.1.2
 
 # Data validation
 pydantic==2.7.1

@@ -36,7 +36,7 @@ export default function Import() {
     const setState = source === 'fidelity' ? setFidelity : setIBKR
     const endpoint = source === 'fidelity' ? '/import/fidelity' : '/import/ibkr'
 
-    if (!state.file) { setState(s => ({ ...s, error: 'Select a CSV file.' })); return }
+    if (!state.file) { setState(s => ({ ...s, error: 'Select a CSV or XLSX file.' })); return }
     if (!state.accountId.trim()) { setState(s => ({ ...s, error: 'Enter an account ID.' })); return }
 
     const form = new FormData()
@@ -63,10 +63,11 @@ export default function Import() {
         e.preventDefault()
         setState(s => ({ ...s, drag: false }))
         const dropped = e.dataTransfer.files[0]
-        if (dropped?.name.toLowerCase().endsWith('.csv')) {
+        const n = dropped?.name.toLowerCase() ?? ''
+        if (n.endsWith('.csv') || n.endsWith('.xlsx')) {
           setState(s => ({ ...s, file: dropped, error: null }))
         } else {
-          setState(s => ({ ...s, error: 'Please drop a .csv file.' }))
+          setState(s => ({ ...s, error: 'Please drop a .csv or .xlsx file.' }))
         }
       },
     }
@@ -118,7 +119,7 @@ export default function Import() {
           <input
             id={inputId}
             type="file"
-            accept=".csv"
+            accept=".csv,.xlsx"
             className="hidden"
             onChange={e => setState(s => ({ ...s, file: e.target.files?.[0] ?? null, error: null }))}
           />
@@ -130,7 +131,7 @@ export default function Import() {
             </>
           ) : (
             <>
-              <p className="text-gray-400 text-sm">Drop your CSV here</p>
+              <p className="text-gray-400 text-sm">Drop your CSV or XLSX here</p>
               <p className="text-xs text-gray-600 mt-1">or click to browse</p>
             </>
           )}
@@ -203,9 +204,12 @@ export default function Import() {
         title="Fidelity CSV"
         instructions={
           <>
+            Supports two Fidelity export formats (auto-detected):{' '}
             <span className="text-gray-400">
-              Accounts &amp; Trade → Portfolio → Activity &amp; Orders → Download
-            </span>
+              <strong className="text-gray-300">Positions snapshot</strong> — Accounts &amp; Trade → Portfolio → export positions CSV/XLSX.{' '}
+              <strong className="text-gray-300">Activity/Orders</strong> — Portfolio → Activity &amp; Orders tab → Download.
+            </span>{' '}
+            Both CSV and XLSX accepted.
           </>
         }
         accountPlaceholder="e.g. FIDELITY_MAIN or Z12345678"

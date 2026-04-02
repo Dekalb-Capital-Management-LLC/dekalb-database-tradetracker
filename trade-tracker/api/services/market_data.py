@@ -1,9 +1,9 @@
 """
 Market data service.
 
-Primary source: yfinance (free, no auth required, always available).
-IBKR path: when IBKR_ENABLED=true and authenticated via Web API OAuth,
-live prices are fetched from IBKR first with yfinance as fallback.
+Primary source: IBKR Web API (live prices via market snapshot).
+yfinance is used ONLY for historical bars (performance chart, SPY benchmark).
+Live price quotes always come from IBKR when connected.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ import yfinance as yf
 import config
 from models.schemas import HistoricalBar, PriceQuote
 
-# Spoof a browser User-Agent — Yahoo Finance blocks plain script/Docker requests
+# yfinance session with browser User-Agent (only used for historical bars)
 _yf_session = requests.Session()
 _yf_session.headers.update({
     "User-Agent": (
@@ -184,9 +184,9 @@ def _fetch_quote_ibkr(symbol: str) -> Optional[PriceQuote]:
 
 def get_quote(symbol: str) -> Optional[PriceQuote]:
     """
-    Get current price for a symbol.
-    Uses IBKR if gateway is enabled, otherwise falls back to yfinance.
+    Get current price for a symbol from IBKR.
     Results are cached for PRICE_CACHE_TTL_SECONDS.
+    yfinance is NOT used for live quotes — IBKR only.
     """
     cached = _cached_quote(symbol)
     if cached:
@@ -197,9 +197,9 @@ def get_quote(symbol: str) -> Optional[PriceQuote]:
         quote = _fetch_quote_ibkr(symbol)
         if quote:
             return quote
-        logger.warning("IBKR quote failed for %s, falling back to yfinance", symbol)
+        logger.warning("IBKR: could not get live quote for %s", symbol)
 
-    return _fetch_quote_yfinance(symbol)
+    return None
 
 
 def get_spy_history(start: date, end: date) -> list[HistoricalBar]:

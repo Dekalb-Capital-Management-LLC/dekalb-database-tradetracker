@@ -1,5 +1,32 @@
 # DeKalb Database — Monorepo
 
+---
+
+## ⚡ Quick-Start Command List (On Every Startup)
+
+Run these in order after `docker compose up --build`:
+
+```
+1. POST /ibkr/connect           ← reconnect to IBKR (auto-runs on boot, but use this if needed)
+2. POST /ibkr/sync/trades       ← pull latest fills from IBKR (last 7 days)
+3. POST /portfolio/snapshots/generate  ← generate today's NAV snapshot for performance chart
+4. GET  /portfolio/summary      ← verify everything loaded correctly
+```
+
+**One-time setup after first deploy or data reset:**
+```
+DELETE /trades/reset            ← wipe all old paper/test data (CAREFUL — irreversible)
+POST   /ibkr/sync/trades        ← pull live fills in
+POST   /import/fidelity         ← upload Fidelity CSV (positions snapshot or activity)
+POST   /portfolio/snapshots/generate  ← generate first NAV snapshot
+```
+
+**The dashboard auto-refreshes every 60 seconds. Trades auto-sync every hour.**
+
+---
+
+
+
 Backend infrastructure for DeKalb Capital. Runs on **Machine 2** (database server). Handles live trading event ingestion, portfolio storage, and the equities team's trade tracker dashboard.
 
 ---
@@ -419,6 +446,39 @@ Full interactive docs at `/docs` (Swagger UI).
 | `GET /market/spy` | SPY benchmark data |
 
 Period options: `1m`, `3m`, `6m`, `ytd`, `1y`
+
+---
+
+## 🔮 Next Steps — Member Browser Login (To Implement Later)
+
+Currently the dashboard is a single shared view with no user auth. To let each team member log in with their own browser and see their own account:
+
+### Option A — Simple Password Protection (1-2 days work)
+Add HTTP Basic Auth via nginx in front of the app. One shared password for the whole team. Simplest option, zero code changes.
+
+### Option B — Per-Member Login with IBKR OAuth (1-2 weeks work)
+Let each member authenticate with their own IBKR account via the browser. This is a real OAuth 2.0 flow — each user gets redirected to IBKR to log in, then comes back with their own session.
+
+**What needs to be built:**
+1. **User table in PostgreSQL** — map IBKR credentials to team member profiles
+2. **OAuth callback endpoint** — `GET /auth/ibkr/callback` — receives the auth code after IBKR login
+3. **Session management** — store session tokens in `ibkr_tokens` table (already exists), issue JWTs to the browser
+4. **Auth middleware on FastAPI** — protect all endpoints, extract user from JWT
+5. **Login page on frontend** — a simple page with a "Login with IBKR" button
+6. **Per-user data filtering** — trades/positions filtered by the logged-in user's account IDs
+
+**IBKR's OAuth 2.0 Browser Flow (different from what we have):**
+- What we have now: RSA key-based server-to-server auth (one fixed service account)
+- What members need: browser-based OAuth where users log in to IBKR in a popup, approve access, and get redirected back
+- IBKR calls this "Third-party OAuth 2.0" — it requires a redirect URI registered with IBKR
+- Contact IBKR API team to register a redirect URI for your Railway/Vercel URL
+
+**IBKR docs:** https://www.interactivebrokers.com/campus/ibkr-api-page/webapi-doc/
+
+**Key config needed from IBKR:**
+- A registered redirect URI: `https://YOUR-APP.vercel.app/auth/callback`
+- The OAuth 2.0 authorization endpoint URL from IBKR
+- This is a separate app registration from the current service account
 
 ---
 
