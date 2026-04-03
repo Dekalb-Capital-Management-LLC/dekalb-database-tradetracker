@@ -164,62 +164,62 @@ async def _account_summary(pool, account_id: str) -> AccountSummary:
         from services.ibkr_client import ibkr_client
         if ibkr_client.is_connected():
             try:
-                summary = ibkr_client.get_account_summary(account_id)
-                if summary:
-                    def _amt(field: str) -> Optional[Decimal]:
-                        entry = summary.get(field, {})
-                        v = entry.get("amount") if isinstance(entry, dict) else None
-                        return Decimal(str(round(v, 2))) if v is not None else None
+                # Use /ledger for accurate cash, NAV, unrealized P&L
+                ledger = ibkr_client.get_ledger(account_id)
+                base = (ledger or {}).get("BASE") or (ledger or {}).get("USD") or {}
 
-                    positions = await _compute_positions(pool, account_id)
-                    equity_value = _amt("equitywithloanvalue") or sum(
-                        (p.market_value or Decimal(0)) for p in positions
-                    )
-                    total_nav = _amt("netliquidation") or equity_value
-                    cash_balance = _amt("totalcashvalue")
-                    unrealized = _amt("unrealizedpnl") or sum(
-                        (p.unrealized_pnl or Decimal(0)) for p in positions
-                    )
+                def _f(key: str) -> Optional[Decimal]:
+                    v = base.get(key)
+                    return Decimal(str(round(float(v), 2))) if v is not None else None
 
-                    # Realized P&L still computed from trade history (IB doesn't surface this cleanly)
-                    realized_row = await pool.fetchrow(
-                        """
-                        WITH by_symbol AS (
-                            SELECT symbol,
-                                SUM(CASE WHEN side='SELL' THEN net_amount  ELSE 0 END) AS sell_proceeds,
-                                SUM(CASE WHEN side='SELL' THEN quantity     ELSE 0 END) AS sold_qty,
-                                NULLIF(SUM(CASE WHEN side='BUY' THEN quantity ELSE 0 END),0) AS total_buy_qty,
-                                SUM(CASE WHEN side='BUY' THEN gross_amount+commission ELSE 0 END) AS total_buy_cost
-                            FROM trades WHERE account_id=$1 GROUP BY symbol
-                            HAVING SUM(CASE WHEN side='SELL' THEN quantity ELSE 0 END) > 0
-                        )
-                        SELECT COALESCE(SUM(sell_proceeds - sold_qty*(total_buy_cost/total_buy_qty)),0) AS realized_pnl
-                        FROM by_symbol WHERE total_buy_qty IS NOT NULL
-                        """,
-                        account_id,
-                    )
-                    realized = Decimal(str(realized_row["realized_pnl"])).quantize(Decimal("0.01"))
+                positions = await _compute_positions(pool, account_id)
+                cash_balance  = _f("cashbalance")
+                total_nav     = _f("netliquidationvalue")
+                equity_value  = _f("stockmarketvalue") or sum(
+                    (p.market_value or Decimal(0)) for p in positions
+                )
+                unrealized    = _f("unrealizedpnl") or sum(
+                    (p.unrealized_pnl or Decimal(0)) for p in positions
+                )
 
-                    # Day P&L from snapshot (IB's daily_pnl field is unreliable via this API)
-                    snap_row = await pool.fetchrow(
-                        "SELECT daily_pnl, daily_pnl_pct FROM portfolio_snapshots "
-                        "WHERE account_id=$1 ORDER BY snapshot_date DESC LIMIT 1",
-                        account_id,
+                # Realized P&L from trade history (IB's realizedpnl resets each day)
+                realized_row = await pool.fetchrow(
+                    """
+                    WITH by_symbol AS (
+                        SELECT symbol,
+                            SUM(CASE WHEN side='SELL' THEN net_amount  ELSE 0 END) AS sell_proceeds,
+                            SUM(CASE WHEN side='SELL' THEN quantity     ELSE 0 END) AS sold_qty,
+                            NULLIF(SUM(CASE WHEN side='BUY' THEN quantity ELSE 0 END),0) AS total_buy_qty,
+                            SUM(CASE WHEN side='BUY' THEN gross_amount+commission ELSE 0 END) AS total_buy_cost
+                        FROM trades WHERE account_id=$1 GROUP BY symbol
+                        HAVING SUM(CASE WHEN side='SELL' THEN quantity ELSE 0 END) > 0
                     )
-                    source_row = await pool.fetchrow(
-                        "SELECT source FROM trades WHERE account_id=$1 LIMIT 1", account_id
-                    )
-                    return AccountSummary(
-                        account_id=account_id,
-                        source=source_row["source"] if source_row else "ibkr",
-                        total_nav=total_nav,
-                        cash_balance=cash_balance,
-                        equity_value=equity_value,
-                        day_pnl=Decimal(str(snap_row["daily_pnl"])) if snap_row and snap_row["daily_pnl"] else None,
-                        day_pnl_pct=Decimal(str(snap_row["daily_pnl_pct"])) if snap_row and snap_row["daily_pnl_pct"] else None,
-                        total_realized_pnl=realized,
-                        total_unrealized_pnl=unrealized,
-                    )
+                    SELECT COALESCE(SUM(sell_proceeds - sold_qty*(total_buy_cost/total_buy_qty)),0) AS realized_pnl
+                    FROM by_symbol WHERE total_buy_qty IS NOT NULL
+                    """,
+                    account_id,
+                )
+                realized = Decimal(str(realized_row["realized_pnl"])).quantize(Decimal("0.01"))
+
+                snap_row = await pool.fetchrow(
+                    "SELECT daily_pnl, daily_pnl_pct FROM portfolio_snapshots "
+                    "WHERE account_id=$1 ORDER BY snapshot_date DESC LIMIT 1",
+                    account_id,
+                )
+                source_row = await pool.fetchrow(
+                    "SELECT source FROM trades WHERE account_id=$1 LIMIT 1", account_id
+                )
+                return AccountSummary(
+                    account_id=account_id,
+                    source=source_row["source"] if source_row else "ibkr",
+                    total_nav=total_nav,
+                    cash_balance=cash_balance,
+                    equity_value=equity_value,
+                    day_pnl=Decimal(str(snap_row["daily_pnl"])) if snap_row and snap_row["daily_pnl"] else None,
+                    day_pnl_pct=Decimal(str(snap_row["daily_pnl_pct"])) if snap_row and snap_row["daily_pnl_pct"] else None,
+                    total_realized_pnl=realized,
+                    total_unrealized_pnl=unrealized,
+                )
             except Exception as exc:
                 logger.warning("IBKR live account summary failed, falling back: %s", exc)
 
@@ -434,25 +434,19 @@ async def get_snapshots(
 
 
 @router.post("/snapshots/backfill", tags=["portfolio"])
-async def backfill_snapshots(
-    start_date: Optional[date] = Query(None, description="Start date (default: first trade)"),
-    end_date: Optional[date] = Query(None, description="End date (default: today)"),
+async def backfill_snapshots_endpoint(
+    background_tasks,
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
     pool=Depends(get_pool),
 ):
     """
-    Generate (or regenerate) daily NAV snapshots across the full trade history.
-
-    This powers the performance graph and all portfolio metrics.
-    Run once after importing trades, then daily snapshots update automatically.
-    Uses yfinance for historical close prices — takes ~10-30 seconds for large histories.
-    Safe to re-run: existing rows are overwritten with latest data.
+    Rebuild historical NAV snapshots from trade history + yfinance prices.
+    Returns immediately — runs in background (~30s for 2 years of history).
+    Safe to re-run: ON CONFLICT DO UPDATE.
     """
-    try:
-        result = await portfolio_metrics.backfill_snapshots(pool, start_date, end_date)
-        return result
-    except Exception as exc:
-        logger.error("backfill error: %s", exc)
-        raise HTTPException(status_code=500, detail=f"Backfill failed: {exc}")
+    background_tasks.add_task(portfolio_metrics.backfill_snapshots, pool, start_date, end_date)
+    return {"status": "started", "message": "Backfill running in background. Performance graph updates in ~30s."}
 
 
 @router.post("/snapshots/generate", tags=["portfolio"])

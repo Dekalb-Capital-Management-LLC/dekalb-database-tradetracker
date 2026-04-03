@@ -330,6 +330,14 @@ class IBKRClient:
         self._get("/portfolio/accounts")
         return self._get(f"/portfolio/{account_id}/summary")
 
+    def get_ledger(self, account_id: str) -> Optional[dict]:
+        """
+        Returns per-currency balances including cashbalance, netliquidationvalue,
+        unrealizedpnl, realizedpnl. Use 'BASE' key for base-currency totals.
+        """
+        self._get("/portfolio/accounts")
+        return self._get(f"/portfolio/{account_id}/ledger")
+
     def get_positions(self, account_id: str) -> list[dict]:
         self._get("/portfolio/accounts")
         data = self._get(f"/portfolio/{account_id}/positions/0")

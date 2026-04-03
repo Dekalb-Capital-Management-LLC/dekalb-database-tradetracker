@@ -403,19 +403,16 @@ async def backfill_snapshots(
     symbols = list({r["symbol"] for r in trade_rows})
     account_ids = list({r["account_id"] for r in trade_rows})
 
-    # Batch-fetch all historical prices per symbol for the full range
-    # symbol_price_map[symbol][date] = close_price
-    symbol_price_map: dict[str, dict[date, Decimal]] = {}
-    for sym in symbols:
-        bars = get_historical_bars(sym, start, end)
-        symbol_price_map[sym] = {b.date: b.close for b in bars}
-        logger.debug("Loaded %d bars for %s", len(bars), sym)
+    # Batch-fetch ALL symbols + SPY in a single yfinance call
+    from services.market_data import get_historical_bars_batch
+    all_symbols_to_fetch = list(set(symbols + ["SPY"]))
+    logger.info("Batch-fetching %d symbols from yfinance...", len(all_symbols_to_fetch))
+    batch = get_historical_bars_batch(all_symbols_to_fetch, start, end)
 
-    # Batch-fetch SPY for the full range (one call, not one per day)
-    spy_bars = get_historical_bars("SPY", start, end)
-    spy_price_map: dict[date, Decimal] = {b.date: b.close for b in spy_bars}
+    symbol_price_map: dict[str, dict[date, Decimal]] = {s: batch.get(s, {}) for s in symbols}
+    spy_price_map: dict[date, Decimal] = batch.get("SPY", {})
     spy_dates = sorted(spy_price_map.keys())
-    logger.info("Loaded %d SPY bars", len(spy_bars))
+    logger.info("Batch fetch complete: %d SPY bars", len(spy_dates))
 
     # Build list of all calendar days in range
     all_dates: list[date] = []

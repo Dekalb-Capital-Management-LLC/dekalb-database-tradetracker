@@ -89,15 +89,12 @@ def get_historical_bars(
     end: date,
     interval: str = "1d",
 ) -> list[HistoricalBar]:
-    """
-    Fetch OHLCV bars via yfinance.
-    interval: '1d', '1wk', '1mo'  (daily is most useful for portfolio metrics)
-    """
+    """Fetch OHLCV bars via yfinance for a single symbol."""
     try:
         ticker = yf.Ticker(symbol, session=_yf_session)
         df = ticker.history(
             start=start.isoformat(),
-            end=(end + timedelta(days=1)).isoformat(),  # yfinance end is exclusive
+            end=(end + timedelta(days=1)).isoformat(),
             interval=interval,
             auto_adjust=True,
         )
@@ -117,12 +114,68 @@ def get_historical_bars(
                     volume=int(row["Volume"]),
                 )
             )
-        logger.info("Fetched %d bars for %s via yfinance", len(bars), symbol)
         return bars
 
     except Exception as exc:
         logger.error("yfinance historical error for %s: %s", symbol, exc)
         return []
+
+
+def get_historical_bars_batch(
+    symbols: list[str],
+    start: date,
+    end: date,
+) -> dict[str, dict[date, Decimal]]:
+    """
+    Fetch close prices for multiple symbols in a single yfinance call.
+    Returns {symbol: {date: close_price}}.
+    This is ~10-50x faster than individual per-symbol calls for large portfolios.
+    """
+    import pandas as pd
+
+    result: dict[str, dict[date, Decimal]] = {s: {} for s in symbols}
+    if not symbols:
+        return result
+
+    try:
+        df = yf.download(
+            symbols,
+            start=start.isoformat(),
+            end=(end + timedelta(days=1)).isoformat(),
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+        if df.empty:
+            logger.warning("Batch yfinance returned no data for %s", symbols)
+            return result
+
+        if len(symbols) == 1:
+            # Single-symbol download: flat column index
+            sym = symbols[0]
+            close_series = df["Close"] if "Close" in df.columns else None
+            if close_series is not None:
+                for ts, val in close_series.items():
+                    if not pd.isna(val):
+                        result[sym][ts.date()] = Decimal(str(round(float(val), 4)))
+        else:
+            # Multi-symbol download: MultiIndex columns ('Close', 'AAPL'), etc.
+            if isinstance(df.columns, pd.MultiIndex):
+                if "Close" in df.columns.get_level_values(0):
+                    close_df = df["Close"]
+                    for sym in symbols:
+                        if sym in close_df.columns:
+                            for ts, val in close_df[sym].items():
+                                if not pd.isna(val):
+                                    result[sym][ts.date()] = Decimal(str(round(float(val), 4)))
+
+        total = sum(len(v) for v in result.values())
+        logger.info("Batch yfinance: %d symbols, %d price points", len(symbols), total)
+
+    except Exception as exc:
+        logger.error("Batch yfinance download failed: %s", exc)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
