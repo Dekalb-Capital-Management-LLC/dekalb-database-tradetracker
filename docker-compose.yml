@@ -134,6 +134,9 @@ services:
     build: ./trade-tracker/api
     ports:
       - "8000:8000"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     environment:
       - DB_HOST=postgres
       - POSTGRES_DB=trade_tracker     # equities team's isolated database

@@ -338,6 +338,38 @@ class IBKRClient:
         self._get("/portfolio/accounts")
         return self._get(f"/portfolio/{account_id}/ledger")
 
+    def get_historical_bars(
+        self,
+        conid: int,
+        period: str = "2y",
+        bar: str = "1d",
+    ) -> list[dict]:
+        """
+        Fetch daily OHLCV history for an instrument.
+        period: '2y' | '1y' | '6m' | '3m' | '1m'
+        bar:    '1d' | '1w' | '1m'
+        Returns list of {'date': date, 'close': Decimal}
+        """
+        from datetime import timezone
+        data = self._get(
+            "/iserver/marketdata/history",
+            params={"conid": conid, "period": period, "bar": bar, "outsideRth": True},
+        )
+        if not data or "data" not in data:
+            return []
+        bars = []
+        for b in data["data"]:
+            ts_ms = b.get("t")
+            close = b.get("c")
+            if ts_ms is None or close is None:
+                continue
+            try:
+                d = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc).date()
+                bars.append({"date": d, "close": Decimal(str(round(float(close), 4)))})
+            except Exception:
+                continue
+        return bars
+
     def get_positions(self, account_id: str) -> list[dict]:
         self._get("/portfolio/accounts")
         data = self._get(f"/portfolio/{account_id}/positions/0")

@@ -127,53 +127,101 @@ def get_historical_bars_batch(
     end: date,
 ) -> dict[str, dict[date, Decimal]]:
     """
-    Fetch close prices for multiple symbols in a single yfinance call.
+    Fetch close prices for multiple symbols.
+    When IBKR is connected, uses IBKR historical bars (no external DNS needed).
+    Falls back to yfinance batch download otherwise.
     Returns {symbol: {date: close_price}}.
-    This is ~10-50x faster than individual per-symbol calls for large portfolios.
     """
-    import pandas as pd
-
     result: dict[str, dict[date, Decimal]] = {s: {} for s in symbols}
     if not symbols:
         return result
 
+    # --- IBKR path (preferred — works inside Docker, no fc.yahoo.com) ---
     try:
+        from services.ibkr_client import ibkr_client
+        if config.IBKR_ENABLED and ibkr_client.is_connected():
+            logger.info("Fetching historical bars via IBKR for %d symbols", len(symbols))
+            # Determine period string from date range
+            days = (end - start).days
+            if days <= 31:
+                period = "1m"
+            elif days <= 91:
+                period = "3m"
+            elif days <= 182:
+                period = "6m"
+            elif days <= 365:
+                period = "1y"
+            else:
+                period = "2y"
+
+            for sym in symbols:
+                try:
+                    conid = ibkr_client.get_conid(sym)
+                    if conid is None:
+                        logger.warning("IBKR: no conid for %s, will use yfinance", sym)
+                        continue
+                    bars = ibkr_client.get_historical_bars(conid, period=period)
+                    for b in bars:
+                        d = b["date"]
+                        if start <= d <= end:
+                            result[sym][d] = b["close"]
+                    logger.debug("IBKR history for %s: %d bars", sym, len(result[sym]))
+                except Exception as exc:
+                    logger.warning("IBKR history failed for %s: %s", sym, exc)
+
+            # Check how many symbols we got data for
+            covered = sum(1 for v in result.values() if v)
+            logger.info("IBKR historical: %d/%d symbols covered", covered, len(symbols))
+
+            # If we got most symbols, return (missing ones stay empty)
+            if covered >= len(symbols) * 0.7:
+                return result
+            # Otherwise fall through to yfinance for the rest
+            logger.warning("IBKR only covered %d/%d symbols, falling back to yfinance", covered, len(symbols))
+    except Exception as exc:
+        logger.warning("IBKR historical batch failed: %s, falling back to yfinance", exc)
+
+    # --- yfinance batch path (fallback) ---
+    try:
+        import pandas as pd
+        missing = [s for s in symbols if not result[s]]
+        if not missing:
+            return result
+
+        logger.info("yfinance batch for %d symbols", len(missing))
         df = yf.download(
-            symbols,
+            missing,
             start=start.isoformat(),
             end=(end + timedelta(days=1)).isoformat(),
             auto_adjust=True,
             progress=False,
-            threads=True,
+            threads=False,  # threads=False avoids spawning sessions that hit fc.yahoo.com
         )
         if df.empty:
-            logger.warning("Batch yfinance returned no data for %s", symbols)
+            logger.warning("yfinance batch returned no data")
             return result
 
-        if len(symbols) == 1:
-            # Single-symbol download: flat column index
-            sym = symbols[0]
+        if len(missing) == 1:
+            sym = missing[0]
             close_series = df["Close"] if "Close" in df.columns else None
             if close_series is not None:
                 for ts, val in close_series.items():
                     if not pd.isna(val):
                         result[sym][ts.date()] = Decimal(str(round(float(val), 4)))
         else:
-            # Multi-symbol download: MultiIndex columns ('Close', 'AAPL'), etc.
-            if isinstance(df.columns, pd.MultiIndex):
-                if "Close" in df.columns.get_level_values(0):
-                    close_df = df["Close"]
-                    for sym in symbols:
-                        if sym in close_df.columns:
-                            for ts, val in close_df[sym].items():
-                                if not pd.isna(val):
-                                    result[sym][ts.date()] = Decimal(str(round(float(val), 4)))
+            if isinstance(df.columns, pd.MultiIndex) and "Close" in df.columns.get_level_values(0):
+                close_df = df["Close"]
+                for sym in missing:
+                    if sym in close_df.columns:
+                        for ts, val in close_df[sym].items():
+                            if not pd.isna(val):
+                                result[sym][ts.date()] = Decimal(str(round(float(val), 4)))
 
         total = sum(len(v) for v in result.values())
-        logger.info("Batch yfinance: %d symbols, %d price points", len(symbols), total)
+        logger.info("After yfinance: %d total price points across %d symbols", total, len(symbols))
 
     except Exception as exc:
-        logger.error("Batch yfinance download failed: %s", exc)
+        logger.error("yfinance batch failed: %s", exc)
 
     return result
 
