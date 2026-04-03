@@ -102,12 +102,29 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
 
 
 async def _account_summary(pool, account_id: str) -> AccountSummary:
-    # Realized P&L: net of all closed sell amounts minus cost basis
+    # Realized P&L: for each symbol, (sell proceeds) - (avg_cost × sold_qty).
+    # Only counts shares that have actually been sold.
+    # avg_cost is weighted average of all buy fills for that symbol.
     realized_row = await pool.fetchrow(
         """
-        SELECT COALESCE(SUM(CASE WHEN side = 'SELL' THEN net_amount ELSE -net_amount END), 0) AS realized_pnl
-        FROM trades
-        WHERE account_id = $1
+        WITH by_symbol AS (
+            SELECT
+                symbol,
+                SUM(CASE WHEN side = 'SELL' THEN net_amount  ELSE 0 END) AS sell_proceeds,
+                SUM(CASE WHEN side = 'SELL' THEN quantity     ELSE 0 END) AS sold_qty,
+                NULLIF(SUM(CASE WHEN side = 'BUY' THEN quantity ELSE 0 END), 0) AS total_buy_qty,
+                SUM(CASE WHEN side = 'BUY' THEN gross_amount + commission ELSE 0 END) AS total_buy_cost
+            FROM trades
+            WHERE account_id = $1
+            GROUP BY symbol
+            HAVING SUM(CASE WHEN side = 'SELL' THEN quantity ELSE 0 END) > 0
+        )
+        SELECT COALESCE(
+            SUM(sell_proceeds - sold_qty * (total_buy_cost / total_buy_qty)),
+            0
+        ) AS realized_pnl
+        FROM by_symbol
+        WHERE total_buy_qty IS NOT NULL
         """,
         account_id,
     )
@@ -292,6 +309,28 @@ async def get_snapshots(
     except Exception as exc:
         logger.error("snapshots error: %s", exc)
         raise HTTPException(status_code=500, detail="Error fetching snapshots")
+
+
+@router.post("/snapshots/backfill", tags=["portfolio"])
+async def backfill_snapshots(
+    start_date: Optional[date] = Query(None, description="Start date (default: first trade)"),
+    end_date: Optional[date] = Query(None, description="End date (default: today)"),
+    pool=Depends(get_pool),
+):
+    """
+    Generate (or regenerate) daily NAV snapshots across the full trade history.
+
+    This powers the performance graph and all portfolio metrics.
+    Run once after importing trades, then daily snapshots update automatically.
+    Uses yfinance for historical close prices — takes ~10-30 seconds for large histories.
+    Safe to re-run: existing rows are overwritten with latest data.
+    """
+    try:
+        result = await portfolio_metrics.backfill_snapshots(pool, start_date, end_date)
+        return result
+    except Exception as exc:
+        logger.error("backfill error: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Backfill failed: {exc}")
 
 
 @router.post("/snapshots/generate", tags=["portfolio"])

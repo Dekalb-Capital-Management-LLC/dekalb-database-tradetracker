@@ -184,9 +184,9 @@ def _fetch_quote_ibkr(symbol: str) -> Optional[PriceQuote]:
 
 def get_quote(symbol: str) -> Optional[PriceQuote]:
     """
-    Get current price for a symbol from IBKR.
+    Get current price for a symbol.
+    Priority: cache → IBKR (if enabled) → yfinance fallback.
     Results are cached for PRICE_CACHE_TTL_SECONDS.
-    yfinance is NOT used for live quotes — IBKR only.
     """
     cached = _cached_quote(symbol)
     if cached:
@@ -197,9 +197,10 @@ def get_quote(symbol: str) -> Optional[PriceQuote]:
         quote = _fetch_quote_ibkr(symbol)
         if quote:
             return quote
-        logger.warning("IBKR: could not get live quote for %s", symbol)
+        logger.warning("IBKR quote failed for %s, falling back to yfinance", symbol)
 
-    return None
+    # Always fall back to yfinance so portfolio values work without IBKR
+    return _fetch_quote_yfinance(symbol)
 
 
 def get_spy_history(start: date, end: date) -> list[HistoricalBar]:

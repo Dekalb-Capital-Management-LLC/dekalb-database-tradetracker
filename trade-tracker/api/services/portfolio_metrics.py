@@ -353,6 +353,155 @@ async def calculate_metrics(
     )
 
 
+async def backfill_snapshots(
+    pool: asyncpg.Pool,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+) -> dict:
+    """
+    Generate daily historical portfolio NAV snapshots from trade history + yfinance prices.
+    This is what powers the performance graph.
+
+    Algorithm:
+      1. Walk through each trading day from first trade to today
+      2. Maintain running positions per account as trades are applied
+      3. For each day, fetch historical close prices from yfinance
+      4. NAV = SUM(qty × close_price) for all open positions
+      5. Upsert snapshot rows (safe to re-run — ON CONFLICT DO UPDATE)
+    """
+    from services.market_data import get_historical_bars
+
+    # Date range
+    first_trade_date = await pool.fetchval(
+        "SELECT MIN(trade_date::date) FROM trades"
+    )
+    if not first_trade_date:
+        return {"error": "No trades found"}
+
+    start = start_date or first_trade_date
+    end = end_date or date.today()
+
+    logger.info("Backfilling snapshots from %s to %s", start, end)
+
+    # Load all trades sorted by date
+    trade_rows = await pool.fetch(
+        """
+        SELECT account_id, symbol, side,
+               quantity::float AS quantity,
+               trade_date::date AS trade_date
+        FROM trades
+        ORDER BY trade_date ASC, id ASC
+        """
+    )
+    if not trade_rows:
+        return {"error": "No trades to process"}
+
+    # All unique symbols and accounts
+    symbols = list({r["symbol"] for r in trade_rows})
+    account_ids = list({r["account_id"] for r in trade_rows})
+
+    # Batch-fetch all historical prices per symbol for the full range
+    # symbol_price_map[symbol][date] = close_price
+    symbol_price_map: dict[str, dict[date, Decimal]] = {}
+    for sym in symbols:
+        bars = get_historical_bars(sym, start, end)
+        symbol_price_map[sym] = {b.date: b.close for b in bars}
+        logger.debug("Loaded %d bars for %s", len(bars), sym)
+
+    # Build list of all calendar days in range
+    all_dates: list[date] = []
+    cur = start
+    while cur <= end:
+        all_dates.append(cur)
+        cur += timedelta(days=1)
+
+    # Group trades by account
+    trades_by_account: dict[str, list] = {a: [] for a in account_ids}
+    for r in trade_rows:
+        trades_by_account[r["account_id"]].append(r)
+
+    snapshots_written = 0
+
+    for acct_id in account_ids:
+        acct_trades = trades_by_account[acct_id]
+        positions: dict[str, float] = {}  # symbol -> net qty
+        trade_idx = 0
+        prev_nav: Optional[Decimal] = None
+
+        for d in all_dates:
+            # Apply all trades on or before this date
+            while trade_idx < len(acct_trades) and acct_trades[trade_idx]["trade_date"] <= d:
+                t = acct_trades[trade_idx]
+                sym = t["symbol"]
+                qty = float(t["quantity"])
+                if t["side"] == "BUY":
+                    positions[sym] = positions.get(sym, 0.0) + qty
+                else:
+                    positions[sym] = positions.get(sym, 0.0) - qty
+                trade_idx += 1
+
+            # Compute NAV for this day
+            nav = Decimal("0")
+            any_price = False
+            for sym, qty in positions.items():
+                if qty <= 0.00001:
+                    continue
+                px = symbol_price_map.get(sym, {}).get(d)
+                if px:
+                    nav += Decimal(str(round(qty, 6))) * px
+                    any_price = True
+
+            if not any_price:
+                # Weekend / market holiday with no prices — skip to avoid zero-value noise
+                continue
+
+            await upsert_snapshot(
+                pool=pool,
+                snapshot_date=d,
+                total_nav=nav.quantize(Decimal("0.01")),
+                account_id=acct_id,
+                equity_value=nav.quantize(Decimal("0.01")),
+                prev_nav=prev_nav,
+            )
+            prev_nav = nav
+            snapshots_written += 1
+
+    # Combined snapshot: sum of all accounts for each date
+    combined_rows = await pool.fetch(
+        """
+        SELECT snapshot_date, SUM(total_nav) AS combined_nav
+        FROM portfolio_snapshots
+        WHERE account_id IS NOT NULL
+          AND snapshot_date BETWEEN $1 AND $2
+        GROUP BY snapshot_date
+        ORDER BY snapshot_date ASC
+        """,
+        start, end,
+    )
+    prev_combined: Optional[Decimal] = None
+    for row in combined_rows:
+        nav = Decimal(str(row["combined_nav"]))
+        await upsert_snapshot(
+            pool=pool,
+            snapshot_date=row["snapshot_date"],
+            total_nav=nav,
+            account_id=None,
+            equity_value=nav,
+            prev_nav=prev_combined,
+        )
+        prev_combined = nav
+        snapshots_written += 1
+
+    logger.info("Backfill complete: %d snapshots written", snapshots_written)
+    return {
+        "start": str(start),
+        "end": str(end),
+        "accounts": account_ids,
+        "symbols": len(symbols),
+        "snapshots_written": snapshots_written,
+    }
+
+
 async def _calculate_win_rate(
     pool: asyncpg.Pool,
     start: date,

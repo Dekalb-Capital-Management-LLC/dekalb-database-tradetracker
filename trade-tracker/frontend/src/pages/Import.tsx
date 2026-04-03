@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
-import { Upload } from 'lucide-react'
+import { Upload, RefreshCw } from 'lucide-react'
 import type { FidelityImport } from '../types'
-import { get, postForm } from '../api/client'
+import { get, post, postForm } from '../api/client'
 
 type ImportSource = 'fidelity' | 'ibkr'
 
@@ -28,9 +28,27 @@ export default function Import() {
   const [ibkr, setIBKR] = useState<UploadState>(defaultState())
   const [imports, setImports] = useState<FidelityImport[]>([])
 
+  const [backfilling, setBackfilling] = useState(false)
+  const [backfillMsg, setBackfillMsg] = useState<string | null>(null)
+
   useEffect(() => {
-    get<FidelityImport[]>('/import/fidelity').then(setImports).catch(() => {})
+    get<FidelityImport[]>('/import/history').then(setImports).catch(() => {})
   }, [])
+
+  async function runBackfill() {
+    setBackfilling(true)
+    setBackfillMsg(null)
+    try {
+      const res = await post<{ snapshots_written: number; start: string; end: string }>(
+        '/portfolio/snapshots/backfill'
+      )
+      setBackfillMsg(`Done — ${res.snapshots_written} snapshots written (${res.start} → ${res.end})`)
+    } catch (e: any) {
+      setBackfillMsg(`Failed: ${e.message}`)
+    } finally {
+      setBackfilling(false)
+    }
+  }
 
   async function handleUpload(source: ImportSource) {
     const state = source === 'fidelity' ? fidelity : ibkr
@@ -49,7 +67,7 @@ export default function Import() {
     try {
       const res = await postForm<FidelityImport>(endpoint, form)
       setState(s => ({ ...s, result: res, file: null, uploading: false }))
-      const updated = await get<FidelityImport[]>('/import/fidelity')
+      const updated = await get<FidelityImport[]>('/import/history')
       setImports(updated)
     } catch (e: any) {
       setState(s => ({ ...s, error: e.message, uploading: false }))
@@ -226,6 +244,35 @@ export default function Import() {
         accountPlaceholder="e.g. FIDELITY_MAIN or Z12345678"
         inputId="fidelity-file-input"
       />
+
+      {/* Rebuild performance graph */}
+      <div
+        className="rounded-xl p-5 mb-5"
+        style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8' }}
+      >
+        <h3 className="text-sm font-semibold mb-1" style={{ color: '#1a2744' }}>
+          Rebuild Performance Graph
+        </h3>
+        <p className="text-xs mb-4" style={{ color: '#9ca3af' }}>
+          After uploading CSVs, run this to generate the historical NAV series that powers the
+          performance chart and all portfolio metrics. Takes ~30 seconds. Also runs automatically
+          after each upload.
+        </p>
+        <button
+          onClick={runBackfill}
+          disabled={backfilling}
+          className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+          style={{ backgroundColor: '#1a2744', color: '#ffffff' }}
+        >
+          <RefreshCw size={14} className={backfilling ? 'animate-spin' : ''} />
+          {backfilling ? 'Rebuilding...' : 'Rebuild Now'}
+        </button>
+        {backfillMsg && (
+          <p className="text-xs mt-3" style={{ color: backfillMsg.startsWith('Failed') ? '#dc2626' : '#16a34a' }}>
+            {backfillMsg}
+          </p>
+        )}
+      </div>
 
       {/* Import history */}
       <div

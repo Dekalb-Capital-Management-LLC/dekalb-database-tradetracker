@@ -240,6 +240,11 @@ async def _sync_ibkr_trades(pool) -> dict:
 
 
 @router.post("/sync/trades", summary="Pull recent IBKR fills into trades table (also runs automatically every hour)")
-async def sync_recent_trades(pool=Depends(get_pool)):
+async def sync_recent_trades(background_tasks, pool=Depends(get_pool)):
     _require_ibkr()
-    return await _sync_ibkr_trades(pool)
+    result = await _sync_ibkr_trades(pool)
+    # Refresh today's snapshot after sync so dashboard numbers update
+    if result.get("inserted", 0) > 0:
+        from services.portfolio_metrics import backfill_snapshots
+        background_tasks.add_task(backfill_snapshots, pool)
+    return result
