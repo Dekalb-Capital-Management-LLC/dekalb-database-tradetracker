@@ -41,12 +41,66 @@ def get_pool():
 
 async def _compute_positions(pool, account_id: Optional[str] = None) -> list[PositionSummary]:
     """
-    Derive current positions from the trades table using FIFO-style quantity netting.
-    BUY adds quantity, SELL subtracts.
-    Also calculates avg_cost as weighted average of buy fills.
+    Derive current positions.
+    When IBKR is connected and account_id matches the IBKR account, uses live
+    IBKR position data (accurate prices, cost basis from IB).
+    Otherwise falls back to computing from trades × yfinance prices.
     """
-    condition = "AND account_id = $1" if account_id else ""
-    params = [account_id] if account_id else []
+    # --- IBKR live path ---
+    if (
+        config.IBKR_ENABLED
+        and account_id
+        and account_id == config.IBKR_ACCOUNT_ID
+    ):
+        from services.ibkr_client import ibkr_client
+        if ibkr_client.is_connected():
+            try:
+                raw = ibkr_client.get_positions(account_id)
+                positions: list[PositionSummary] = []
+                for p in raw:
+                    qty = p.get("position", 0)
+                    if not qty or abs(qty) < 0.00001:
+                        continue
+                    symbol = (p.get("ticker") or p.get("contractDesc") or "").upper().strip()
+                    if not symbol:
+                        continue
+                    avg_cost = p.get("avgCost")
+                    mkt_price = p.get("mktPrice")
+                    mkt_value = p.get("mktValue")
+                    unreal = p.get("unrealizedPnl")
+
+                    qty_d = Decimal(str(qty))
+                    avg_d = Decimal(str(avg_cost)).quantize(Decimal("0.0001")) if avg_cost else None
+                    price_d = Decimal(str(mkt_price)).quantize(Decimal("0.0001")) if mkt_price else None
+                    mktval_d = Decimal(str(mkt_value)).quantize(Decimal("0.01")) if mkt_value else None
+                    unreal_d = Decimal(str(unreal)).quantize(Decimal("0.01")) if unreal is not None else None
+
+                    cost_basis = (qty_d * avg_d).quantize(Decimal("0.01")) if avg_d else None
+                    unreal_pct = None
+                    if unreal_d is not None and cost_basis and cost_basis != 0:
+                        unreal_pct = (unreal_d / abs(cost_basis) * 100).quantize(Decimal("0.0001"))
+
+                    # pull label from trades table
+                    label_row = await pool.fetchrow(
+                        "SELECT MAX(label) AS label FROM trades WHERE account_id=$1 AND symbol=$2",
+                        account_id, symbol,
+                    )
+                    positions.append(PositionSummary(
+                        symbol=symbol,
+                        account_id=account_id,
+                        quantity=qty_d,
+                        avg_cost=avg_d,
+                        current_price=price_d,
+                        market_value=mktval_d,
+                        unrealized_pnl=unreal_d,
+                        unrealized_pnl_pct=unreal_pct,
+                        label=label_row["label"] if label_row else None,
+                    ))
+                return positions
+            except Exception as exc:
+                logger.warning("IBKR live positions failed, falling back to trades: %s", exc)
+
+    # --- Trades + price fallback ---
 
     rows = await pool.fetch(
         f"""
@@ -102,6 +156,74 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
 
 
 async def _account_summary(pool, account_id: str) -> AccountSummary:
+    # --- IBKR live account data path ---
+    if (
+        config.IBKR_ENABLED
+        and account_id == config.IBKR_ACCOUNT_ID
+    ):
+        from services.ibkr_client import ibkr_client
+        if ibkr_client.is_connected():
+            try:
+                summary = ibkr_client.get_account_summary(account_id)
+                if summary:
+                    def _amt(field: str) -> Optional[Decimal]:
+                        entry = summary.get(field, {})
+                        v = entry.get("amount") if isinstance(entry, dict) else None
+                        return Decimal(str(round(v, 2))) if v is not None else None
+
+                    positions = await _compute_positions(pool, account_id)
+                    equity_value = _amt("equitywithloanvalue") or sum(
+                        (p.market_value or Decimal(0)) for p in positions
+                    )
+                    total_nav = _amt("netliquidation") or equity_value
+                    cash_balance = _amt("totalcashvalue")
+                    unrealized = _amt("unrealizedpnl") or sum(
+                        (p.unrealized_pnl or Decimal(0)) for p in positions
+                    )
+
+                    # Realized P&L still computed from trade history (IB doesn't surface this cleanly)
+                    realized_row = await pool.fetchrow(
+                        """
+                        WITH by_symbol AS (
+                            SELECT symbol,
+                                SUM(CASE WHEN side='SELL' THEN net_amount  ELSE 0 END) AS sell_proceeds,
+                                SUM(CASE WHEN side='SELL' THEN quantity     ELSE 0 END) AS sold_qty,
+                                NULLIF(SUM(CASE WHEN side='BUY' THEN quantity ELSE 0 END),0) AS total_buy_qty,
+                                SUM(CASE WHEN side='BUY' THEN gross_amount+commission ELSE 0 END) AS total_buy_cost
+                            FROM trades WHERE account_id=$1 GROUP BY symbol
+                            HAVING SUM(CASE WHEN side='SELL' THEN quantity ELSE 0 END) > 0
+                        )
+                        SELECT COALESCE(SUM(sell_proceeds - sold_qty*(total_buy_cost/total_buy_qty)),0) AS realized_pnl
+                        FROM by_symbol WHERE total_buy_qty IS NOT NULL
+                        """,
+                        account_id,
+                    )
+                    realized = Decimal(str(realized_row["realized_pnl"])).quantize(Decimal("0.01"))
+
+                    # Day P&L from snapshot (IB's daily_pnl field is unreliable via this API)
+                    snap_row = await pool.fetchrow(
+                        "SELECT daily_pnl, daily_pnl_pct FROM portfolio_snapshots "
+                        "WHERE account_id=$1 ORDER BY snapshot_date DESC LIMIT 1",
+                        account_id,
+                    )
+                    source_row = await pool.fetchrow(
+                        "SELECT source FROM trades WHERE account_id=$1 LIMIT 1", account_id
+                    )
+                    return AccountSummary(
+                        account_id=account_id,
+                        source=source_row["source"] if source_row else "ibkr",
+                        total_nav=total_nav,
+                        cash_balance=cash_balance,
+                        equity_value=equity_value,
+                        day_pnl=Decimal(str(snap_row["daily_pnl"])) if snap_row and snap_row["daily_pnl"] else None,
+                        day_pnl_pct=Decimal(str(snap_row["daily_pnl_pct"])) if snap_row and snap_row["daily_pnl_pct"] else None,
+                        total_realized_pnl=realized,
+                        total_unrealized_pnl=unrealized,
+                    )
+            except Exception as exc:
+                logger.warning("IBKR live account summary failed, falling back: %s", exc)
+
+    # --- Trades-based fallback ---
     # Realized P&L: for each symbol, (sell proceeds) - (avg_cost × sold_qty).
     # Only counts shares that have actually been sold.
     # avg_cost is weighted average of all buy fills for that symbol.
@@ -386,6 +508,20 @@ async def generate_snapshot(
 
             # For NAV: equity + (cash is unknown unless IBKR gateway is on, so use equity as proxy)
             nav = equity
+
+            # If IBKR connected, pull live NAV instead of equity-only
+            if config.IBKR_ENABLED and acct_id == config.IBKR_ACCOUNT_ID:
+                from services.ibkr_client import ibkr_client as _ibkr
+                if _ibkr.is_connected():
+                    try:
+                        acct_data = _ibkr.get_account_summary(acct_id)
+                        if acct_data:
+                            live_nav = acct_data.get("netliquidation", {}).get("amount")
+                            if live_nav:
+                                nav = Decimal(str(round(live_nav, 2)))
+                                equity = nav
+                    except Exception as _e:
+                        logger.warning("Could not fetch live NAV from IBKR: %s", _e)
 
             await upsert_snapshot(
                 pool=pool,

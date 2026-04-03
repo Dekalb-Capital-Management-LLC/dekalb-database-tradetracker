@@ -128,16 +128,28 @@ async def upsert_snapshot(
     cash_balance: Optional[Decimal] = None,
     equity_value: Optional[Decimal] = None,
     prev_nav: Optional[Decimal] = None,
+    spy_close: Optional[Decimal] = None,         # pre-fetched by backfill (batch)
+    spy_prev_close: Optional[Decimal] = None,    # pre-fetched by backfill (batch)
 ) -> None:
     """
     Upsert a portfolio NAV snapshot.
-    Also fetches SPY close for the date and stores it for overlay calculations.
+    spy_close / spy_prev_close can be pre-fetched by the caller (backfill does this in batch).
+    If not provided, fetches from yfinance individually.
     """
     from services.market_data import get_historical_bars
 
-    # Get SPY data for this date
-    spy_bars = get_historical_bars("SPY", snapshot_date, snapshot_date)
-    spy_close = Decimal(str(spy_bars[0].close)) if spy_bars else None
+    # Use pre-fetched SPY if provided; otherwise fetch individually (single-date use)
+    if spy_close is None:
+        spy_bars = get_historical_bars("SPY", snapshot_date, snapshot_date)
+        spy_close = Decimal(str(spy_bars[0].close)) if spy_bars else None
+
+    if spy_prev_close is None and spy_close is not None:
+        prev_spy_bars = get_historical_bars(
+            "SPY",
+            snapshot_date - timedelta(days=5),
+            snapshot_date - timedelta(days=1),
+        )
+        spy_prev_close = Decimal(str(prev_spy_bars[-1].close)) if prev_spy_bars else None
 
     daily_pnl: Optional[Decimal] = None
     daily_pnl_pct: Optional[Decimal] = None
@@ -145,20 +157,11 @@ async def upsert_snapshot(
         daily_pnl = total_nav - prev_nav
         daily_pnl_pct = (daily_pnl / prev_nav * 100).quantize(Decimal("0.000001"))
 
-    # Fetch previous SPY close to calculate daily pct
     spy_daily_pct: Optional[Decimal] = None
-    if spy_close:
-        prev_spy_bars = get_historical_bars(
-            "SPY",
-            snapshot_date - timedelta(days=5),  # look back enough to find last trading day
-            snapshot_date - timedelta(days=1),
-        )
-        if prev_spy_bars:
-            prev_spy_close = prev_spy_bars[-1].close
-            if prev_spy_close > 0:
-                spy_daily_pct = (
-                    (spy_close - prev_spy_close) / prev_spy_close * 100
-                ).quantize(Decimal("0.000001"))
+    if spy_close and spy_prev_close and spy_prev_close > 0:
+        spy_daily_pct = (
+            (spy_close - spy_prev_close) / spy_prev_close * 100
+        ).quantize(Decimal("0.000001"))
 
     # ON CONFLICT must reference different partial indexes depending on whether
     # account_id is NULL (combined portfolio) or NOT NULL (per-account).
@@ -408,6 +411,12 @@ async def backfill_snapshots(
         symbol_price_map[sym] = {b.date: b.close for b in bars}
         logger.debug("Loaded %d bars for %s", len(bars), sym)
 
+    # Batch-fetch SPY for the full range (one call, not one per day)
+    spy_bars = get_historical_bars("SPY", start, end)
+    spy_price_map: dict[date, Decimal] = {b.date: b.close for b in spy_bars}
+    spy_dates = sorted(spy_price_map.keys())
+    logger.info("Loaded %d SPY bars", len(spy_bars))
+
     # Build list of all calendar days in range
     all_dates: list[date] = []
     cur = start
@@ -455,6 +464,15 @@ async def backfill_snapshots(
                 # Weekend / market holiday with no prices — skip to avoid zero-value noise
                 continue
 
+            # Pre-fetch SPY close for this date (and previous trading day for daily pct)
+            spy_close_d = spy_price_map.get(d)
+            spy_prev_d: Optional[Decimal] = None
+            if spy_close_d is not None:
+                # Find the most recent SPY date before d
+                prev_spy_dates = [sd for sd in spy_dates if sd < d]
+                if prev_spy_dates:
+                    spy_prev_d = spy_price_map[prev_spy_dates[-1]]
+
             await upsert_snapshot(
                 pool=pool,
                 snapshot_date=d,
@@ -462,6 +480,8 @@ async def backfill_snapshots(
                 account_id=acct_id,
                 equity_value=nav.quantize(Decimal("0.01")),
                 prev_nav=prev_nav,
+                spy_close=spy_close_d,
+                spy_prev_close=spy_prev_d,
             )
             prev_nav = nav
             snapshots_written += 1
@@ -481,13 +501,22 @@ async def backfill_snapshots(
     prev_combined: Optional[Decimal] = None
     for row in combined_rows:
         nav = Decimal(str(row["combined_nav"]))
+        d = row["snapshot_date"]
+        spy_close_d = spy_price_map.get(d)
+        spy_prev_d = None
+        if spy_close_d is not None:
+            prev_spy_dates = [sd for sd in spy_dates if sd < d]
+            if prev_spy_dates:
+                spy_prev_d = spy_price_map[prev_spy_dates[-1]]
         await upsert_snapshot(
             pool=pool,
-            snapshot_date=row["snapshot_date"],
+            snapshot_date=d,
             total_nav=nav,
             account_id=None,
             equity_value=nav,
             prev_nav=prev_combined,
+            spy_close=spy_close_d,
+            spy_prev_close=spy_prev_d,
         )
         prev_combined = nav
         snapshots_written += 1
