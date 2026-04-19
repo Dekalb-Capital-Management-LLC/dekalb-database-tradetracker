@@ -296,25 +296,64 @@ def _parse_positions(
 # Public entry point — auto-detects format
 # ---------------------------------------------------------------------------
 
-def parse_fidelity_csv(
-    csv_text: str,
-    account_id: str,
-    import_id: int,
-) -> tuple[list[TradeCreate], list[str]]:
+def extract_account_id(csv_text: str) -> Optional[str]:
     """
-    Parse a Fidelity CSV export into TradeCreate objects.
-    Automatically detects whether it's an Activity/Orders export or a
-    Portfolio Positions snapshot and uses the appropriate parser.
+    Auto-detect the Fidelity account ID from the CSV data.
+    The Activity CSV has an "Account" column with values like "Z12345678".
+    The Positions CSV has an "Account Number" column.
     """
     lines = csv_text.splitlines()
     header_idx = _find_header_row(lines)
     if header_idx is None:
-        return [], ["Could not find header row. Expected columns: Symbol, Action or Average Cost Basis."]
+        return None
+    try:
+        header_lower = lines[header_idx].lower()
+        data_section = "\n".join(lines[header_idx:])
+        reader = csv.DictReader(io.StringIO(data_section))
+        norm = {_normalise_header(f): f for f in (reader.fieldnames or []) if f}
+
+        def col(row: dict, *candidates: str) -> str:
+            for c in candidates:
+                orig = norm.get(c)
+                if orig and orig in row:
+                    return (row[orig] or "").strip()
+            return ""
+
+        for row in reader:
+            # Activity format: "Account" column
+            acct = col(row, "account", "account number")
+            if acct and len(acct) >= 4:
+                return acct
+    except Exception:
+        pass
+    return None
+
+
+def parse_fidelity_csv(
+    csv_text: str,
+    account_id: Optional[str],
+    import_id: int,
+) -> tuple[list[TradeCreate], list[str], str]:
+    """
+    Parse a Fidelity CSV export into TradeCreate objects.
+    Automatically detects whether it's an Activity/Orders export or a
+    Portfolio Positions snapshot and uses the appropriate parser.
+    Auto-detects account_id from the file if not provided.
+    Returns (trades, errors, resolved_account_id).
+    """
+    resolved_account_id = account_id or extract_account_id(csv_text) or "FIDELITY"
+
+    lines = csv_text.splitlines()
+    header_idx = _find_header_row(lines)
+    if header_idx is None:
+        return [], ["Could not find header row. Expected columns: Symbol, Action or Average Cost Basis."], resolved_account_id
 
     header_lower = lines[header_idx].lower()
     if "average cost basis" in header_lower:
-        logger.info("Fidelity CSV detected as POSITIONS format (import_id=%d)", import_id)
-        return _parse_positions(lines, header_idx, account_id, import_id)
+        logger.info("Fidelity CSV detected as POSITIONS format (import_id=%d, account=%s)", import_id, resolved_account_id)
+        trades, errors = _parse_positions(lines, header_idx, resolved_account_id, import_id)
     else:
-        logger.info("Fidelity CSV detected as ACTIVITY format (import_id=%d)", import_id)
-        return _parse_activity(lines, header_idx, account_id, import_id)
+        logger.info("Fidelity CSV detected as ACTIVITY format (import_id=%d, account=%s)", import_id, resolved_account_id)
+        trades, errors = _parse_activity(lines, header_idx, resolved_account_id, import_id)
+
+    return trades, errors, resolved_account_id

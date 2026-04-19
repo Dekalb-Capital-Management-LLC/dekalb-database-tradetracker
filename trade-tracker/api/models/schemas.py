@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 # Enums / Literals
 # ---------------------------------------------------------------------------
 
-TradeSource = Literal["ibkr", "fidelity"]
+TradeSource = Literal["ibkr", "fidelity", "portfolio"]
 TradeSide = Literal["BUY", "SELL"]
 TradeLabel = Literal["event-driven", "hedge", "long-term", "short-term", "unclassified"]
 

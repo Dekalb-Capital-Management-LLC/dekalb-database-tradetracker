@@ -52,30 +52,42 @@ def _store_quote(symbol: str, quote: PriceQuote) -> None:
 # ---------------------------------------------------------------------------
 
 def _fetch_quote_yfinance(symbol: str) -> Optional[PriceQuote]:
+    """
+    Single-symbol price fetch via yf.download (avoids fc.yahoo.com / fast_info issues).
+    Prefer warm_quote_cache() for multiple symbols — it batches them in one call.
+    """
     try:
-        ticker = yf.Ticker(symbol, session=_yf_session)
-        info = ticker.fast_info  # lighter call than .info
-        price = info.last_price
-        prev_close = info.previous_close
-
-        if price is None:
-            logger.warning("yfinance returned no price for %s", symbol)
+        df = yf.download(
+            symbol,
+            period="5d",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
+        if df.empty or "Close" not in df.columns:
+            logger.warning("yfinance returned no data for %s", symbol)
             return None
 
-        change = Decimal(str(price)) - Decimal(str(prev_close)) if prev_close else None
-        change_pct = (change / Decimal(str(prev_close)) * 100) if (change and prev_close) else None
+        closes = df["Close"].dropna()
+        if closes.empty:
+            return None
+
+        price = float(closes.iloc[-1])
+        prev = float(closes.iloc[-2]) if len(closes) >= 2 else None
+
+        change = Decimal(str(round(price - prev, 4))) if prev else None
+        change_pct = (change / Decimal(str(prev)) * 100).quantize(Decimal("0.0001")) if (change and prev) else None
 
         quote = PriceQuote(
             symbol=symbol,
             price=Decimal(str(round(price, 4))),
-            change=round(change, 4) if change else None,
-            change_pct=round(change_pct, 4) if change_pct else None,
-            previous_close=Decimal(str(round(prev_close, 4))) if prev_close else None,
+            change=change,
+            change_pct=change_pct,
+            previous_close=Decimal(str(round(prev, 4))) if prev else None,
             source="yfinance",
             as_of=datetime.utcnow(),
         )
         _store_quote(symbol, quote)
-        logger.debug("yfinance price for %s: %s", symbol, price)
         return quote
 
     except Exception as exc:
@@ -277,6 +289,92 @@ def _fetch_quote_ibkr(symbol: str) -> Optional[PriceQuote]:
     _store_quote(symbol, quote)
     logger.debug("IBKR price for %s: %s", symbol, price)
     return quote
+
+
+# ---------------------------------------------------------------------------
+# Batch cache warming — call this before any loop that needs N prices
+# ---------------------------------------------------------------------------
+
+def warm_quote_cache(symbols: list[str]) -> None:
+    """
+    Batch-fetch current prices for multiple symbols in ONE network call.
+    Populates the in-process cache so subsequent get_quote() calls are instant.
+    Far faster than N individual get_quote() calls for portfolio valuation.
+    """
+    if not symbols:
+        return
+
+    # Only fetch symbols whose cache entry has expired
+    uncached = [s for s in symbols if not _cached_quote(s)]
+    if not uncached:
+        return
+
+    logger.info("warm_quote_cache: fetching %d uncached symbols", len(uncached))
+
+    # Try IBKR first (when connected — no external DNS needed)
+    if config.IBKR_ENABLED:
+        try:
+            from services.ibkr_client import ibkr_client
+            if ibkr_client.is_connected():
+                still_missing = []
+                for sym in uncached:
+                    if not _fetch_quote_ibkr(sym):
+                        still_missing.append(sym)
+                uncached = still_missing
+        except Exception as exc:
+            logger.warning("warm_quote_cache IBKR pass failed: %s", exc)
+
+    if not uncached:
+        return
+
+    # yfinance batch download — one HTTP call for all remaining symbols
+    try:
+        import pandas as pd
+        df = yf.download(
+            uncached,
+            period="5d",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
+        if df.empty:
+            logger.warning("warm_quote_cache: yfinance returned empty dataframe")
+            return
+
+        now = datetime.utcnow()
+
+        if len(uncached) == 1:
+            sym = uncached[0]
+            col = "Close" if "Close" in df.columns else None
+            if col is not None:
+                series = df[col].dropna()
+                if not series.empty:
+                    price = Decimal(str(round(float(series.iloc[-1]), 4)))
+                    prev = Decimal(str(round(float(series.iloc[-2]), 4))) if len(series) >= 2 else None
+                    change = (price - prev).quantize(Decimal("0.0001")) if prev else None
+                    change_pct = (change / prev * 100).quantize(Decimal("0.0001")) if (change and prev) else None
+                    _store_quote(sym, PriceQuote(
+                        symbol=sym, price=price, change=change, change_pct=change_pct,
+                        previous_close=prev, source="yfinance", as_of=now,
+                    ))
+        else:
+            if isinstance(df.columns, pd.MultiIndex) and "Close" in df.columns.get_level_values(0):
+                close_df = df["Close"]
+                for sym in uncached:
+                    if sym in close_df.columns:
+                        series = close_df[sym].dropna()
+                        if not series.empty:
+                            price = Decimal(str(round(float(series.iloc[-1]), 4)))
+                            prev = Decimal(str(round(float(series.iloc[-2]), 4))) if len(series) >= 2 else None
+                            change = (price - prev).quantize(Decimal("0.0001")) if prev else None
+                            change_pct = (change / prev * 100).quantize(Decimal("0.0001")) if (change and prev) else None
+                            _store_quote(sym, PriceQuote(
+                                symbol=sym, price=price, change=change, change_pct=change_pct,
+                                previous_close=prev, source="yfinance", as_of=now,
+                            ))
+        logger.info("warm_quote_cache: populated cache for %d symbols", len(uncached))
+    except Exception as exc:
+        logger.warning("warm_quote_cache batch failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------

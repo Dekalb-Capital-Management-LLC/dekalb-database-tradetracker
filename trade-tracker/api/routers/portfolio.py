@@ -16,6 +16,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+import config
 import db
 from models.schemas import (
     AccountSummary,
@@ -102,6 +103,7 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
 
     # --- Trades + price fallback ---
 
+    params = [account_id] if account_id else []
     rows = await pool.fetch(
         f"""
         SELECT
@@ -120,13 +122,17 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
         *params,
     )
 
+    # Batch-warm the price cache for all symbols in one call before looping
+    all_symbols = [row["symbol"] for row in rows]
+    market_data.warm_quote_cache(all_symbols)
+
     positions: list[PositionSummary] = []
     for row in rows:
         symbol = row["symbol"]
         qty = Decimal(str(row["net_quantity"]))
         avg_cost = Decimal(str(row["avg_cost"])) if row["avg_cost"] else None
 
-        # Fetch current price (cached by market_data service)
+        # Fetch current price — hits cache populated above (no network call per symbol)
         quote = market_data.get_quote(symbol)
         current_price = quote.price if quote else None
 
@@ -300,6 +306,11 @@ async def get_portfolio_summary(pool=Depends(get_pool)):
             "SELECT DISTINCT account_id FROM trades ORDER BY account_id"
         )
         account_ids = [r["account_id"] for r in account_rows]
+
+        # Pre-warm price cache for ALL symbols across all accounts in one batch call.
+        # Without this, _compute_positions fetches each symbol individually (~1s each).
+        symbol_rows = await pool.fetch("SELECT DISTINCT symbol FROM trades")
+        market_data.warm_quote_cache([r["symbol"] for r in symbol_rows])
 
         accounts = []
         for acct_id in account_ids:

@@ -299,32 +299,61 @@ def _parse_simple_csv(csv_text: str, account_id: str, import_id: int) -> tuple[l
 
 
 # ---------------------------------------------------------------------------
+# Account ID extraction
+# ---------------------------------------------------------------------------
+
+def extract_account_id(csv_text: str) -> Optional[str]:
+    """
+    Extract the account ID from an IBKR Activity Statement CSV.
+    Looks for lines like: Account Information,Data,Account ID,F16173704
+    """
+    for line in csv_text.splitlines():
+        if not line.startswith("Account Information,Data,"):
+            continue
+        try:
+            parts = next(csv.reader([line]))
+            # parts[2] is the field name, parts[3] is the value
+            if len(parts) >= 4 and "account id" in parts[2].strip().lower():
+                val = parts[3].strip()
+                if val:
+                    return val
+        except Exception:
+            continue
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
 def parse_ibkr_csv(
     csv_text: str,
-    account_id: str,
+    account_id: Optional[str],
     import_id: int,
-) -> tuple[list[TradeCreate], list[str]]:
+) -> tuple[list[TradeCreate], list[str], str]:
     """
     Parse an IBKR CSV export into TradeCreate objects.
     Auto-detects Activity Statement format vs simple flat CSV.
+    Auto-detects account_id from the file if not provided.
+    Returns (trades, errors, resolved_account_id).
     """
     lines = csv_text.splitlines()
+
+    # Auto-detect account ID from the Activity Statement header if not provided
+    resolved_account_id = account_id or extract_account_id(csv_text) or "IBKR"
 
     # Detect Activity Statement format
     has_section_rows = any(line.startswith("Trades,Header,") for line in lines)
 
     if has_section_rows:
-        logger.info("Detected IBKR Activity Statement format (import_id=%d)", import_id)
-        trades, errors = _parse_activity_statement(lines, account_id, import_id)
+        logger.info("Detected IBKR Activity Statement format (import_id=%d, account=%s)", import_id, resolved_account_id)
+        trades, errors = _parse_activity_statement(lines, resolved_account_id, import_id)
     else:
-        logger.info("Detected simple IBKR CSV format (import_id=%d)", import_id)
-        trades, errors = _parse_simple_csv(csv_text, account_id, import_id)
+        logger.info("Detected simple IBKR CSV format (import_id=%d, account=%s)", import_id, resolved_account_id)
+        trades, errors = _parse_simple_csv(csv_text, resolved_account_id, import_id)
 
     logger.info(
         "IBKR parse complete: %d trades, %d errors (import_id=%d)",
         len(trades), len(errors), import_id,
     )
-    return trades, errors
+    return trades, errors, resolved_account_id
