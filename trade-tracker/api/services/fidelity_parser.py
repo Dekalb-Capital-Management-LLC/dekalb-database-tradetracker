@@ -89,11 +89,23 @@ def _find_header_row(lines: list[str]) -> Optional[int]:
 
 
 def _clean_symbol(raw: str) -> str:
-    """Normalize a Fidelity symbol: strip spaces, leading dashes, etc."""
+    """Normalize a Fidelity symbol, preserving leading dash so we can detect options."""
+    return raw.strip().upper()
+
+
+def _is_option_symbol(raw: str) -> bool:
+    """
+    Fidelity option symbols start with a dash: '-ONDS260402P8', '-PR260417P20'.
+    They also embed a YYMMDD expiry date followed by P or C and a strike.
+    Skip both patterns.
+    """
     s = raw.strip()
-    # Option symbols like " -ONDS260402P8" or "-PR260417P20"
-    s = s.lstrip("- ")
-    return s.upper()
+    if s.startswith("-"):
+        return True
+    # Pattern: 6 digits (YYMMDD) followed by P or C and digits (strike)
+    if re.search(r'\d{6}[PC]\d', s):
+        return True
+    return False
 
 
 def _is_skip_row(symbol: str, description: str) -> bool:
@@ -102,7 +114,11 @@ def _is_skip_row(symbol: str, description: str) -> bool:
     desc = description.upper().strip()
     if not sym:
         return True
-    if sym in _SKIP_SYMBOLS or sym.startswith("SPAXX") or sym.startswith("FDRXX"):
+    if _is_option_symbol(sym):
+        return True
+    # Strip the leading dash for further checks (money market funds, etc.)
+    clean = sym.lstrip("-").strip()
+    if clean in _SKIP_SYMBOLS or clean.startswith("SPAXX") or clean.startswith("FDRXX"):
         return True
     if "PENDING ACTIVITY" in sym or "PENDING ACTIVITY" in desc:
         return True
@@ -140,13 +156,14 @@ def _parse_activity(
 
     for row_num, row in enumerate(reader, start=header_idx + 2):
         raw_symbol = _clean_symbol(col(row, "symbol"))
+        description = col(row, "security description", "description")
         if not raw_symbol or len(raw_symbol) > 20:
             continue
-        if not re.match(r"^[A-Z0-9.\-]+$", raw_symbol):
-            continue
-
-        description = col(row, "security description", "description")
         if _is_skip_row(raw_symbol, description):
+            continue
+        # Strip any remaining leading dash after option check (shouldn't happen, but safety)
+        raw_symbol = raw_symbol.lstrip("-").strip()
+        if not raw_symbol or not re.match(r"^[A-Z0-9.]+$", raw_symbol):
             continue
 
         raw_action = col(row, "action")
@@ -243,8 +260,11 @@ def _parse_positions(
             continue
         if _is_skip_row(raw_symbol, description):
             continue
-        # Skip footer/disclaimer text rows
-        if len(raw_symbol) > 25 or raw_symbol.startswith("BROKERAGE") or raw_symbol.startswith("THE DATA"):
+        raw_symbol = raw_symbol.lstrip("-").strip()
+        # Skip footer/disclaimer text rows and invalid tickers
+        if not raw_symbol or len(raw_symbol) > 10 or not re.match(r"^[A-Z0-9.]+$", raw_symbol):
+            continue
+        if raw_symbol.startswith("BROKERAGE") or raw_symbol.startswith("THE DATA"):
             continue
 
         raw_qty = col(row, "quantity")

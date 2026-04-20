@@ -125,11 +125,16 @@ async def upload_trades(
 
     raw_bytes = await file.read()
 
-    # Create audit record — store a readable snapshot of the raw content
-    try:
-        preview = raw_bytes[:200_000].decode("utf-8", errors="replace")
-    except Exception:
-        preview = ""
+    # Create audit record — store a readable text preview.
+    # For binary formats (xlsx/xlsm), just record the filename;
+    # null bytes (0x00 in Excel binaries) are rejected by PostgreSQL UTF-8.
+    if ext in ("xlsx", "xlsm", "xls"):
+        preview = f"[binary {ext.upper()} file — {len(raw_bytes):,} bytes]"
+    else:
+        try:
+            preview = raw_bytes[:200_000].decode("utf-8", errors="replace").replace("\x00", "")
+        except Exception:
+            preview = ""
 
     import_id = await pool.fetchval(
         """
