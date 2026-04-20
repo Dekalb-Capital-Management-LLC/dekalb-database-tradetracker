@@ -31,6 +31,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Optional
 
 import jwt
@@ -397,18 +398,75 @@ class IBKRClient:
         return None
 
     def get_market_snapshot(self, conid: int) -> Optional[dict]:
+        result = self.get_market_snapshot_batch([conid])
+        return result.get(conid)
+
+    def get_market_snapshot_batch(
+        self,
+        conids: list[int],
+        max_retries: int = 4,
+        retry_delay: float = 0.5,
+    ) -> dict[int, dict]:
+        """
+        Batch snapshot for multiple conids.
+        IBKR requires polling: the first call subscribes to the stream; subsequent
+        calls return actual prices. We retry until field 31 (last) appears for
+        every conid or max_retries is exhausted.
+        Returns {conid: snapshot_dict}.
+        """
+        if not conids:
+            return {}
+        # Dedup while preserving order
+        unique_conids = list(dict.fromkeys(conids))
+        conids_csv = ",".join(str(c) for c in unique_conids)
         # Fields: 31=last, 84=bid, 86=ask, 82=change$, 83=change%, 7296=prev_close
-        params = {"conids": conid, "fields": "31,84,86,82,83,7296"}
-        data = self._get("/iserver/marketdata/snapshot", params=params)
-        if not data or not isinstance(data, list):
-            return None
-        # First call subscribes to the feed — wait 1s then fetch actual data
-        if not data[0].get("31"):
-            time.sleep(1)
+        params = {"conids": conids_csv, "fields": "31,84,86,82,83,7296"}
+
+        results: dict[int, dict] = {}
+        for attempt in range(max_retries):
             data = self._get("/iserver/marketdata/snapshot", params=params)
             if not data or not isinstance(data, list):
-                return None
-        return data[0]
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                return results
+
+            for entry in data:
+                cid = entry.get("conid") or entry.get("conidEx")
+                if cid is None:
+                    continue
+                try:
+                    cid = int(str(cid).split(".")[0])
+                except (ValueError, TypeError):
+                    continue
+                if entry.get("31") is not None:
+                    results[cid] = entry
+
+            if len(results) >= len(unique_conids):
+                break
+            time.sleep(retry_delay)
+
+        logger.info("IBKR snapshot batch: got prices for %d/%d conids", len(results), len(unique_conids))
+        return results
+
+    def get_conids_batch(self, symbols: list[str]) -> dict[str, int]:
+        """Batch symbol → conid lookup via /trsrv/stocks."""
+        if not symbols:
+            return {}
+        unique = list(dict.fromkeys(s.upper() for s in symbols))
+        result: dict[str, int] = {}
+        # /trsrv/stocks accepts comma-separated list
+        data = self._get("/trsrv/stocks", params={"symbols": ",".join(unique)})
+        if not data:
+            return result
+        for sym in unique:
+            try:
+                contracts = data.get(sym, [])
+                if contracts:
+                    result[sym] = int(contracts[0]["contracts"][0]["conid"])
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+        return result
 
 
 # Singleton — imported by routers and services

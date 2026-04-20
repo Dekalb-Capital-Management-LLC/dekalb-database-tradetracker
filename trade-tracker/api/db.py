@@ -113,6 +113,20 @@ async def _apply_migrations(conn: asyncpg.Connection) -> None:
         ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'fidelity'
     """)
 
+    # instrument_conids: persistent symbol → IBKR contract ID cache
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS instrument_conids (
+            symbol       VARCHAR(20) PRIMARY KEY,
+            conid        BIGINT      NOT NULL,
+            description  TEXT,
+            asset_class  VARCHAR(16),
+            updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_instrument_conids_conid ON instrument_conids(conid)"
+    )
+
 
 async def init_pool() -> None:
     """Create the connection pool. Called once at application startup."""

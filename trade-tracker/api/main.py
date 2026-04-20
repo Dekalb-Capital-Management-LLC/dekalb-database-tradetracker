@@ -87,7 +87,7 @@ async def _auto_backfill():
 async def _hourly_snapshot_loop():
     """
     Every hour: generate today's snapshot so the dashboard stays current.
-    Uses live IBKR prices when connected, yfinance otherwise.
+    Uses live IBKR prices and historical bars.
     """
     await asyncio.sleep(60)  # Let startup settle first
     while True:
@@ -118,7 +118,7 @@ async def startup():
         t.start()
         logger.info("IBKR connection starting (client_id=%s)", config.IBKR_CLIENT_ID)
     else:
-        logger.info("IBKR disabled — using yfinance. Set IBKR_ENABLED=true to activate.")
+        logger.warning("IBKR disabled — no market data available. Set IBKR_ENABLED=true to activate.")
 
     # Auto-backfill and hourly refresh run in background
     asyncio.create_task(_auto_backfill())
@@ -157,7 +157,7 @@ async def health():
     return {
         "status": "ok" if db_ok else "degraded",
         "database": "connected" if db_ok else "unreachable",
-        "ibkr": "enabled" if config.IBKR_ENABLED else "disabled (yfinance fallback)",
+        "ibkr": "enabled" if config.IBKR_ENABLED else "disabled (no market data)",
         "trades": trade_count,
         "latest_snapshot": str(snap_date) if snap_date else "none",
         "version": "0.1.0",

@@ -1,7 +1,7 @@
 """
 Import router.
 
-  POST /import/trades   — universal endpoint, auto-detects any CSV/XLSX/TSV format
+  POST /import/trades   — universal endpoint, auto-detects any CSV/XLSX/XLSM/TSV format
   GET  /import/history  — list all past imports (audit log)
 
 Legacy paths kept for compatibility:
@@ -10,19 +10,19 @@ Legacy paths kept for compatibility:
 """
 from __future__ import annotations
 
-import io as _io
 import json
 import logging
-from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 
 import db
 from models.schemas import FidelityImportResponse
-from services.universal_parser import auto_parse
+from services.universal_parser import auto_parse, persist_ibkr_conids
 
 router = APIRouter(prefix="/import", tags=["imports"])
 logger = logging.getLogger(__name__)
+
+_SUPPORTED_EXTENSIONS = ("csv", "xlsx", "xlsm", "xls", "tsv", "txt")
 
 
 def get_pool():
@@ -93,31 +93,6 @@ async def _insert_trades(pool, trades, source_label: str):
 
 
 # ---------------------------------------------------------------------------
-# File reading helper (handles CSV + XLSX + TSV)
-# ---------------------------------------------------------------------------
-
-def _read_as_text(raw_bytes: bytes, filename: str) -> str:
-    fname = filename.lower()
-    if fname.endswith(".xlsx"):
-        import openpyxl
-        wb = openpyxl.load_workbook(_io.BytesIO(raw_bytes), data_only=True)
-        ws = wb.active
-        rows = list(ws.iter_rows(values_only=True))
-        # Detect if source data is tab-separated (unlikely in xlsx but handle it)
-        return "\n".join(
-            "\t".join("" if cell is None else str(cell) for cell in row)
-            for row in rows
-        )
-    # CSV / TSV / plain text
-    for enc in ("utf-8", "utf-8-sig", "latin-1"):
-        try:
-            return raw_bytes.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return raw_bytes.decode("latin-1", errors="replace")
-
-
-# ---------------------------------------------------------------------------
 # Unified endpoint
 # ---------------------------------------------------------------------------
 
@@ -128,41 +103,68 @@ async def upload_trades(
     pool=Depends(get_pool),
 ):
     """
-    Universal trade importer — drop any CSV, XLSX, or TSV file.
+    Universal trade importer — drop any CSV, XLSX, XLSM, XLS, or TSV file.
 
     Auto-detects format:
-      • IBKR Activity Statement CSV
-      • Fidelity Activity / Positions CSV or XLSX
-      • Simple portfolio CSV  (Ticker | Date Acquired | Amount | Price Acquired)
+      • IBKR Activity Statement
+      • Fidelity Activity / Positions
+      • Simple portfolio  (Ticker | Date Acquired | Amount | Price Acquired)
 
     Account ID is extracted from the file automatically.
     Duplicate trades are skipped.
+    IBKR activity statements additionally populate the symbol→conid table.
     Performance snapshots rebuild in the background after a successful import.
     """
     fname = file.filename or "upload"
-    ext = fname.rsplit(".", 1)[-1].lower()
-    if ext not in ("csv", "xlsx", "tsv", "txt"):
-        raise HTTPException(status_code=400, detail="Supported file types: .csv, .xlsx, .tsv")
+    ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
+    if ext not in _SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Supported file types: {', '.join('.' + e for e in _SUPPORTED_EXTENSIONS)}",
+        )
 
     raw_bytes = await file.read()
-    text = _read_as_text(raw_bytes, fname)
 
-    # Create audit record (account_id filled in after parse)
+    # Create audit record — store a readable snapshot of the raw content
+    try:
+        preview = raw_bytes[:200_000].decode("utf-8", errors="replace")
+    except Exception:
+        preview = ""
+
     import_id = await pool.fetchval(
         """
         INSERT INTO fidelity_imports (filename, account_id, raw_csv, status, source)
         VALUES ($1, 'detecting', $2, 'pending', 'auto')
         RETURNING id
         """,
-        fname, text,
+        fname, preview,
     )
 
-    trades, errors, account_id, source_label = auto_parse(text, import_id)
+    try:
+        trades, errors, account_id, source_label, text = auto_parse(raw_bytes, fname, import_id)
+    except Exception as exc:
+        logger.exception("Parse failed for %s", fname)
+        await pool.execute(
+            "UPDATE fidelity_imports SET status='error', error_message=$1 WHERE id=$2",
+            f"Parse failed: {exc}", import_id,
+        )
+        raise HTTPException(status_code=400, detail=f"Could not read file: {exc}")
+
     parse_error_count = len(errors)
 
     success_count, insert_errors = await _insert_trades(pool, trades, source_label)
     errors.extend(insert_errors)
     error_count = len(errors)
+
+    # If this was an IBKR Activity Statement, mine the Financial Instrument
+    # Information section and persist symbol → conid mappings so market_data
+    # can look them up without a round-trip to /trsrv/stocks.
+    conids_written = 0
+    if source_label == "ibkr":
+        try:
+            conids_written = await persist_ibkr_conids(pool, text)
+        except Exception as exc:
+            logger.warning("conid persistence failed: %s", exc)
 
     if success_count == 0 and error_count > 0:
         status = "error"
@@ -186,12 +188,17 @@ async def upload_trades(
         import_id,
     )
 
-    logger.info("Import %d [%s / %s]: %d inserted, %d errors", import_id, source_label, account_id, success_count, error_count)
+    logger.info(
+        "Import %d [%s / %s]: %d inserted, %d errors, %d conids",
+        import_id, source_label, account_id, success_count, error_count, conids_written,
+    )
 
     if success_count > 0:
         background_tasks.add_task(_run_backfill, pool)
 
-    imported_at = await pool.fetchval("SELECT imported_at FROM fidelity_imports WHERE id=$1", import_id)
+    imported_at = await pool.fetchval(
+        "SELECT imported_at FROM fidelity_imports WHERE id=$1", import_id
+    )
     return FidelityImportResponse(
         import_id=import_id,
         filename=fname,

@@ -19,7 +19,6 @@ from typing import Optional
 import asyncpg
 
 from models.schemas import PerformancePoint, PortfolioMetrics
-from services.market_data import get_spy_history
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +69,7 @@ def _max_drawdown(nav_series: list[float]) -> float:
         if nav > peak:
             peak = nav
         if peak == 0:
-            continue  # skip — nav=0 means no real data (yfinance failed that day)
+            continue  # skip — nav=0 means no price data available that day
         dd = (nav - peak) / peak
         if dd < max_dd:
             max_dd = dd
@@ -134,17 +133,18 @@ async def upsert_snapshot(
     """
     Upsert a portfolio NAV snapshot.
     spy_close / spy_prev_close can be pre-fetched by the caller (backfill does this in batch).
-    If not provided, fetches from yfinance individually.
+    If not provided, fetches from IBKR individually.
     """
     from services.market_data import get_historical_bars
 
     # Use pre-fetched SPY if provided; otherwise fetch individually (single-date use)
     if spy_close is None:
-        spy_bars = get_historical_bars("SPY", snapshot_date, snapshot_date)
+        spy_bars = await get_historical_bars(pool, "SPY", snapshot_date, snapshot_date)
         spy_close = Decimal(str(spy_bars[0].close)) if spy_bars else None
 
     if spy_prev_close is None and spy_close is not None:
-        prev_spy_bars = get_historical_bars(
+        prev_spy_bars = await get_historical_bars(
+            pool,
             "SPY",
             snapshot_date - timedelta(days=5),
             snapshot_date - timedelta(days=1),
@@ -362,17 +362,16 @@ async def backfill_snapshots(
     end_date: Optional[date] = None,
 ) -> dict:
     """
-    Generate daily historical portfolio NAV snapshots from trade history + yfinance prices.
+    Generate daily historical portfolio NAV snapshots from trade history + IBKR prices.
     This is what powers the performance graph.
 
     Algorithm:
       1. Walk through each trading day from first trade to today
       2. Maintain running positions per account as trades are applied
-      3. For each day, fetch historical close prices from yfinance
+      3. For each day, fetch historical close prices from IBKR
       4. NAV = SUM(qty × close_price) for all open positions
       5. Upsert snapshot rows (safe to re-run — ON CONFLICT DO UPDATE)
     """
-    from services.market_data import get_historical_bars
 
     # Date range
     first_trade_date = await pool.fetchval(
@@ -403,11 +402,11 @@ async def backfill_snapshots(
     symbols = list({r["symbol"] for r in trade_rows})
     account_ids = list({r["account_id"] for r in trade_rows})
 
-    # Batch-fetch ALL symbols + SPY in a single yfinance call
+    # Batch-fetch ALL symbols + SPY via IBKR
     from services.market_data import get_historical_bars_batch
     all_symbols_to_fetch = list(set(symbols + ["SPY"]))
-    logger.info("Batch-fetching %d symbols from yfinance...", len(all_symbols_to_fetch))
-    batch = get_historical_bars_batch(all_symbols_to_fetch, start, end)
+    logger.info("Batch-fetching %d symbols from IBKR...", len(all_symbols_to_fetch))
+    batch = await get_historical_bars_batch(pool, all_symbols_to_fetch, start, end)
 
     symbol_price_map: dict[str, dict[date, Decimal]] = {s: batch.get(s, {}) for s in symbols}
     spy_price_map: dict[date, Decimal] = batch.get("SPY", {})

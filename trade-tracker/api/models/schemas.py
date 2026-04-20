@@ -72,7 +72,7 @@ class PositionSummary(BaseModel):
     account_id: str
     quantity: Decimal
     avg_cost: Optional[Decimal]           # calculated from trade history
-    current_price: Optional[Decimal]      # from yfinance / IBKR
+    current_price: Optional[Decimal]      # from IBKR
     market_value: Optional[Decimal]
     unrealized_pnl: Optional[Decimal]
     unrealized_pnl_pct: Optional[Decimal]
@@ -157,7 +157,7 @@ class PriceQuote(BaseModel):
     change: Optional[Decimal]               # absolute change vs previous close
     change_pct: Optional[Decimal]
     previous_close: Optional[Decimal]
-    source: str                             # 'yfinance' | 'ibkr' | 'cache'
+    source: str                             # 'ibkr' | 'cache'
     as_of: datetime
 
 

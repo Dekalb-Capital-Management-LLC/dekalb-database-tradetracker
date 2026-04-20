@@ -45,7 +45,7 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
     Derive current positions.
     When IBKR is connected and account_id matches the IBKR account, uses live
     IBKR position data (accurate prices, cost basis from IB).
-    Otherwise falls back to computing from trades × yfinance prices.
+    Otherwise falls back to computing from trades × IBKR snapshot prices.
     """
     # --- IBKR live path ---
     if (
@@ -124,7 +124,7 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
 
     # Batch-warm the price cache for all symbols in one call before looping
     all_symbols = [row["symbol"] for row in rows]
-    market_data.warm_quote_cache(all_symbols)
+    await market_data.warm_quote_cache(pool, all_symbols)
 
     positions: list[PositionSummary] = []
     for row in rows:
@@ -133,7 +133,7 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
         avg_cost = Decimal(str(row["avg_cost"])) if row["avg_cost"] else None
 
         # Fetch current price — hits cache populated above (no network call per symbol)
-        quote = market_data.get_quote(symbol)
+        quote = await market_data.get_quote(pool, symbol)
         current_price = quote.price if quote else None
 
         market_value = (qty * current_price).quantize(Decimal("0.01")) if current_price else None
@@ -310,7 +310,7 @@ async def get_portfolio_summary(pool=Depends(get_pool)):
         # Pre-warm price cache for ALL symbols across all accounts in one batch call.
         # Without this, _compute_positions fetches each symbol individually (~1s each).
         symbol_rows = await pool.fetch("SELECT DISTINCT symbol FROM trades")
-        market_data.warm_quote_cache([r["symbol"] for r in symbol_rows])
+        await market_data.warm_quote_cache(pool, [r["symbol"] for r in symbol_rows])
 
         accounts = []
         for acct_id in account_ids:
@@ -361,7 +361,7 @@ async def get_positions(
     """
     Current open positions with live P&L.
     Quantities are netted from trade history (BUY - SELL).
-    Prices fetched from yfinance (or IBKR if gateway enabled).
+    Prices fetched from IBKR.
     """
     try:
         return await _compute_positions(pool, account_id)
@@ -452,7 +452,7 @@ async def backfill_snapshots_endpoint(
     pool=Depends(get_pool),
 ):
     """
-    Rebuild historical NAV snapshots from trade history + yfinance prices.
+    Rebuild historical NAV snapshots from trade history + IBKR historical bars.
     Returns immediately — runs in background (~30s for 2 years of history).
     Safe to re-run: ON CONFLICT DO UPDATE.
     """

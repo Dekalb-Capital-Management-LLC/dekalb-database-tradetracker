@@ -302,6 +302,58 @@ def _parse_simple_csv(csv_text: str, account_id: str, import_id: int) -> tuple[l
 # Account ID extraction
 # ---------------------------------------------------------------------------
 
+def extract_conids(csv_text: str) -> list[dict]:
+    """
+    Parse the "Financial Instrument Information" section of an IBKR Activity
+    Statement to extract symbol → conid mappings.
+
+    Example rows:
+      Financial Instrument Information,Header,Asset Category,Symbol,Description,Conid,...
+      Financial Instrument Information,Data,Stocks,AAPL,APPLE INC,265598,...
+      Financial Instrument Information,Data,Stocks,DTM,DT MIDSTREAM INC,495876055,...
+
+    Returns list of {symbol, conid, description, asset_class}.
+    """
+    results: list[dict] = []
+    header_cols: Optional[list[str]] = None
+    for line in csv_text.splitlines():
+        if line.startswith("Financial Instrument Information,Header,"):
+            parts = next(csv.reader([line]))
+            header_cols = [_normalise(c) for c in parts[2:]]
+            continue
+        if header_cols and line.startswith("Financial Instrument Information,Data,"):
+            try:
+                parts = next(csv.reader([line]))
+            except Exception:
+                continue
+            data = parts[2:]
+
+            def get(name: str) -> str:
+                for i, c in enumerate(header_cols):
+                    if name in c and i < len(data):
+                        return data[i].strip()
+                return ""
+
+            symbol = get("symbol").upper().split(",")[0].strip()
+            # Conid may be named "conid" or include it
+            conid_raw = get("conid")
+            if not symbol or not conid_raw:
+                continue
+            try:
+                conid = int(conid_raw)
+            except ValueError:
+                continue
+            if not re.match(r"^[A-Z0-9.\-]+$", symbol):
+                continue
+            results.append({
+                "symbol": symbol,
+                "conid": conid,
+                "description": get("description") or None,
+                "asset_class": get("asset category") or None,
+            })
+    return results
+
+
 def extract_account_id(csv_text: str) -> Optional[str]:
     """
     Extract the account ID from an IBKR Activity Statement CSV.

@@ -40,8 +40,8 @@ export default function Import() {
     setState(s => ({ ...s, drag: false }))
     const f = e.dataTransfer.files[0]
     if (!f) return
-    const ok = /\.(csv|xlsx|tsv|txt)$/i.test(f.name)
-    setState(s => ({ ...s, file: ok ? f : null, error: ok ? null : 'Drop a .csv, .xlsx, or .tsv file.' }))
+    const ok = /\.(csv|xlsx|xlsm|xls|tsv|txt)$/i.test(f.name)
+    setState(s => ({ ...s, file: ok ? f : null, error: ok ? null : 'Drop a .csv, .xlsx, .xlsm, .xls, or .tsv file.' }))
   }
 
   const ok = state.result?.status === 'success'
@@ -70,7 +70,7 @@ export default function Import() {
         <input
           id="file-input"
           type="file"
-          accept=".csv,.xlsx,.tsv,.txt"
+          accept=".csv,.xlsx,.xlsm,.xls,.tsv,.txt"
           className="hidden"
           onChange={e => {
             const f = e.target.files?.[0] ?? null
@@ -90,7 +90,7 @@ export default function Import() {
             <Upload size={24} color="#c0ccd8" className="mx-auto mb-2" />
             <p className="text-sm font-medium" style={{ color: '#6b7a99' }}>Drop your file here</p>
             <p className="text-xs mt-1" style={{ color: '#c0ccd8' }}>
-              CSV, XLSX, or TSV · IBKR · Fidelity · custom spreadsheet
+              CSV, XLSX, XLSM, XLS, or TSV · IBKR · Fidelity · custom spreadsheet
             </p>
           </>
         )}
