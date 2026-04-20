@@ -127,6 +127,31 @@ async def _apply_migrations(conn: asyncpg.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_instrument_conids_conid ON instrument_conids(conid)"
     )
 
+    # imported_positions: direct position snapshot from Fidelity/IBKR files.
+    # Stores the exact values from the file so portfolio view doesn't need to
+    # recompute from trades × live prices.
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS imported_positions (
+            id               SERIAL PRIMARY KEY,
+            import_id        INT,
+            account_id       VARCHAR(50)  NOT NULL,
+            symbol           VARCHAR(20)  NOT NULL,
+            quantity         DECIMAL,
+            last_price       DECIMAL,
+            current_value    DECIMAL,
+            today_gain_loss  DECIMAL,
+            today_gl_pct     DECIMAL,
+            total_gain_loss  DECIMAL,
+            total_gl_pct     DECIMAL,
+            cost_basis_total DECIMAL,
+            avg_cost         DECIMAL,
+            source           VARCHAR(20)  NOT NULL DEFAULT 'fidelity',
+            snapshot_date    DATE         NOT NULL DEFAULT CURRENT_DATE,
+            updated_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            UNIQUE (account_id, symbol)
+        )
+    """)
+
 
 async def init_pool() -> None:
     """Create the connection pool. Called once at application startup."""

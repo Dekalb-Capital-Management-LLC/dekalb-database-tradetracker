@@ -101,8 +101,54 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
             except Exception as exc:
                 logger.warning("IBKR live positions failed, falling back to trades: %s", exc)
 
-    # --- Trades + price fallback ---
+    # --- Imported position snapshot path (Fidelity positions file) ---
+    # When a Fidelity positions CSV was imported, use the numbers straight from
+    # the file — last_price, current_value, total_gain_loss — instead of
+    # recomputing from trades × live prices (which needs IBKR market data).
+    snap_params = [account_id] if account_id else []
+    snap_rows = await pool.fetch(
+        f"""
+        SELECT ip.symbol, ip.account_id, ip.quantity, ip.last_price,
+               ip.current_value, ip.total_gain_loss, ip.total_gl_pct,
+               ip.cost_basis_total, ip.avg_cost,
+               t.label
+        FROM imported_positions ip
+        LEFT JOIN LATERAL (
+            SELECT MAX(label) AS label
+            FROM trades
+            WHERE account_id = ip.account_id AND symbol = ip.symbol
+        ) t ON TRUE
+        {"WHERE ip.account_id = $1" if account_id else ""}
+        ORDER BY ip.symbol
+        """,
+        *snap_params,
+    )
 
+    if snap_rows:
+        positions: list[PositionSummary] = []
+        for r in snap_rows:
+            qty = Decimal(str(r["quantity"])) if r["quantity"] else Decimal("0")
+            if qty <= 0:
+                continue
+            avg_cost = Decimal(str(r["avg_cost"])).quantize(Decimal("0.0001")) if r["avg_cost"] else None
+            current_price = Decimal(str(r["last_price"])).quantize(Decimal("0.0001")) if r["last_price"] else None
+            market_value = Decimal(str(r["current_value"])).quantize(Decimal("0.01")) if r["current_value"] else None
+            unreal = Decimal(str(r["total_gain_loss"])).quantize(Decimal("0.01")) if r["total_gain_loss"] else None
+            unreal_pct = Decimal(str(r["total_gl_pct"])).quantize(Decimal("0.0001")) if r["total_gl_pct"] else None
+            positions.append(PositionSummary(
+                symbol=r["symbol"],
+                account_id=r["account_id"],
+                quantity=qty,
+                avg_cost=avg_cost,
+                current_price=current_price,
+                market_value=market_value,
+                unrealized_pnl=unreal,
+                unrealized_pnl_pct=unreal_pct,
+                label=r["label"],
+            ))
+        return positions
+
+    # --- Trades + IBKR price fallback ---
     params = [account_id] if account_id else []
     rows = await pool.fetch(
         f"""
@@ -122,7 +168,6 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
         *params,
     )
 
-    # Batch-warm the price cache for all symbols in one call before looping
     all_symbols = [row["symbol"] for row in rows]
     await market_data.warm_quote_cache(pool, all_symbols)
 
@@ -132,7 +177,6 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
         qty = Decimal(str(row["net_quantity"]))
         avg_cost = Decimal(str(row["avg_cost"])) if row["avg_cost"] else None
 
-        # Fetch current price — hits cache populated above (no network call per symbol)
         quote = await market_data.get_quote(pool, symbol)
         current_price = quote.price if quote else None
 
@@ -145,19 +189,17 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
             unrealized_pnl = (market_value - cost_basis).quantize(Decimal("0.01"))
             unrealized_pnl_pct = (unrealized_pnl / cost_basis * 100).quantize(Decimal("0.0001"))
 
-        positions.append(
-            PositionSummary(
-                symbol=symbol,
-                account_id=row["account_id"],
-                quantity=qty,
-                avg_cost=avg_cost,
-                current_price=current_price,
-                market_value=market_value,
-                unrealized_pnl=unrealized_pnl,
-                unrealized_pnl_pct=unrealized_pnl_pct,
-                label=row["label"],
-            )
-        )
+        positions.append(PositionSummary(
+            symbol=symbol,
+            account_id=row["account_id"],
+            quantity=qty,
+            avg_cost=avg_cost,
+            current_price=current_price,
+            market_value=market_value,
+            unrealized_pnl=unrealized_pnl,
+            unrealized_pnl_pct=unrealized_pnl_pct,
+            label=row["label"],
+        ))
     return positions
 
 
@@ -229,10 +271,34 @@ async def _account_summary(pool, account_id: str) -> AccountSummary:
             except Exception as exc:
                 logger.warning("IBKR live account summary failed, falling back: %s", exc)
 
-    # --- Trades-based fallback ---
-    # Realized P&L: for each symbol, (sell proceeds) - (avg_cost × sold_qty).
-    # Only counts shares that have actually been sold.
-    # avg_cost is weighted average of all buy fills for that symbol.
+    # --- Imported positions snapshot path (Fidelity) ---
+    # If a Fidelity positions file was imported, sum from imported_positions
+    # for perfectly accurate equity_value and unrealized PnL.
+    snap_total = await pool.fetchrow(
+        """
+        SELECT SUM(current_value) AS equity_value,
+               SUM(total_gain_loss) AS unrealized_pnl
+        FROM imported_positions
+        WHERE account_id = $1
+        """,
+        account_id,
+    )
+
+    source_row = await pool.fetchrow(
+        "SELECT source FROM trades WHERE account_id = $1 LIMIT 1",
+        account_id,
+    )
+
+    if snap_total and snap_total["equity_value"] is not None:
+        equity_value = Decimal(str(snap_total["equity_value"])).quantize(Decimal("0.01"))
+        unrealized_pnl = Decimal(str(snap_total["unrealized_pnl"] or 0)).quantize(Decimal("0.01"))
+    else:
+        # --- Trades + IBKR price fallback ---
+        positions = await _compute_positions(pool, account_id)
+        equity_value = sum((p.market_value or Decimal(0)) for p in positions)
+        unrealized_pnl = sum((p.unrealized_pnl or Decimal(0)) for p in positions)
+
+    # Realized P&L from trade history
     realized_row = await pool.fetchrow(
         """
         WITH by_symbol AS (
@@ -256,15 +322,6 @@ async def _account_summary(pool, account_id: str) -> AccountSummary:
         """,
         account_id,
     )
-
-    source_row = await pool.fetchrow(
-        "SELECT source FROM trades WHERE account_id = $1 LIMIT 1",
-        account_id,
-    )
-
-    positions = await _compute_positions(pool, account_id)
-    equity_value = sum((p.market_value or Decimal(0)) for p in positions)
-    unrealized_pnl = sum((p.unrealized_pnl or Decimal(0)) for p in positions)
 
     # Latest snapshot for today's P&L
     snap_row = await pool.fetchrow(

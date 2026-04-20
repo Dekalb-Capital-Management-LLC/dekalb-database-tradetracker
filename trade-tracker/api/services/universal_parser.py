@@ -50,8 +50,10 @@ def read_spreadsheet(raw_bytes: bytes, filename: str) -> tuple[pd.DataFrame, str
         # Read WITHOUT a header so every cell is preserved verbatim (Activity
         # Statements use different column counts per section, no single header).
         df = pd.read_excel(io.BytesIO(raw_bytes), engine=engine, header=None, dtype=str)
-        df = df.fillna("")
-        text = df.to_csv(index=False, header=False)
+        df = df.fillna("").replace("\x00", "", regex=True)
+        # Strip null bytes from string cells (some Excel files embed them)
+        df = df.applymap(lambda x: str(x).replace("\x00", "") if isinstance(x, str) else x)
+        text = df.to_csv(index=False, header=False).replace("\x00", "")
         return df, text
 
     # CSV / TSV / plain text — decode bytes with fallback encodings

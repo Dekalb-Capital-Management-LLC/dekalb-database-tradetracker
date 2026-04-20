@@ -313,6 +313,73 @@ def _parse_positions(
 
 
 # ---------------------------------------------------------------------------
+# Rich position snapshot extraction (Positions CSV only)
+# Returns list of dicts with all numeric fields Fidelity provides.
+# ---------------------------------------------------------------------------
+
+def extract_positions_snapshot(
+    csv_text: str,
+    account_id: str,
+    import_id: int,
+) -> list[dict]:
+    """
+    Parse a Fidelity Portfolio Positions CSV and return a list of position
+    dicts with all the financial data Fidelity already computed for us:
+    last_price, current_value, total_gain_loss, etc.
+    """
+    lines = csv_text.splitlines()
+    header_idx = _find_header_row(lines)
+    if header_idx is None:
+        return []
+    if "average cost basis" not in lines[header_idx].lower():
+        return []  # not a positions file
+
+    data_section = "\n".join(lines[header_idx:])
+    reader = csv.DictReader(io.StringIO(data_section))
+    if reader.fieldnames is None:
+        return []
+
+    norm = {_normalise_header(f): f for f in reader.fieldnames if f}
+
+    def col(row: dict, *candidates: str) -> str:
+        for c in candidates:
+            orig = norm.get(c)
+            if orig and orig in row:
+                return (row[orig] or "").strip()
+        return ""
+
+    results: list[dict] = []
+    for row in reader:
+        raw_symbol = _clean_symbol(col(row, "symbol"))
+        description = col(row, "description", "security description")
+        if not raw_symbol or _is_skip_row(raw_symbol, description):
+            continue
+        raw_symbol = raw_symbol.lstrip("-").strip()
+        if not raw_symbol or len(raw_symbol) > 10 or not re.match(r"^[A-Z0-9.]+$", raw_symbol):
+            continue
+
+        qty = _parse_fidelity_decimal(col(row, "quantity"))
+        if qty is None or qty == 0:
+            continue
+
+        results.append({
+            "symbol":          raw_symbol,
+            "account_id":      account_id,
+            "import_id":       import_id,
+            "quantity":        abs(qty),
+            "last_price":      _parse_fidelity_decimal(col(row, "last price")),
+            "current_value":   _parse_fidelity_decimal(col(row, "current value")),
+            "today_gain_loss": _parse_fidelity_decimal(col(row, "today's gain/loss dollar", "today gain/loss dollar")),
+            "today_gl_pct":    _parse_fidelity_decimal(col(row, "today's gain/loss percent", "today gain/loss percent")),
+            "total_gain_loss": _parse_fidelity_decimal(col(row, "total gain/loss dollar")),
+            "total_gl_pct":    _parse_fidelity_decimal(col(row, "total gain/loss percent")),
+            "cost_basis_total": _parse_fidelity_decimal(col(row, "cost basis total")),
+            "avg_cost":        _parse_fidelity_decimal(col(row, "average cost basis")),
+        })
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Public entry point — auto-detects format
 # ---------------------------------------------------------------------------
 

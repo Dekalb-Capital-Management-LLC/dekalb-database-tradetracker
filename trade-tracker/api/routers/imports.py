@@ -18,6 +18,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Up
 import db
 from models.schemas import FidelityImportResponse
 from services.universal_parser import auto_parse, persist_ibkr_conids
+from services.fidelity_parser import extract_positions_snapshot
 
 router = APIRouter(prefix="/import", tags=["imports"])
 logger = logging.getLogger(__name__)
@@ -160,6 +161,52 @@ async def upload_trades(
     success_count, insert_errors = await _insert_trades(pool, trades, source_label)
     errors.extend(insert_errors)
     error_count = len(errors)
+
+    # For Fidelity positions files: store the rich snapshot data (current value,
+    # total gain/loss, last price, etc.) directly so the portfolio view can serve
+    # the exact numbers Fidelity computed rather than recomputing from trades.
+    positions_written = 0
+    if source_label == "fidelity":
+        try:
+            pos_rows = extract_positions_snapshot(text, account_id, import_id)
+            for p in pos_rows:
+                await pool.execute(
+                    """
+                    INSERT INTO imported_positions
+                        (import_id, account_id, symbol, quantity, last_price,
+                         current_value, today_gain_loss, today_gl_pct,
+                         total_gain_loss, total_gl_pct, cost_basis_total,
+                         avg_cost, source, snapshot_date, updated_at)
+                    VALUES ($1,$2,$3,$4,$5, $6,$7,$8, $9,$10,$11, $12,'fidelity',CURRENT_DATE,NOW())
+                    ON CONFLICT (account_id, symbol) DO UPDATE SET
+                        import_id        = EXCLUDED.import_id,
+                        quantity         = EXCLUDED.quantity,
+                        last_price       = EXCLUDED.last_price,
+                        current_value    = EXCLUDED.current_value,
+                        today_gain_loss  = EXCLUDED.today_gain_loss,
+                        today_gl_pct     = EXCLUDED.today_gl_pct,
+                        total_gain_loss  = EXCLUDED.total_gain_loss,
+                        total_gl_pct     = EXCLUDED.total_gl_pct,
+                        cost_basis_total = EXCLUDED.cost_basis_total,
+                        avg_cost         = EXCLUDED.avg_cost,
+                        snapshot_date    = EXCLUDED.snapshot_date,
+                        updated_at       = NOW()
+                    """,
+                    p["import_id"], p["account_id"], p["symbol"],
+                    float(p["quantity"]) if p["quantity"] else None,
+                    float(p["last_price"]) if p["last_price"] else None,
+                    float(p["current_value"]) if p["current_value"] else None,
+                    float(p["today_gain_loss"]) if p["today_gain_loss"] else None,
+                    float(p["today_gl_pct"]) if p["today_gl_pct"] else None,
+                    float(p["total_gain_loss"]) if p["total_gain_loss"] else None,
+                    float(p["total_gl_pct"]) if p["total_gl_pct"] else None,
+                    float(p["cost_basis_total"]) if p["cost_basis_total"] else None,
+                    float(p["avg_cost"]) if p["avg_cost"] else None,
+                )
+            positions_written = len(pos_rows)
+            logger.info("Stored %d position snapshots for account %s", positions_written, account_id)
+        except Exception as exc:
+            logger.warning("Position snapshot storage failed: %s", exc)
 
     # If this was an IBKR Activity Statement, mine the Financial Instrument
     # Information section and persist symbol → conid mappings so market_data
