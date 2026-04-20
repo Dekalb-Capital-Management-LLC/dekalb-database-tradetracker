@@ -1,18 +1,17 @@
 """
-Market data service — IBKR Web API only.
+Market data service — IBKR Web API.
 
-All live quotes and historical bars come from IBKR's /iserver/marketdata/*
-endpoints. Symbols are resolved to conids via the local `instrument_conids`
-table (populated from IBKR Activity Statement imports) with a fallback to
-/trsrv/stocks for symbols we haven't seen before.
+Quotes come from /iserver/marketdata/snapshot with the standard pre-flight +
+retry pattern (handled inside ibkr_client.get_market_snapshot_batch).
+Historical bars come from /iserver/marketdata/history.
 
-Quotes are cached for PRICE_CACHE_TTL_SECONDS.
+All live data is cached in-process for PRICE_CACHE_TTL_SECONDS.
 """
 from __future__ import annotations
 
 import logging
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -21,9 +20,10 @@ from models.schemas import HistoricalBar, PriceQuote
 
 logger = logging.getLogger(__name__)
 
-# In-process TTL cache
-_price_cache: dict[str, tuple[float, PriceQuote]] = {}   # symbol -> (expires_at, quote)
-_conid_cache: dict[str, int] = {}                        # symbol -> conid (session)
+# symbol -> (expires_at, quote)
+_price_cache: dict[str, tuple[float, PriceQuote]] = {}
+# symbol -> conid  (session-lifetime)
+_conid_cache: dict[str, int] = {}
 
 
 def _cached_quote(symbol: str) -> Optional[PriceQuote]:
@@ -43,12 +43,12 @@ def _store_quote(symbol: str, quote: PriceQuote) -> None:
 
 async def _resolve_conids(pool, symbols: list[str]) -> dict[str, int]:
     """
-    Resolve a batch of symbols to IBKR conids.
-    Checks process cache, then the persistent instrument_conids table, then
-    falls back to /trsrv/stocks for anything still missing (and caches it).
+    Resolve symbols to IBKR conids.
+    Checks: process cache → instrument_conids table → /trsrv/stocks live lookup.
     """
     result: dict[str, int] = {}
     missing: list[str] = []
+
     for sym in symbols:
         s = sym.upper()
         if s in _conid_cache:
@@ -84,51 +84,48 @@ async def _resolve_conids(pool, symbols: list[str]) -> dict[str, int]:
                         sym, conid,
                     )
         except Exception as exc:
-            logger.warning("conid lookup failed for %s: %s", missing, exc)
+            logger.warning("conid batch lookup failed: %s", exc)
 
     return result
 
 
 # ---------------------------------------------------------------------------
-# Quote building
+# Quote building from IBKR snapshot field map
 # ---------------------------------------------------------------------------
 
 def _dec(val) -> Optional[Decimal]:
     if val is None:
         return None
     try:
-        s = str(val).strip().lstrip("C")  # IBKR sometimes prefixes change fields
+        s = str(val).strip().lstrip("C")  # IBKR prefixes change fields with "C"
         return Decimal(s) if s else None
     except Exception:
         return None
 
 
 def _snapshot_to_quote(symbol: str, snap: dict) -> Optional[PriceQuote]:
-    price = _dec(snap.get("31"))
+    price = _dec(snap.get("31"))  # last traded price
     if price is None:
         return None
-    prev_close = _dec(snap.get("7296"))
-    change = _dec(snap.get("82"))
-    change_pct = _dec(snap.get("83"))
     return PriceQuote(
         symbol=symbol,
         price=price,
-        change=change,
-        change_pct=change_pct,
-        previous_close=prev_close,
+        change=_dec(snap.get("82")),
+        change_pct=_dec(snap.get("83")),
+        previous_close=_dec(snap.get("7296")),
         source="ibkr",
         as_of=datetime.utcnow(),
     )
 
 
 # ---------------------------------------------------------------------------
-# Public: batch warming (preferred path for portfolio valuation)
+# Public: batch warm (call once per page load — one IBKR round-trip for all)
 # ---------------------------------------------------------------------------
 
 async def warm_quote_cache(pool, symbols: list[str]) -> None:
     """
-    Fetch current prices for N symbols in ONE IBKR snapshot call.
-    Populates the in-process cache so subsequent get_quote() calls are instant.
+    Fetch live prices for all symbols in a single IBKR snapshot call.
+    Skips symbols already in cache. No-ops when IBKR is not connected.
     """
     if not symbols:
         return
@@ -139,23 +136,22 @@ async def warm_quote_cache(pool, symbols: list[str]) -> None:
     try:
         from services.ibkr_client import ibkr_client
     except Exception as exc:
-        logger.error("IBKR client import failed: %s", exc)
+        logger.error("IBKR client unavailable: %s", exc)
         return
 
     if not ibkr_client.is_connected():
-        logger.warning("IBKR not connected — cannot fetch quotes for %d symbols", len(uncached))
+        logger.warning("IBKR not connected — skipping quote fetch for %d symbols", len(uncached))
         return
 
     conid_map = await _resolve_conids(pool, uncached)
     if not conid_map:
-        logger.warning("Could not resolve any conids for %s", uncached)
+        logger.warning("Could not resolve conids for %s", uncached)
         return
 
-    conids = list(conid_map.values())
-    snapshots = ibkr_client.get_market_snapshot_batch(conids)
+    snapshots = ibkr_client.get_market_snapshot_batch(list(conid_map.values()))
 
-    # Reverse lookup: conid -> symbol
     by_conid = {cid: sym for sym, cid in conid_map.items()}
+    cached_count = 0
     for cid, snap in snapshots.items():
         sym = by_conid.get(cid)
         if not sym:
@@ -163,12 +159,9 @@ async def warm_quote_cache(pool, symbols: list[str]) -> None:
         quote = _snapshot_to_quote(sym, snap)
         if quote:
             _store_quote(sym, quote)
+            cached_count += 1
 
-    logger.info(
-        "warm_quote_cache: cached %d/%d via IBKR",
-        sum(1 for s in uncached if _cached_quote(s)),
-        len(uncached),
-    )
+    logger.info("warm_quote_cache: %d/%d symbols priced via IBKR", cached_count, len(uncached))
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +169,6 @@ async def warm_quote_cache(pool, symbols: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 async def get_quote(pool, symbol: str) -> Optional[PriceQuote]:
-    """Get current price for one symbol (cached). Use warm_quote_cache for N symbols."""
     sym = symbol.upper()
     cached = _cached_quote(sym)
     if cached:
@@ -186,7 +178,7 @@ async def get_quote(pool, symbol: str) -> Optional[PriceQuote]:
 
 
 # ---------------------------------------------------------------------------
-# Historical bars (via IBKR /iserver/marketdata/history)
+# Historical bars
 # ---------------------------------------------------------------------------
 
 def _period_for(days: int) -> str:
@@ -201,13 +193,7 @@ def _period_for(days: int) -> str:
     return "2y"
 
 
-async def get_historical_bars(
-    pool,
-    symbol: str,
-    start: date,
-    end: date,
-) -> list[HistoricalBar]:
-    """Fetch OHLCV daily bars via IBKR for one symbol."""
+async def get_historical_bars(pool, symbol: str, start: date, end: date) -> list[HistoricalBar]:
     try:
         from services.ibkr_client import ibkr_client
         if not ibkr_client.is_connected():
@@ -216,7 +202,6 @@ async def get_historical_bars(
         conid = conid_map.get(symbol.upper())
         if conid is None:
             return []
-
         period = _period_for((end - start).days)
         raw = ibkr_client._get(
             "/iserver/marketdata/history",
@@ -224,7 +209,6 @@ async def get_historical_bars(
         )
         if not raw or "data" not in raw:
             return []
-
         bars: list[HistoricalBar] = []
         for b in raw["data"]:
             ts_ms = b.get("t")
@@ -256,18 +240,12 @@ async def get_historical_bars_batch(
     start: date,
     end: date,
 ) -> dict[str, dict[date, Decimal]]:
-    """
-    Fetch close prices for multiple symbols via IBKR.
-    Returns {symbol: {date: close_price}}.
-    """
     result: dict[str, dict[date, Decimal]] = {s.upper(): {} for s in symbols}
     if not symbols:
         return result
-
     try:
         from services.ibkr_client import ibkr_client
         if not ibkr_client.is_connected():
-            logger.warning("IBKR not connected — historical batch returning empty")
             return result
     except Exception as exc:
         logger.error("IBKR client unavailable: %s", exc)
@@ -301,5 +279,4 @@ async def get_historical_bars_batch(
 
 
 async def get_spy_history(pool, start: date, end: date) -> list[HistoricalBar]:
-    """SPY benchmark series."""
     return await get_historical_bars(pool, config.BENCHMARK_SYMBOL, start, end)

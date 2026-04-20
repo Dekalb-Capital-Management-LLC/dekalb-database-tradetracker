@@ -42,17 +42,40 @@ def read_spreadsheet(raw_bytes: bytes, filename: str) -> tuple[pd.DataFrame, str
     """
     Read any spreadsheet into a DataFrame of strings, plus a text representation
     used by section-aware parsers. Returns (df, text).
-    Excel files are converted to CSV text so section detection works uniformly.
+    Excel files: ALL sheets are stacked vertically (separated by blank rows) so
+    multi-tab portfolio workbooks parse correctly.
     """
     name = filename.lower()
     if name.endswith((".xlsx", ".xlsm", ".xls")):
         engine = "openpyxl" if name.endswith((".xlsx", ".xlsm")) else "xlrd"
-        # Read WITHOUT a header so every cell is preserved verbatim (Activity
-        # Statements use different column counts per section, no single header).
-        df = pd.read_excel(io.BytesIO(raw_bytes), engine=engine, header=None, dtype=str)
-        df = df.fillna("").replace("\x00", "", regex=True)
-        # Strip null bytes from string cells (some Excel files embed them)
-        df = df.applymap(lambda x: str(x).replace("\x00", "") if isinstance(x, str) else x)
+        # Read every sheet — a dict of {sheet_name: DataFrame}
+        sheets = pd.read_excel(
+            io.BytesIO(raw_bytes), engine=engine, header=None,
+            dtype=str, sheet_name=None,
+        )
+
+        cleaned: list[pd.DataFrame] = []
+        for sheet_df in sheets.values():
+            sd = sheet_df.fillna("").replace("\x00", "", regex=True)
+            sd = sd.applymap(lambda x: str(x).replace("\x00", "") if isinstance(x, str) else x)
+            cleaned.append(sd)
+
+        if not cleaned:
+            df = pd.DataFrame()
+        else:
+            # Pad to widest column count so concat doesn't drop data
+            max_cols = max(c.shape[1] for c in cleaned)
+            padded = []
+            for c in cleaned:
+                if c.shape[1] < max_cols:
+                    for i in range(max_cols - c.shape[1]):
+                        c[f"_pad_{i}"] = ""
+                padded.append(c)
+                # Insert one blank row between sheets so header detection
+                # doesn't carry across tab boundaries
+                padded.append(pd.DataFrame([[""] * max_cols], columns=padded[-1].columns))
+            df = pd.concat(padded, ignore_index=True).fillna("")
+
         text = df.to_csv(index=False, header=False).replace("\x00", "")
         return df, text
 
@@ -172,26 +195,26 @@ def _norm(col: str) -> str:
     return re.sub(r"\s+", " ", str(col).strip().lower())
 
 
-def _find_simple_header_row(df: pd.DataFrame) -> Optional[int]:
-    """Find the row that contains 'ticker'/'symbol' and looks like column names."""
-    for i in range(min(30, len(df))):
+def _find_all_simple_header_rows(df: pd.DataFrame) -> list[int]:
+    """
+    Find every row that looks like a 'Ticker | Date | Amount | Price'-style
+    header. Used for multi-sheet workbooks where each tab has its own header.
+    """
+    hits: list[int] = []
+    for i in range(len(df)):
         cells = [_norm(c) for c in df.iloc[i].tolist()]
         if any(c in ("ticker", "symbol") for c in cells):
-            return i
-    return None
+            hits.append(i)
+    return hits
 
 
 def _parse_simple_portfolio_pd(df: pd.DataFrame, import_id: int) -> tuple[list[TradeCreate], list[str], str]:
     trades: list[TradeCreate] = []
     errors: list[str] = []
 
-    header_idx = _find_simple_header_row(df)
-    if header_idx is None:
+    header_idxs = _find_all_simple_header_rows(df)
+    if not header_idxs:
         return [], ["Could not find a header row containing 'Ticker' or 'Symbol'."], "PORTFOLIO"
-
-    headers = [_norm(c) for c in df.iloc[header_idx].tolist()]
-    data_df = df.iloc[header_idx + 1:].copy()
-    data_df.columns = headers + [f"_extra_{i}" for i in range(len(data_df.columns) - len(headers))]
 
     def pick(row, *names: str) -> str:
         for n in names:
@@ -204,52 +227,59 @@ def _parse_simple_portfolio_pd(df: pd.DataFrame, import_id: int) -> tuple[list[T
                     return s
         return ""
 
-    for row_num, (_, row) in enumerate(data_df.iterrows(), start=header_idx + 2):
-        symbol = pick(row, "ticker", "symbol").upper().strip()
-        if not symbol:
-            continue
-        # Strip junk like "AAPL (Apple Inc)" -> "AAPL"
-        symbol = symbol.split()[0].split("(")[0].strip()
-        if not re.match(r"^[A-Z0-9.\-]+$", symbol) or len(symbol) > 10:
-            continue
+    # Iterate each header section: rows from header+1 up to the next header (or EOF)
+    for sec_idx, header_idx in enumerate(header_idxs):
+        end_idx = header_idxs[sec_idx + 1] if sec_idx + 1 < len(header_idxs) else len(df)
+        headers = [_norm(c) for c in df.iloc[header_idx].tolist()]
+        data_df = df.iloc[header_idx + 1:end_idx].copy()
+        data_df.columns = headers + [f"_extra_{i}" for i in range(len(data_df.columns) - len(headers))]
 
-        raw_date = pick(row, "date acquired", "date", "trade date", "purchase date")
-        trade_date = _parse_date(raw_date)
-        if trade_date is None:
-            errors.append(f"Row {row_num}: unrecognised date '{raw_date}' for {symbol} — skipped")
-            continue
+        for row_num, (_, row) in enumerate(data_df.iterrows(), start=header_idx + 2):
+            symbol = pick(row, "ticker", "symbol").upper().strip()
+            if not symbol:
+                continue
+            symbol = symbol.split()[0].split("(")[0].strip()
+            if not re.match(r"^[A-Z0-9.\-]+$", symbol) or len(symbol) > 10:
+                continue
 
-        qty_raw = pick(row, "amount", "quantity", "shares", "qty", "# shares")
-        qty = _parse_number(qty_raw)
-        if qty is None or qty <= 0:
-            errors.append(f"Row {row_num}: invalid quantity '{qty_raw}' for {symbol} — skipped")
-            continue
+            raw_date = pick(row, "date acquired", "date", "trade date", "purchase date")
+            trade_date = _parse_date(raw_date)
+            if trade_date is None:
+                errors.append(f"Row {row_num}: unrecognised date '{raw_date}' for {symbol} — skipped")
+                continue
 
-        price_raw = pick(row, "price acquired", "price", "cost", "cost basis", "unit cost", "avg price")
-        price = _parse_number(price_raw)
-        if price is None or price <= 0:
-            errors.append(f"Row {row_num}: invalid price '{price_raw}' for {symbol} — skipped")
-            continue
+            qty_raw = pick(row, "amount", "quantity", "shares", "qty", "# shares")
+            qty = _parse_number(qty_raw)
+            if qty is None or qty <= 0:
+                errors.append(f"Row {row_num}: invalid quantity '{qty_raw}' for {symbol} — skipped")
+                continue
 
-        gross = (qty * price).quantize(Decimal("0.01"))
-        trades.append(TradeCreate(
-            source="portfolio",
-            account_id="PORTFOLIO",
-            trade_date=trade_date,
-            symbol=symbol,
-            side="BUY",
-            quantity=qty,
-            price=price,
-            commission=Decimal("0"),
-            gross_amount=gross,
-            net_amount=-gross,
-            label=None,
-            is_hedge=False,
-            fidelity_import_id=import_id,
-            raw_data={"_row": row_num},
-        ))
+            price_raw = pick(row, "price acquired", "price", "cost", "cost basis", "unit cost", "avg price")
+            price = _parse_number(price_raw)
+            if price is None or price <= 0:
+                errors.append(f"Row {row_num}: invalid price '{price_raw}' for {symbol} — skipped")
+                continue
 
-    logger.info("Simple portfolio: %d trades, %d errors", len(trades), len(errors))
+            gross = (qty * price).quantize(Decimal("0.01"))
+            trades.append(TradeCreate(
+                source="portfolio",
+                account_id="PORTFOLIO",
+                trade_date=trade_date,
+                symbol=symbol,
+                side="BUY",
+                quantity=qty,
+                price=price,
+                commission=Decimal("0"),
+                gross_amount=gross,
+                net_amount=-gross,
+                label=None,
+                is_hedge=False,
+                fidelity_import_id=import_id,
+                raw_data={"_row": row_num, "_section": sec_idx},
+            ))
+
+    logger.info("Simple portfolio: %d trades, %d errors (from %d sheet section(s))",
+                len(trades), len(errors), len(header_idxs))
     return trades, errors, "PORTFOLIO"
 
 

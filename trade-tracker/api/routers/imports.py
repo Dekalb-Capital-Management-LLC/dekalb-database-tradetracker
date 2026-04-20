@@ -162,6 +162,62 @@ async def upload_trades(
     errors.extend(insert_errors)
     error_count = len(errors)
 
+    # For simple portfolio imports (XLSX): aggregate by symbol, fetch live
+    # IBKR prices, write imported_positions so the portfolio view shows
+    # real current value and P&L without a separate Fidelity file.
+    if source_label == "portfolio" and trades:
+        try:
+            from services.market_data import warm_quote_cache, get_quote
+            agg: dict[str, dict] = {}
+            for t in trades:
+                sym = t.symbol
+                if sym not in agg:
+                    agg[sym] = {"qty": 0.0, "cost": 0.0}
+                agg[sym]["qty"] += float(t.quantity)
+                agg[sym]["cost"] += float(t.quantity) * float(t.price)
+
+            await warm_quote_cache(pool, list(agg.keys()))
+
+            for sym, data in agg.items():
+                qty = data["qty"]
+                if qty <= 0:
+                    continue
+                avg_cost = data["cost"] / qty
+                quote = await get_quote(pool, sym)
+                last_price = float(quote.price) if quote else None
+                current_value = qty * last_price if last_price is not None else None
+                cost_basis = qty * avg_cost
+                total_gl = (current_value - cost_basis) if current_value is not None else None
+                total_gl_pct = (total_gl / cost_basis * 100) if total_gl is not None and cost_basis else None
+
+                await pool.execute(
+                    """
+                    INSERT INTO imported_positions
+                        (import_id, account_id, symbol, quantity, last_price,
+                         current_value, today_gain_loss, today_gl_pct,
+                         total_gain_loss, total_gl_pct, cost_basis_total,
+                         avg_cost, source, snapshot_date, updated_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,NULL,NULL,$7,$8,$9,$10,'portfolio',CURRENT_DATE,NOW())
+                    ON CONFLICT (account_id, symbol) DO UPDATE SET
+                        import_id        = EXCLUDED.import_id,
+                        quantity         = EXCLUDED.quantity,
+                        last_price       = EXCLUDED.last_price,
+                        current_value    = EXCLUDED.current_value,
+                        total_gain_loss  = EXCLUDED.total_gain_loss,
+                        total_gl_pct     = EXCLUDED.total_gl_pct,
+                        cost_basis_total = EXCLUDED.cost_basis_total,
+                        avg_cost         = EXCLUDED.avg_cost,
+                        snapshot_date    = EXCLUDED.snapshot_date,
+                        updated_at       = NOW()
+                    """,
+                    import_id, account_id, sym,
+                    qty, last_price, current_value,
+                    total_gl, total_gl_pct, cost_basis, avg_cost,
+                )
+            logger.info("Stored %d portfolio position snapshots (account=%s)", len(agg), account_id)
+        except Exception as exc:
+            logger.warning("Portfolio position snapshot storage failed: %s", exc)
+
     # For Fidelity positions files: store the rich snapshot data (current value,
     # total gain/loss, last price, etc.) directly so the portfolio view can serve
     # the exact numbers Fidelity computed rather than recomputing from trades.
