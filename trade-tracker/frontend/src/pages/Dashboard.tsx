@@ -80,6 +80,8 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null)
   const [syncing, setSyncing] = useState(false)
   const [syncMsg, setSyncMsg] = useState<string | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
+  const [refreshMsg, setRefreshMsg] = useState<string | null>(null)
 
   const accounts: AccountSummary[] = summary?.accounts ?? []
 
@@ -97,6 +99,20 @@ export default function Dashboard() {
     const id = setInterval(loadSummary, 60_000)
     return () => clearInterval(id)
   }, [])
+
+  async function refreshPrices() {
+    setRefreshing(true)
+    setRefreshMsg(null)
+    try {
+      const res = await post<{ updated: number; total_symbols: number; errors: string[] }>('/portfolio/refresh-prices')
+      setRefreshMsg(`${res.updated}/${res.total_symbols} updated`)
+      await loadSummary()
+    } catch (e: any) {
+      setRefreshMsg(`Failed: ${e.message}`)
+    } finally {
+      setRefreshing(false)
+    }
+  }
 
   async function syncTrades() {
     setSyncing(true)
@@ -161,9 +177,21 @@ export default function Dashboard() {
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-2xl font-bold" style={{ color: '#1a2744' }}>Dashboard</h2>
           <div className="flex items-center gap-3">
+            {refreshMsg && (
+              <span className="text-xs" style={{ color: '#6b7a99' }}>{refreshMsg}</span>
+            )}
             {syncMsg && (
               <span className="text-xs" style={{ color: '#6b7a99' }}>{syncMsg}</span>
             )}
+            <button
+              onClick={refreshPrices}
+              disabled={refreshing}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors disabled:opacity-50"
+              style={{ backgroundColor: '#1a2744', border: '1px solid #1a2744', color: '#ffffff' }}
+            >
+              <RefreshCw size={13} className={refreshing ? 'animate-spin' : ''} />
+              {refreshing ? 'Fetching...' : 'Pull Live Prices'}
+            </button>
             <button
               onClick={syncTrades}
               disabled={syncing}

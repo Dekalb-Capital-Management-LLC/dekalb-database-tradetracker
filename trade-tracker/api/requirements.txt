@@ -17,6 +17,7 @@ pydantic==2.7.1
 # Utilities
 python-dateutil==2.9.0
 requests==2.31.0
+yfinance>=0.2.40
 
 # IBKR RSA authentication
 PyJWT==2.8.0

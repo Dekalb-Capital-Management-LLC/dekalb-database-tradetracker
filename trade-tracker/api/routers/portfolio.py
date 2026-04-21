@@ -501,6 +501,70 @@ async def get_snapshots(
         raise HTTPException(status_code=500, detail="Error fetching snapshots")
 
 
+@router.post("/refresh-prices")
+async def refresh_prices(pool=Depends(get_pool)):
+    """
+    Pull latest prices from Yahoo Finance for every symbol in imported_positions,
+    then recompute current_value / total_gain_loss / total_gl_pct.
+    Call this manually whenever you want fresh P&L numbers.
+    """
+    import yfinance as yf
+
+    rows = await pool.fetch(
+        "SELECT account_id, symbol, quantity, avg_cost, cost_basis_total FROM imported_positions"
+    )
+    if not rows:
+        return {"updated": 0, "message": "No positions found — import a file first"}
+
+    symbols = list({r["symbol"] for r in rows})
+    prices: dict[str, float] = {}
+    errors: list[str] = []
+
+    for sym in symbols:
+        try:
+            info = yf.Ticker(sym).info
+            price = info.get("currentPrice") or info.get("regularMarketPrice")
+            if price:
+                prices[sym] = float(price)
+        except Exception as exc:
+            errors.append(f"{sym}: {exc}")
+
+    updated = 0
+    for r in rows:
+        sym = r["symbol"]
+        price = prices.get(sym)
+        if price is None:
+            continue
+        qty = float(r["quantity"] or 0)
+        cost_basis = float(r["cost_basis_total"] or 0)
+        current_value = qty * price
+        total_gl = current_value - cost_basis
+        total_gl_pct = (total_gl / cost_basis * 100) if cost_basis else None
+        await pool.execute(
+            """
+            UPDATE imported_positions
+            SET last_price       = $1,
+                current_value    = $2,
+                total_gain_loss  = $3,
+                total_gl_pct     = $4,
+                snapshot_date    = CURRENT_DATE,
+                updated_at       = NOW()
+            WHERE account_id = $5 AND symbol = $6
+            """,
+            price, current_value, total_gl, total_gl_pct,
+            r["account_id"], sym,
+        )
+        updated += 1
+
+    logger.info("refresh-prices: updated %d positions, %d errors", updated, len(errors))
+    return {
+        "updated": updated,
+        "total_symbols": len(symbols),
+        "prices_found": len(prices),
+        "errors": errors[:10],
+    }
+
+
 @router.post("/snapshots/backfill", tags=["portfolio"])
 async def backfill_snapshots_endpoint(
     background_tasks,
