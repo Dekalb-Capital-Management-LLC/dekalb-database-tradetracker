@@ -159,9 +159,7 @@ async def startup():
     else:
         logger.warning("IBKR disabled — no market data available. Set IBKR_ENABLED=true to activate.")
 
-    # Auto-backfill and hourly refresh run in background
-    asyncio.create_task(_auto_backfill())
-    asyncio.create_task(_hourly_snapshot_loop())
+
 
 
 @app.on_event("shutdown")

@@ -159,14 +159,10 @@ export default function Import() {
                     <td className="py-2 pr-4 text-xs whitespace-nowrap" style={{ color: '#6b7a99' }}>
                       {new Date(imp.imported_at).toLocaleDateString('en-US', {
                         month: 'short', day: 'numeric', year: 'numeric',
-                        month: 'short', day: 'numeric', year: 'numeric',
                       })}
                     </td>
                     <td className="py-2 pr-4 text-xs max-w-xs truncate" title={imp.filename}
                       style={{ color: '#374151' }}>{imp.filename}</td>
-                    <td className="py-2 pr-4 text-xs" style={{ color: '#9ca3af' }}>
-                      {imp.account_id ?? '—'}
-                    </td>
                     <td className="py-2 pr-4 text-right text-xs tabular-nums" style={{ color: '#374151' }}>
                       {imp.success_count}/{imp.row_count ?? '?'}
                     </td>
