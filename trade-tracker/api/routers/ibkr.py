@@ -159,11 +159,13 @@ async def sync_recent_trades(pool=Depends(get_pool)):
     """
     Fetches the last ~24 hours of fills from IBKR and inserts any new ones
     into the trades table. Existing trades are matched by ibkr_order_id and skipped.
-
-    Run this once per day (or after any trading session) to keep the trades table current.
-    For trade history older than 24h, use IBKR Flex Queries and the manual import endpoint.
     """
-    _require_ibkr()
+    if not config.IBKR_ENABLED or not config.IBKR_ACCOUNT_ID:
+        return {"inserted": 0, "skipped": 0, "total_from_ibkr": 0,
+                "message": "IBKR not configured. Set IBKR_ENABLED=true and IBKR_ACCOUNT_ID."}
+    if not ibkr_client.is_connected():
+        return {"inserted": 0, "skipped": 0, "total_from_ibkr": 0,
+                "message": "IBKR gateway not connected. Check /ibkr/status for details."}
 
     raw_trades = ibkr_client.get_recent_trades(config.IBKR_ACCOUNT_ID)
     if not raw_trades:

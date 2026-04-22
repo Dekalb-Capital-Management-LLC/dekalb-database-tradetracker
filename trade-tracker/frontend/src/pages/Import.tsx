@@ -4,37 +4,33 @@ import { get, postForm } from '../api/client'
 
 export default function Import() {
   const [file, setFile] = useState<File | null>(null)
-  const [accountId, setAccountId] = useState('')
   const [uploading, setUploading] = useState(false)
   const [result, setResult] = useState<FidelityImport | null>(null)
   const [uploadError, setUploadError] = useState<string | null>(null)
   const [imports, setImports] = useState<FidelityImport[]>([])
   const [drag, setDrag] = useState(false)
 
-  useEffect(() => {
-    get<FidelityImport[]>('/import/fidelity')
-      .then(setImports)
-      .catch(() => {})
-  }, [])
+  function loadHistory() {
+    get<FidelityImport[]>('/import/history').then(setImports).catch(() => {})
+  }
+
+  useEffect(() => { loadHistory() }, [])
 
   async function handleUpload() {
-    if (!file) { setUploadError('Select a CSV file.'); return }
-    if (!accountId.trim()) { setUploadError('Enter an account ID.'); return }
+    if (!file) { setUploadError('Select an .xlsx file.'); return }
 
     const form = new FormData()
     form.append('file', file)
-    form.append('account_id', accountId.trim())
 
     setUploading(true)
     setUploadError(null)
     setResult(null)
 
     try {
-      const res = await postForm<FidelityImport>('/import/fidelity', form)
+      const res = await postForm<FidelityImport>('/import/trades', form)
       setResult(res)
       setFile(null)
-      const updated = await get<FidelityImport[]>('/import/fidelity')
-      setImports(updated)
+      loadHistory()
     } catch (e: any) {
       setUploadError(e.message)
     } finally {
@@ -44,24 +40,13 @@ export default function Import() {
 
   return (
     <div className="p-6 max-w-2xl mx-auto">
-      <h2 className="text-xl font-semibold text-white mb-6">Import Trades</h2>
+      <h2 className="text-xl font-semibold text-white mb-2">Import Portfolio</h2>
+      <p className="text-xs text-gray-500 mb-6">
+        Upload your .xlsx file. Each sheet should have columns: <span className="text-gray-400">Ticker | Date Acquired | Amount | Price Acquired</span>
+      </p>
 
       {/* Upload card */}
       <div className="bg-gray-900 border border-gray-800 rounded-lg p-6 mb-8">
-        <h3 className="text-sm font-medium text-gray-200 mb-1">Fidelity CSV Upload</h3>
-        <p className="text-xs text-gray-500 mb-5">
-          In Fidelity: <span className="text-gray-400">Accounts &amp; Trade → Portfolio → Activity &amp; Orders → Download</span>
-        </p>
-
-        {/* Account ID input */}
-        <label className="block text-xs text-gray-500 mb-1">Account ID</label>
-        <input
-          type="text"
-          placeholder="e.g. FIDELITY_MAIN or Z12345678"
-          value={accountId}
-          onChange={(e) => setAccountId(e.target.value)}
-          className="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-blue-500 mb-5"
-        />
 
         {/* Drop zone */}
         <div
@@ -71,14 +56,15 @@ export default function Import() {
             e.preventDefault()
             setDrag(false)
             const dropped = e.dataTransfer.files[0]
-            if (dropped?.name.toLowerCase().endsWith('.csv')) {
+            if (dropped?.name.toLowerCase().match(/\.xlsx?$/)) {
               setFile(dropped)
+              setUploadError(null)
             } else {
-              setUploadError('Please drop a .csv file.')
+              setUploadError('Please drop an .xlsx file.')
             }
           }}
-          onClick={() => document.getElementById('csv-file-input')?.click()}
-          className={`border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-colors mb-4 ${
+          onClick={() => document.getElementById('xlsx-file-input')?.click()}
+          className={`border-2 border-dashed rounded-lg p-10 text-center cursor-pointer transition-colors mb-4 ${
             drag
               ? 'border-blue-500 bg-blue-950/20'
               : file
@@ -87,11 +73,11 @@ export default function Import() {
           }`}
         >
           <input
-            id="csv-file-input"
+            id="xlsx-file-input"
             type="file"
-            accept=".csv"
+            accept=".xlsx,.xlsm"
             className="hidden"
-            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+            onChange={(e) => { setFile(e.target.files?.[0] ?? null); setUploadError(null) }}
           />
           {file ? (
             <>
@@ -101,20 +87,18 @@ export default function Import() {
             </>
           ) : (
             <>
-              <p className="text-gray-400 text-sm">Drop your Fidelity CSV here</p>
+              <p className="text-gray-400 text-sm">Drop your portfolio .xlsx here</p>
               <p className="text-xs text-gray-600 mt-1">or click to browse</p>
             </>
           )}
         </div>
 
-        {/* Error */}
         {uploadError && (
           <div className="bg-red-950/50 border border-red-800/50 text-red-300 px-3 py-2 rounded-lg text-xs mb-3">
             {uploadError}
           </div>
         )}
 
-        {/* Success/partial result */}
         {result && (
           <div
             className={`px-3 py-2 rounded-lg text-xs mb-3 border ${
@@ -126,17 +110,17 @@ export default function Import() {
             }`}
           >
             {result.status === 'success'
-              ? `✓ Imported ${result.success_count} trades successfully.`
+              ? `✓ Imported ${result.success_count} rows. Prices will refresh automatically.`
               : `${result.success_count} imported, ${result.error_count} failed${result.error_message ? `: ${result.error_message}` : '.'}`}
           </div>
         )}
 
         <button
           onClick={handleUpload}
-          disabled={uploading || !file || !accountId.trim()}
+          disabled={uploading || !file}
           className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-800 disabled:text-gray-600 text-white rounded-lg text-sm font-medium transition-colors"
         >
-          {uploading ? 'Uploading...' : 'Upload CSV'}
+          {uploading ? 'Uploading...' : 'Upload Portfolio'}
         </button>
       </div>
 
@@ -155,7 +139,6 @@ export default function Import() {
                 <tr className="border-b border-gray-800 text-xs text-gray-500 uppercase tracking-wider">
                   <th className="text-left py-2 pr-4 font-medium">Date</th>
                   <th className="text-left py-2 pr-4 font-medium">File</th>
-                  <th className="text-left py-2 pr-4 font-medium">Account</th>
                   <th className="text-right py-2 pr-4 font-medium">Rows</th>
                   <th className="text-left py-2 font-medium">Status</th>
                 </tr>
@@ -165,31 +148,21 @@ export default function Import() {
                   <tr key={imp.import_id} className="border-b border-gray-800/40">
                     <td className="py-2 pr-4 text-gray-500 text-xs whitespace-nowrap">
                       {new Date(imp.imported_at).toLocaleDateString('en-US', {
-                        month: 'short',
-                        day: 'numeric',
-                        year: 'numeric',
+                        month: 'short', day: 'numeric', year: 'numeric',
                       })}
                     </td>
-                    <td
-                      className="py-2 pr-4 text-gray-300 text-xs max-w-xs truncate"
-                      title={imp.filename}
-                    >
+                    <td className="py-2 pr-4 text-gray-300 text-xs max-w-xs truncate" title={imp.filename}>
                       {imp.filename}
                     </td>
-                    <td className="py-2 pr-4 text-gray-500 text-xs">{imp.account_id ?? '—'}</td>
                     <td className="py-2 pr-4 text-right text-gray-400 text-xs tabular-nums">
                       {imp.success_count}/{imp.row_count ?? '?'}
                     </td>
                     <td className="py-2">
-                      <span
-                        className={`text-xs px-2 py-0.5 rounded ${
-                          imp.status === 'success'
-                            ? 'bg-emerald-900/50 text-emerald-400'
-                            : imp.status === 'partial'
-                            ? 'bg-yellow-900/50 text-yellow-400'
-                            : 'bg-red-900/50 text-red-400'
-                        }`}
-                      >
+                      <span className={`text-xs px-2 py-0.5 rounded ${
+                        imp.status === 'success' ? 'bg-emerald-900/50 text-emerald-400'
+                        : imp.status === 'partial' ? 'bg-yellow-900/50 text-yellow-400'
+                        : 'bg-red-900/50 text-red-400'
+                      }`}>
                         {imp.status}
                       </span>
                     </td>

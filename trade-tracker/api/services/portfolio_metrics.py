@@ -19,7 +19,6 @@ from typing import Optional
 import asyncpg
 
 from models.schemas import PerformancePoint, PortfolioMetrics
-from services.market_data import get_spy_history
 
 logger = logging.getLogger(__name__)
 
@@ -125,19 +124,32 @@ async def upsert_snapshot(
     snapshot_date: date,
     total_nav: Decimal,
     account_id: Optional[str],
-    cash_balance: Optional[Decimal] = None,
     equity_value: Optional[Decimal] = None,
     prev_nav: Optional[Decimal] = None,
+    cash_balance: Optional[Decimal] = None,
 ) -> None:
-    """
-    Upsert a portfolio NAV snapshot.
-    Also fetches SPY close for the date and stores it for overlay calculations.
-    """
-    from services.market_data import get_historical_bars
+    """Upsert a portfolio NAV snapshot with SPY close from yfinance."""
+    import yfinance as yf
 
-    # Get SPY data for this date
-    spy_bars = get_historical_bars("SPY", snapshot_date, snapshot_date)
-    spy_close = Decimal(str(spy_bars[0].close)) if spy_bars else None
+    # Fetch SPY close for this date via yfinance
+    spy_close: Optional[Decimal] = None
+    spy_daily_pct: Optional[Decimal] = None
+    try:
+        spy_hist = yf.Ticker("SPY").history(start=snapshot_date.isoformat(), end=(snapshot_date + timedelta(days=5)).isoformat())
+        if not spy_hist.empty:
+            spy_close = Decimal(str(round(float(spy_hist["Close"].iloc[0]), 4)))
+            if len(spy_hist) > 1 or prev_nav is not None:
+                # Get previous trading day close for daily pct
+                spy_prev = yf.Ticker("SPY").history(
+                    start=(snapshot_date - timedelta(days=7)).isoformat(),
+                    end=snapshot_date.isoformat(),
+                )
+                if not spy_prev.empty:
+                    prev_spy = Decimal(str(round(float(spy_prev["Close"].iloc[-1]), 4)))
+                    if prev_spy > 0:
+                        spy_daily_pct = ((spy_close - prev_spy) / prev_spy * 100).quantize(Decimal("0.000001"))
+    except Exception as exc:
+        logger.warning("SPY fetch failed for %s: %s", snapshot_date, exc)
 
     daily_pnl: Optional[Decimal] = None
     daily_pnl_pct: Optional[Decimal] = None
@@ -145,25 +157,6 @@ async def upsert_snapshot(
         daily_pnl = total_nav - prev_nav
         daily_pnl_pct = (daily_pnl / prev_nav * 100).quantize(Decimal("0.000001"))
 
-    # Fetch previous SPY close to calculate daily pct
-    spy_daily_pct: Optional[Decimal] = None
-    if spy_close:
-        prev_spy_bars = get_historical_bars(
-            "SPY",
-            snapshot_date - timedelta(days=5),  # look back enough to find last trading day
-            snapshot_date - timedelta(days=1),
-        )
-        if prev_spy_bars:
-            prev_spy_close = prev_spy_bars[-1].close
-            if prev_spy_close > 0:
-                spy_daily_pct = (
-                    (spy_close - prev_spy_close) / prev_spy_close * 100
-                ).quantize(Decimal("0.000001"))
-
-    # ON CONFLICT must reference different partial indexes depending on whether
-    # account_id is NULL (combined portfolio) or NOT NULL (per-account).
-    # A plain UNIQUE(date, account_id) silently fails for NULLs in PostgreSQL
-    # because NULL != NULL in standard equality — so we use partial indexes.
     if account_id is None:
         conflict_clause = "ON CONFLICT (snapshot_date) WHERE account_id IS NULL"
     else:
@@ -188,7 +181,7 @@ async def upsert_snapshot(
         snapshot_date, account_id, total_nav, cash_balance, equity_value,
         daily_pnl, daily_pnl_pct, spy_close, spy_daily_pct,
     )
-    logger.info("Upserted snapshot %s account=%s nav=%s", snapshot_date, account_id, total_nav)
+    logger.info("Upserted snapshot %s account=%s nav=%s spy=%s", snapshot_date, account_id, total_nav, spy_close)
 
 
 # ---------------------------------------------------------------------------
@@ -395,3 +388,48 @@ async def _calculate_win_rate(
     except Exception as exc:
         logger.error("Win rate calculation failed: %s", exc)
     return None
+
+
+async def backfill_snapshots(pool: asyncpg.Pool) -> dict:
+    """
+    Write/update today's snapshot from imported_positions current values.
+    Called automatically after a successful import.
+    """
+    try:
+        acct_rows = await pool.fetch("SELECT DISTINCT account_id FROM imported_positions")
+        if not acct_rows:
+            return {"skipped": "no imported_positions"}
+        today = date.today()
+        combined_nav = Decimal(0)
+        for ar in acct_rows:
+            acct_id = ar["account_id"]
+            t = await pool.fetchrow(
+                "SELECT SUM(current_value) AS nav FROM imported_positions WHERE account_id=$1",
+                acct_id,
+            )
+            nav = Decimal(str(t["nav"] or 0))
+            prev = await pool.fetchrow(
+                """
+                SELECT total_nav FROM portfolio_snapshots
+                WHERE account_id=$1 AND snapshot_date < $2
+                ORDER BY snapshot_date DESC LIMIT 1
+                """,
+                acct_id, today,
+            )
+            await upsert_snapshot(pool, today, nav, acct_id, nav,
+                                  Decimal(str(prev["total_nav"])) if prev else None)
+            combined_nav += nav
+        prev_comb = await pool.fetchrow(
+            """
+            SELECT total_nav FROM portfolio_snapshots
+            WHERE account_id IS NULL AND snapshot_date < $1
+            ORDER BY snapshot_date DESC LIMIT 1
+            """,
+            today,
+        )
+        await upsert_snapshot(pool, today, combined_nav, None, combined_nav,
+                              Decimal(str(prev_comb["total_nav"])) if prev_comb else None)
+        return {"ok": True, "nav": float(combined_nav)}
+    except Exception as exc:
+        logger.error("backfill_snapshots failed: %s", exc)
+        return {"error": str(exc)}

@@ -7,7 +7,7 @@ import type {
   PortfolioSummary,
   PositionSummary,
 } from '../types'
-import { get } from '../api/client'
+import { get, post } from '../api/client'
 import MetricCard from '../components/MetricCard'
 import PerformanceChart from '../components/PerformanceChart'
 import PositionsTable from '../components/PositionsTable'
@@ -51,6 +51,8 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [chartLoading, setChartLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
+  const [refreshMsg, setRefreshMsg] = useState<string | null>(null)
 
   const accounts: AccountSummary[] = summary?.accounts ?? []
 
@@ -60,12 +62,32 @@ export default function Dashboard() {
 
   const accountParam = selectedAccount ? `&account_id=${encodeURIComponent(selectedAccount)}` : ''
 
-  // Load summary once on mount
-  useEffect(() => {
-    get<PortfolioSummary>('/portfolio/summary')
+  function loadSummary() {
+    return get<PortfolioSummary>('/portfolio/summary')
       .then(setSummary)
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
+  }
+
+  async function refreshPrices() {
+    setRefreshing(true)
+    setRefreshMsg(null)
+    try {
+      const res = await post<{ updated: number; total_symbols: number }>('/portfolio/refresh-prices')
+      setRefreshMsg(`${res.updated}/${res.total_symbols} updated`)
+      await loadSummary()
+    } catch (e: any) {
+      setRefreshMsg(`Error: ${e.message}`)
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
+  // Load summary once on mount, auto-refresh every 5 min
+  useEffect(() => {
+    loadSummary()
+    const id = setInterval(loadSummary, 300_000)
+    return () => clearInterval(id)
   }, [])
 
   // Load metrics + performance when period or account changes
@@ -117,6 +139,17 @@ export default function Dashboard() {
               As of {new Date(summary.as_of).toLocaleString()}
             </p>
           )}
+        </div>
+
+        <div className="flex items-center gap-3">
+          {refreshMsg && <span className="text-xs text-gray-500">{refreshMsg}</span>}
+          <button
+            onClick={refreshPrices}
+            disabled={refreshing}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white transition-colors"
+          >
+            {refreshing ? '⏳ Fetching...' : '↻ Pull Live Prices'}
+          </button>
         </div>
 
         {/* Period selector */}
