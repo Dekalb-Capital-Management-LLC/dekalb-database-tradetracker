@@ -175,7 +175,7 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
         qty = Decimal(str(row["net_qty"]))
         avg_cost = Decimal(str(row["avg_cost"])) if row["avg_cost"] else None
 
-        quote = await market_data.get_quote(pool, symbol)
+        quote = await market_data.get_quote(pool, row["symbol"])
         current_price = quote.price if quote else None
 
         market_value = (qty * current_price).quantize(Decimal("0.01")) if current_price else None
@@ -188,7 +188,7 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
             unrealized_pnl_pct = (unrealized_pnl / cost_basis * 100).quantize(Decimal("0.0001"))
 
         positions.append(PositionSummary(
-            symbol=symbol,
+            symbol=row["symbol"],
             account_id=row["account_id"],
             quantity=qty,
             avg_cost=avg_cost,
@@ -281,7 +281,6 @@ async def _account_summary(pool, account_id: str) -> AccountSummary:
         """,
         account_id,
     )
-    realized = Decimal(str(realized_row["realized_pnl"])).quantize(Decimal("0.01"))
 
     source_row = await pool.fetchrow(
         "SELECT source FROM trades WHERE account_id=$1 LIMIT 1", account_id
@@ -320,6 +319,7 @@ async def _account_summary(pool, account_id: str) -> AccountSummary:
         """,
         account_id,
     )
+    realized = Decimal(str(realized_row["realized_pnl"])).quantize(Decimal("0.01"))
 
     # Latest snapshot for today's P&L
     snap_row = await pool.fetchrow(
