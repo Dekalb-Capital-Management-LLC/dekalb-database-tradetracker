@@ -91,7 +91,7 @@ def parse_portfolio_xlsx(raw_bytes: bytes, import_id: int, account_id: str = "PO
     errors: list[str] = []
 
     for sheet_name, df in sheets.items():
-        df = df.fillna("").applymap(lambda x: str(x).replace("\x00", "") if isinstance(x, str) else x)
+        df = df.fillna("").map(lambda x: str(x).replace("\x00", "") if isinstance(x, str) else x)
 
         # Find header row (contains "ticker" or "symbol")
         header_idx = None
