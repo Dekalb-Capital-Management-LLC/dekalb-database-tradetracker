@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 
 import config
 import db
@@ -246,8 +246,11 @@ async def _sync_ibkr_trades(pool) -> dict:
 
 
 @router.post("/sync/trades", summary="Pull recent IBKR fills into trades table (also runs automatically every hour)")
-async def sync_recent_trades(background_tasks, pool=Depends(get_pool)):
-    _require_ibkr()
+async def sync_recent_trades(background_tasks: BackgroundTasks, pool=Depends(get_pool)):
+    if not config.IBKR_ENABLED or not config.IBKR_ACCOUNT_ID:
+        return {"inserted": 0, "skipped": 0, "total_from_ibkr": 0, "message": "IBKR not configured"}
+    if not ibkr_client.is_connected():
+        return {"inserted": 0, "skipped": 0, "total_from_ibkr": 0, "message": "IBKR gateway not connected"}
     result = await _sync_ibkr_trades(pool)
     # Refresh today's snapshot after sync so dashboard numbers update
     if result.get("inserted", 0) > 0:

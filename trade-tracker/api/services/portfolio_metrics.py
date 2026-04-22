@@ -151,15 +151,6 @@ async def upsert_snapshot(
     except Exception as exc:
         logger.warning("SPY fetch failed for %s: %s", snapshot_date, exc)
 
-    if spy_prev_close is None and spy_close is not None:
-        prev_spy_bars = await get_historical_bars(
-            pool,
-            "SPY",
-            snapshot_date - timedelta(days=5),
-            snapshot_date - timedelta(days=1),
-        )
-        spy_prev_close = Decimal(str(prev_spy_bars[-1].close)) if prev_spy_bars else None
-
     daily_pnl: Optional[Decimal] = None
     daily_pnl_pct: Optional[Decimal] = None
     if prev_nav and prev_nav > 0:

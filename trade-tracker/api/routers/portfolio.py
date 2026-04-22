@@ -15,7 +15,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 
 import config
 import db
@@ -560,7 +560,7 @@ async def get_snapshots(
 
 @router.post("/snapshots/backfill", tags=["portfolio"])
 async def backfill_snapshots_endpoint(
-    background_tasks,
+    background_tasks: BackgroundTasks,
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
     pool=Depends(get_pool),
