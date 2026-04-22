@@ -27,7 +27,7 @@ from models.schemas import (
     PortfolioSummary,
     PositionSummary,
 )
-from services import portfolio_metrics
+from services import market_data, portfolio_metrics
 
 router = APIRouter(prefix="/portfolio", tags=["portfolio"])
 logger = logging.getLogger(__name__)
