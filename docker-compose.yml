@@ -131,7 +131,9 @@ services:
   # Health check: http://localhost:8000/health
   # ---------------------------------------------------------------
   trade-tracker:
-    build: ./trade-tracker/api
+    build:
+      context: .
+      dockerfile: trade-tracker/api/Dockerfile
     ports:
       - "8000:8000"
     dns:
