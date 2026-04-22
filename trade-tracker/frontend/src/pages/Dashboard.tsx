@@ -80,6 +80,8 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [refreshMsg, setRefreshMsg] = useState<string | null>(null)
+  const [syncing, setSyncing] = useState(false)
+  const [syncMsg, setSyncMsg] = useState<string | null>(null)
 
   const accounts: AccountSummary[] = summary?.accounts ?? []
 
@@ -112,20 +114,6 @@ export default function Dashboard() {
     const id = setInterval(loadSummary, 300_000)
     return () => clearInterval(id)
   }, [])
-
-  async function refreshPrices() {
-    setRefreshing(true)
-    setRefreshMsg(null)
-    try {
-      const res = await post<{ updated: number; total_symbols: number; errors: string[] }>('/portfolio/refresh-prices')
-      setRefreshMsg(`${res.updated}/${res.total_symbols} updated`)
-      await loadSummary()
-    } catch (e: any) {
-      setRefreshMsg(`Failed: ${e.message}`)
-    } finally {
-      setRefreshing(false)
-    }
-  }
 
   async function syncTrades() {
     setSyncing(true)
@@ -237,9 +225,6 @@ export default function Dashboard() {
                 style={{ color: '#1a2744' }}
               />
             </div>
-          </div>
-        </div>
-      </div>
 
       {/* Error bar */}
       {error && (
