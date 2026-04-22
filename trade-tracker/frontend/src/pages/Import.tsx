@@ -149,7 +149,6 @@ export default function Import() {
                   style={{ borderBottom: '1px solid #e8edf5', color: '#9ca3af' }}>
                   <th className="text-left py-2 pr-4 font-medium">Date</th>
                   <th className="text-left py-2 pr-4 font-medium">File</th>
-                  <th className="text-left py-2 pr-4 font-medium">Account</th>
                   <th className="text-right py-2 pr-4 font-medium">Rows</th>
                   <th className="text-left py-2 font-medium">Status</th>
                 </tr>
@@ -159,6 +158,7 @@ export default function Import() {
                   <tr key={imp.import_id} style={{ borderBottom: '1px solid #f1f5f9' }}>
                     <td className="py-2 pr-4 text-xs whitespace-nowrap" style={{ color: '#6b7a99' }}>
                       {new Date(imp.imported_at).toLocaleDateString('en-US', {
+                        month: 'short', day: 'numeric', year: 'numeric',
                         month: 'short', day: 'numeric', year: 'numeric',
                       })}
                     </td>

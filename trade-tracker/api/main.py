@@ -54,63 +54,102 @@ app.include_router(market.router)
 app.include_router(ibkr.router)
 
 
-async def _auto_backfill():
-    """
-    On startup: if we have trades but missing/stale snapshots, run backfill automatically.
-    Waits 15s for DB + IBKR to settle before starting.
-    """
-    await asyncio.sleep(15)
-    try:
-        pool = db.get_pool()
-        trade_count = await pool.fetchval("SELECT COUNT(*) FROM trades")
-        if not trade_count:
-            logger.info("Auto-backfill: no trades yet, skipping")
-            return
+async def _auto_refresh_loop():
+    """Refresh yfinance prices + write snapshot every 5 minutes."""
+    import yfinance as yf
+    from datetime import date
+    from decimal import Decimal
+    from services.portfolio_metrics import upsert_snapshot
 
-        latest_snap = await pool.fetchval(
-            "SELECT MAX(snapshot_date) FROM portfolio_snapshots WHERE account_id IS NULL"
-        )
-        today = date.today()
-        needs_backfill = (latest_snap is None) or ((today - latest_snap).days > 1)
+    INTERVAL = 300  # seconds
+    await asyncio.sleep(30)  # wait for DB pool to be ready
 
-        if needs_backfill:
-            logger.info("Auto-backfill: snapshots missing or stale (latest=%s), running now...", latest_snap)
-            from services.portfolio_metrics import backfill_snapshots
-            result = await backfill_snapshots(pool)
-            logger.info("Auto-backfill complete: %s", result)
-        else:
-            logger.info("Auto-backfill: snapshots are current (latest=%s), skipping", latest_snap)
-    except Exception as exc:
-        logger.error("Auto-backfill failed: %s", exc)
-
-
-async def _hourly_snapshot_loop():
-    """
-    Every hour: generate today's snapshot so the dashboard stays current.
-    Uses live IBKR prices and historical bars.
-    """
-    await asyncio.sleep(60)  # Let startup settle first
     while True:
         try:
             pool = db.get_pool()
-            trade_count = await pool.fetchval("SELECT COUNT(*) FROM trades")
-            if trade_count:
-                from services.portfolio_metrics import backfill_snapshots
-                # Only backfill the last 2 days to keep it fast
-                from datetime import timedelta
-                start = date.today() - timedelta(days=2)
-                await backfill_snapshots(pool, start_date=start)
-                logger.info("Hourly snapshot refresh complete")
+            rows = await pool.fetch(
+                "SELECT account_id, symbol, quantity, avg_cost, cost_basis_total FROM imported_positions"
+            )
+            if rows:
+                symbols = list({r["symbol"] for r in rows})
+                prices: dict[str, float] = {}
+                for sym in symbols:
+                    try:
+                        info = yf.Ticker(sym).info
+                        p = info.get("currentPrice") or info.get("regularMarketPrice")
+                        if p:
+                            prices[sym] = float(p)
+                    except Exception:
+                        pass
+
+                updated = 0
+                for r in rows:
+                    price = prices.get(r["symbol"])
+                    if price is None:
+                        continue
+                    qty = float(r["quantity"] or 0)
+                    cost_basis = float(r["cost_basis_total"] or 0)
+                    current_value = qty * price
+                    total_gl = current_value - cost_basis
+                    total_gl_pct = (total_gl / cost_basis * 100) if cost_basis else None
+                    await pool.execute(
+                        """
+                        UPDATE imported_positions
+                        SET last_price=$1, current_value=$2, total_gain_loss=$3,
+                            total_gl_pct=$4, snapshot_date=CURRENT_DATE, updated_at=NOW()
+                        WHERE account_id=$5 AND symbol=$6
+                        """,
+                        price, current_value, total_gl, total_gl_pct,
+                        r["account_id"], r["symbol"],
+                    )
+                    updated += 1
+
+                if updated > 0:
+                    today = date.today()
+                    acct_rows = await pool.fetch(
+                        "SELECT DISTINCT account_id FROM imported_positions"
+                    )
+                    combined_nav = Decimal(0)
+                    for ar in acct_rows:
+                        acct_id = ar["account_id"]
+                        t = await pool.fetchrow(
+                            "SELECT SUM(current_value) AS nav FROM imported_positions WHERE account_id=$1",
+                            acct_id,
+                        )
+                        nav = Decimal(str(t["nav"] or 0))
+                        prev = await pool.fetchrow(
+                            """
+                            SELECT total_nav FROM portfolio_snapshots
+                            WHERE account_id=$1 AND snapshot_date < $2
+                            ORDER BY snapshot_date DESC LIMIT 1
+                            """,
+                            acct_id, today,
+                        )
+                        await upsert_snapshot(pool, today, nav, acct_id, nav,
+                                              Decimal(str(prev["total_nav"])) if prev else None)
+                        combined_nav += nav
+                    prev_comb = await pool.fetchrow(
+                        """
+                        SELECT total_nav FROM portfolio_snapshots
+                        WHERE account_id IS NULL AND snapshot_date < $1
+                        ORDER BY snapshot_date DESC LIMIT 1
+                        """,
+                        today,
+                    )
+                    await upsert_snapshot(pool, today, combined_nav, None, combined_nav,
+                                         Decimal(str(prev_comb["total_nav"])) if prev_comb else None)
+                    logger.info("Auto-refresh: updated %d positions, snapshot written", updated)
         except Exception as exc:
-            logger.error("Hourly snapshot loop error: %s", exc)
-        await asyncio.sleep(3600)  # 1 hour
+            logger.warning("Auto-refresh error: %s", exc)
+
+        await asyncio.sleep(INTERVAL)
 
 
 @app.on_event("startup")
 async def startup():
     await db.init_pool()
-    logger.info("Trade Tracker API started")
-
+    asyncio.create_task(_auto_refresh_loop())
+    logger.info("Trade Tracker API started. Docs at /docs")
     if config.IBKR_ENABLED:
         import threading
         from services.ibkr_client import ibkr_client

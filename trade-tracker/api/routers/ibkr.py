@@ -157,10 +157,16 @@ def get_live_positions():
 
 async def _sync_ibkr_trades(pool) -> dict:
     """
-    Pull recent fills from IBKR and insert new ones into the trades table.
-    Called automatically after connect and by the hourly cron.
-    Existing trades (matched by ibkr_order_id) are skipped.
+    Fetches the last ~24 hours of fills from IBKR and inserts any new ones
+    into the trades table. Existing trades are matched by ibkr_order_id and skipped.
     """
+    if not config.IBKR_ENABLED or not config.IBKR_ACCOUNT_ID:
+        return {"inserted": 0, "skipped": 0, "total_from_ibkr": 0,
+                "message": "IBKR not configured. Set IBKR_ENABLED=true and IBKR_ACCOUNT_ID."}
+    if not ibkr_client.is_connected():
+        return {"inserted": 0, "skipped": 0, "total_from_ibkr": 0,
+                "message": "IBKR gateway not connected. Check /ibkr/status for details."}
+
     raw_trades = ibkr_client.get_recent_trades(config.IBKR_ACCOUNT_ID)
     if not raw_trades:
         return {"inserted": 0, "skipped": 0, "total_from_ibkr": 0, "message": "No recent trades returned by IBKR"}

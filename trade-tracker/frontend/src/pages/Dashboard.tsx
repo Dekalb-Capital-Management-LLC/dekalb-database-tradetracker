@@ -78,8 +78,6 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [chartLoading, setChartLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [syncing, setSyncing] = useState(false)
-  const [syncMsg, setSyncMsg] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [refreshMsg, setRefreshMsg] = useState<string | null>(null)
 
@@ -94,9 +92,24 @@ export default function Dashboard() {
       .finally(() => setLoading(false))
   }
 
+  async function refreshPrices() {
+    setRefreshing(true)
+    setRefreshMsg(null)
+    try {
+      const res = await post<{ updated: number; total_symbols: number }>('/portfolio/refresh-prices')
+      setRefreshMsg(`${res.updated}/${res.total_symbols} updated`)
+      await loadSummary()
+    } catch (e: any) {
+      setRefreshMsg(`Error: ${e.message}`)
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
+  // Load summary once on mount, auto-refresh every 5 min
   useEffect(() => {
     loadSummary()
-    const id = setInterval(loadSummary, 60_000)
+    const id = setInterval(loadSummary, 300_000)
     return () => clearInterval(id)
   }, [])
 
@@ -170,86 +183,44 @@ export default function Dashboard() {
   return (
     <div className="flex flex-col h-full">
       {/* Page header */}
-      <div
-        className="px-8 pt-6 pb-0 shrink-0"
-        style={{ backgroundColor: 'transparent' }}
-      >
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-2xl font-bold" style={{ color: '#1a2744' }}>Dashboard</h2>
-          <div className="flex items-center gap-3">
-            {refreshMsg && (
-              <span className="text-xs" style={{ color: '#6b7a99' }}>{refreshMsg}</span>
-            )}
-            {syncMsg && (
-              <span className="text-xs" style={{ color: '#6b7a99' }}>{syncMsg}</span>
-            )}
-            <button
-              onClick={refreshPrices}
-              disabled={refreshing}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors disabled:opacity-50"
-              style={{ backgroundColor: '#1a2744', border: '1px solid #1a2744', color: '#ffffff' }}
-            >
-              <RefreshCw size={13} className={refreshing ? 'animate-spin' : ''} />
-              {refreshing ? 'Fetching...' : 'Pull Live Prices'}
-            </button>
-            <button
-              onClick={syncTrades}
-              disabled={syncing}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors disabled:opacity-50"
-              style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8', color: '#374151' }}
-            >
-              <RefreshCw size={13} className={syncing ? 'animate-spin' : ''} />
-              {syncing ? 'Syncing...' : 'Sync Trades'}
-            </button>
-          </div>
+      <div className="flex items-start justify-between mb-6">
+        <div>
+          <h2 className="text-xl font-semibold text-white">Portfolio Overview</h2>
+          {summary && (
+            <p className="text-xs text-gray-500 mt-0.5">
+              As of {new Date(summary.as_of).toLocaleString()}
+            </p>
+          )}
         </div>
 
-        {/* Tab bar */}
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-1">
-            {tabs.map((tab) => {
-              const isActive = selectedAccount === tab.key
-              return (
-                <button
-                  key={tab.key ?? 'overview'}
-                  onClick={() => setSelectedAccount(tab.key)}
-                  className="px-4 py-2 text-sm font-medium transition-colors relative"
-                  style={{ color: isActive ? '#1a2744' : '#6b7a99' }}
-                >
-                  {tab.label}
-                  {isActive && (
-                    <span
-                      className="absolute bottom-0 left-0 right-0 h-0.5 rounded-t"
-                      style={{ backgroundColor: '#1a2744' }}
-                    />
-                  )}
-                </button>
-              )
-            })}
-          </div>
+        <div className="flex items-center gap-3">
+          {refreshMsg && <span className="text-xs text-gray-500">{refreshMsg}</span>}
+          <button
+            onClick={refreshPrices}
+            disabled={refreshing}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white transition-colors"
+          >
+            {refreshing ? '⏳ Fetching...' : '↻ Pull Live Prices'}
+          </button>
+        </div>
 
-          {/* Search + period */}
-          <div className="flex items-center gap-2 mb-1">
-            {/* Period pills */}
-            <div
-              className="flex items-center rounded-lg p-0.5"
-              style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8' }}
+        {/* Period selector */}
+        <div className="flex bg-gray-900 border border-gray-800 rounded-lg p-1 gap-0.5">
+          {PERIODS.map((p) => (
+            <button
+              key={p.value}
+              onClick={() => setPeriod(p.value)}
+              className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
+                period === p.value
+                  ? 'bg-blue-600 text-white'
+                  : 'text-gray-400 hover:text-white'
+              }`}
             >
-              {PERIODS.map((p) => (
-                <button
-                  key={p.value}
-                  onClick={() => setPeriod(p.value)}
-                  className="px-3 py-1 rounded-md text-xs font-medium transition-colors"
-                  style={
-                    period === p.value
-                      ? { backgroundColor: '#1a2744', color: '#ffffff' }
-                      : { color: '#6b7a99' }
-                  }
-                >
-                  {p.label}
-                </button>
-              ))}
-            </div>
+              {p.label}
+            </button>
+          ))}
+        </div>
+      </div>
 
             {/* Search */}
             <div
