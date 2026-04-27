@@ -372,11 +372,36 @@ class IBKRClient:
         return bars
 
     def get_positions(self, account_id: str) -> list[dict]:
+        # Portfolio endpoints require /portfolio/accounts to be called first
         self._get("/portfolio/accounts")
-        data = self._get(f"/portfolio/{account_id}/positions/0")
-        if data is None:
-            return []
-        return data if isinstance(data, list) else []
+
+        all_positions: list[dict] = []
+        page = 0
+
+        while True:
+            # IBKR returns [] on the first call (subscription delay). Retry up to 3x.
+            data = None
+            for attempt in range(3):
+                data = self._get(f"/portfolio/{account_id}/positions/{page}")
+                if data and isinstance(data, list) and len(data) > 0:
+                    break
+                if attempt < 2:
+                    time.sleep(1.5)
+
+            if not data or not isinstance(data, list) or len(data) == 0:
+                break  # no more pages
+
+            all_positions.extend(data)
+            logger.info("IBKR positions page %d: got %d rows (total so far %d)",
+                        page, len(data), len(all_positions))
+
+            # IBKR paginates in chunks of 30; if we got a full page, fetch the next
+            if len(data) < 30:
+                break
+            page += 1
+
+        logger.info("IBKR get_positions: %d total positions for %s", len(all_positions), account_id)
+        return all_positions
 
     def get_recent_trades(self, account_id: str) -> list[dict]:
         # days=7 fetches up to 7 days of fills (IBKR max for this endpoint)
