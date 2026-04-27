@@ -127,19 +127,20 @@ async def upsert_snapshot(
     equity_value: Optional[Decimal] = None,
     prev_nav: Optional[Decimal] = None,
     cash_balance: Optional[Decimal] = None,
+    spy_close: Optional[Decimal] = None,
+    spy_prev_close: Optional[Decimal] = None,
 ) -> None:
     """Upsert a portfolio NAV snapshot with SPY close from yfinance."""
     import yfinance as yf
 
-    # Fetch SPY close for this date via yfinance
-    spy_close: Optional[Decimal] = None
     spy_daily_pct: Optional[Decimal] = None
-    try:
-        spy_hist = yf.Ticker("SPY").history(start=snapshot_date.isoformat(), end=(snapshot_date + timedelta(days=5)).isoformat())
-        if not spy_hist.empty:
-            spy_close = Decimal(str(round(float(spy_hist["Close"].iloc[0]), 4)))
-            if len(spy_hist) > 1 or prev_nav is not None:
-                # Get previous trading day close for daily pct
+
+    if spy_close is None:
+        # Fetch SPY close for this date via yfinance
+        try:
+            spy_hist = yf.Ticker("SPY").history(start=snapshot_date.isoformat(), end=(snapshot_date + timedelta(days=5)).isoformat())
+            if not spy_hist.empty:
+                spy_close = Decimal(str(round(float(spy_hist["Close"].iloc[0]), 4)))
                 spy_prev = yf.Ticker("SPY").history(
                     start=(snapshot_date - timedelta(days=7)).isoformat(),
                     end=snapshot_date.isoformat(),
@@ -148,8 +149,10 @@ async def upsert_snapshot(
                     prev_spy = Decimal(str(round(float(spy_prev["Close"].iloc[-1]), 4)))
                     if prev_spy > 0:
                         spy_daily_pct = ((spy_close - prev_spy) / prev_spy * 100).quantize(Decimal("0.000001"))
-    except Exception as exc:
-        logger.warning("SPY fetch failed for %s: %s", snapshot_date, exc)
+        except Exception as exc:
+            logger.warning("SPY fetch failed for %s: %s", snapshot_date, exc)
+    elif spy_prev_close is not None and spy_prev_close > 0:
+        spy_daily_pct = ((spy_close - spy_prev_close) / spy_prev_close * 100).quantize(Decimal("0.000001"))
 
     daily_pnl: Optional[Decimal] = None
     daily_pnl_pct: Optional[Decimal] = None
@@ -561,46 +564,3 @@ async def _calculate_win_rate(
     return None
 
 
-async def backfill_snapshots(pool: asyncpg.Pool) -> dict:
-    """
-    Write/update today's snapshot from imported_positions current values.
-    Called automatically after a successful import.
-    """
-    try:
-        acct_rows = await pool.fetch("SELECT DISTINCT account_id FROM imported_positions")
-        if not acct_rows:
-            return {"skipped": "no imported_positions"}
-        today = date.today()
-        combined_nav = Decimal(0)
-        for ar in acct_rows:
-            acct_id = ar["account_id"]
-            t = await pool.fetchrow(
-                "SELECT SUM(current_value) AS nav FROM imported_positions WHERE account_id=$1",
-                acct_id,
-            )
-            nav = Decimal(str(t["nav"] or 0))
-            prev = await pool.fetchrow(
-                """
-                SELECT total_nav FROM portfolio_snapshots
-                WHERE account_id=$1 AND snapshot_date < $2
-                ORDER BY snapshot_date DESC LIMIT 1
-                """,
-                acct_id, today,
-            )
-            await upsert_snapshot(pool, today, nav, acct_id, nav,
-                                  Decimal(str(prev["total_nav"])) if prev else None)
-            combined_nav += nav
-        prev_comb = await pool.fetchrow(
-            """
-            SELECT total_nav FROM portfolio_snapshots
-            WHERE account_id IS NULL AND snapshot_date < $1
-            ORDER BY snapshot_date DESC LIMIT 1
-            """,
-            today,
-        )
-        await upsert_snapshot(pool, today, combined_nav, None, combined_nav,
-                              Decimal(str(prev_comb["total_nav"])) if prev_comb else None)
-        return {"ok": True, "nav": float(combined_nav)}
-    except Exception as exc:
-        logger.error("backfill_snapshots failed: %s", exc)
-        return {"error": str(exc)}

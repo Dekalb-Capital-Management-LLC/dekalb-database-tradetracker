@@ -152,6 +152,19 @@ async def _apply_migrations(conn: asyncpg.Connection) -> None:
         )
     """)
 
+    # Partial unique indexes for portfolio_snapshots ON CONFLICT upserts.
+    # These must exist for upsert_snapshot to work correctly. Safe to re-run.
+    await conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_uq_combined
+        ON portfolio_snapshots (snapshot_date)
+        WHERE account_id IS NULL
+    """)
+    await conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_uq_account
+        ON portfolio_snapshots (snapshot_date, account_id)
+        WHERE account_id IS NOT NULL
+    """)
+
 
 async def init_pool() -> None:
     """Create the connection pool. Called once at application startup."""

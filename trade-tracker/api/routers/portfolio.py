@@ -412,24 +412,26 @@ async def get_positions(
         raise HTTPException(status_code=500, detail="Error computing positions")
 
 
-@router.post("/refresh-prices")
-async def refresh_prices(pool=Depends(get_pool)):
+@router.post("/update-all")
+@router.post("/refresh-prices")  # keep old path working
+async def update_all(pool=Depends(get_pool)):
     """
-    Fetch live prices from Yahoo Finance for every symbol in imported_positions.
-    Recomputes current_value and total_gain_loss = (price - avg_cost) * qty.
-    Then writes a portfolio_snapshot for today.
+    Single endpoint to refresh live prices and write today's snapshot.
+    Fetches prices via yfinance for all symbols in imported_positions,
+    updates current_value / gain_loss, then upserts a portfolio snapshot.
     """
     import yfinance as yf
+    from services.portfolio_metrics import upsert_snapshot
 
     rows = await pool.fetch(
         "SELECT account_id, symbol, quantity, avg_cost, cost_basis_total FROM imported_positions"
     )
     if not rows:
-        return {"updated": 0, "message": "No positions — import a file first"}
+        return {"updated": 0, "snapshot_written": False, "message": "No positions — import a file first"}
 
     symbols = list({r["symbol"] for r in rows})
     prices: dict[str, float] = {}
-    errors: list[str] = []
+    price_errors: list[str] = []
 
     CASH_SYMBOLS = {"XXCASH", "CASH", "SPAXX", "FDRXX", "FCASH"}
     for sym in symbols:
@@ -441,8 +443,10 @@ async def refresh_prices(pool=Depends(get_pool)):
             price = info.get("currentPrice") or info.get("regularMarketPrice")
             if price:
                 prices[sym] = float(price)
+            else:
+                price_errors.append(f"{sym}: no price returned")
         except Exception as exc:
-            errors.append(f"{sym}: {exc}")
+            price_errors.append(f"{sym}: {exc}")
 
     updated = 0
     for r in rows:
@@ -467,15 +471,16 @@ async def refresh_prices(pool=Depends(get_pool)):
         )
         updated += 1
 
-    # Auto-write a snapshot so performance graph works
+    # Write today's snapshot so the performance graph accumulates history
+    snapshot_written = False
+    snapshot_nav = None
     if updated > 0:
         try:
-            from services.portfolio_metrics import upsert_snapshot
+            today = date.today()
             account_rows = await pool.fetch(
                 "SELECT DISTINCT account_id FROM imported_positions"
             )
             combined_nav = Decimal(0)
-            today = date.today()
             for ar in account_rows:
                 acct_id = ar["account_id"]
                 snap_total = await pool.fetchrow(
@@ -505,11 +510,20 @@ async def refresh_prices(pool=Depends(get_pool)):
             )
             await upsert_snapshot(pool, today, combined_nav, None, combined_nav,
                                   Decimal(str(prev_comb["total_nav"])) if prev_comb else None)
+            snapshot_written = True
+            snapshot_nav = float(combined_nav)
+            logger.info("update-all: snapshot written for %s, combined NAV=%s", today, combined_nav)
         except Exception as exc:
-            logger.warning("Auto-snapshot after refresh-prices failed: %s", exc)
+            logger.error("update-all: snapshot write failed: %s", exc)
 
-    logger.info("refresh-prices: %d/%d symbols updated, %d errors", updated, len(symbols), len(errors))
-    return {"updated": updated, "total_symbols": len(symbols), "prices_found": len(prices), "errors": errors[:10]}
+    logger.info("update-all: %d/%d positions updated, %d price errors", updated, len(symbols), len(price_errors))
+    return {
+        "updated": updated,
+        "total_symbols": len(symbols),
+        "snapshot_written": snapshot_written,
+        "portfolio_nav": snapshot_nav,
+        "price_errors": price_errors[:5],
+    }
 
 
 @router.get("/performance", response_model=list[PerformancePoint])

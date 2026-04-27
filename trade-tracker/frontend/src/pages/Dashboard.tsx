@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Search, RefreshCw } from 'lucide-react'
+import { Search } from 'lucide-react'
 import type {
   AccountSummary,
   PerformancePoint,
@@ -78,10 +78,8 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [chartLoading, setChartLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [refreshing, setRefreshing] = useState(false)
-  const [refreshMsg, setRefreshMsg] = useState<string | null>(null)
-  const [syncing, setSyncing] = useState(false)
-  const [syncMsg, setSyncMsg] = useState<string | null>(null)
+  const [updating, setUpdating] = useState(false)
+  const [updateMsg, setUpdateMsg] = useState<string | null>(null)
 
   const accounts: AccountSummary[] = summary?.accounts ?? []
 
@@ -94,17 +92,18 @@ export default function Dashboard() {
       .finally(() => setLoading(false))
   }
 
-  async function refreshPrices() {
-    setRefreshing(true)
-    setRefreshMsg(null)
+  async function updatePortfolio() {
+    setUpdating(true)
+    setUpdateMsg(null)
     try {
-      const res = await post<{ updated: number; total_symbols: number }>('/portfolio/refresh-prices')
-      setRefreshMsg(`${res.updated}/${res.total_symbols} updated`)
+      const res = await post<{ updated: number; total_symbols: number; snapshot_written: boolean; portfolio_nav: number | null }>('/portfolio/update-all')
+      const nav = res.portfolio_nav != null ? ` · NAV $${res.portfolio_nav.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : ''
+      setUpdateMsg(`${res.updated}/${res.total_symbols} prices · snapshot ${res.snapshot_written ? '✓' : '✗'}${nav}`)
       await loadSummary()
     } catch (e: any) {
-      setRefreshMsg(`Error: ${e.message}`)
+      setUpdateMsg(`Error: ${e.message}`)
     } finally {
-      setRefreshing(false)
+      setUpdating(false)
     }
   }
 
@@ -114,20 +113,6 @@ export default function Dashboard() {
     const id = setInterval(loadSummary, 300_000)
     return () => clearInterval(id)
   }, [])
-
-  async function syncTrades() {
-    setSyncing(true)
-    setSyncMsg(null)
-    try {
-      const res = await post<{ inserted: number; skipped: number }>('/ibkr/sync/trades')
-      setSyncMsg(`${res.inserted} new, ${res.skipped} skipped`)
-      await loadSummary()
-    } catch (e: any) {
-      setSyncMsg(`Failed: ${e.message}`)
-    } finally {
-      setSyncing(false)
-    }
-  }
 
   useEffect(() => {
     setChartLoading(true)
@@ -182,13 +167,13 @@ export default function Dashboard() {
         </div>
 
         <div className="flex items-center gap-3">
-          {refreshMsg && <span className="text-xs text-gray-500">{refreshMsg}</span>}
+          {updateMsg && <span className="text-xs text-gray-400">{updateMsg}</span>}
           <button
-            onClick={refreshPrices}
-            disabled={refreshing}
+            onClick={updatePortfolio}
+            disabled={updating}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white transition-colors"
           >
-            {refreshing ? '⏳ Fetching...' : '↻ Pull Live Prices'}
+            {updating ? '⏳ Updating...' : '↻ Update Portfolio'}
           </button>
         </div>
 
