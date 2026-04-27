@@ -72,8 +72,12 @@ async def _auto_refresh_loop():
             )
             if rows:
                 symbols = list({r["symbol"] for r in rows})
+                CASH_SYMS = {"XXCASH", "CASH", "SPAXX", "FDRXX", "FCASH"}
                 prices: dict[str, float] = {}
                 for sym in symbols:
+                    if sym.upper() in CASH_SYMS or sym.upper().startswith("XX"):
+                        prices[sym] = 1.0
+                        continue
                     try:
                         info = yf.Ticker(sym).info
                         p = info.get("currentPrice") or info.get("regularMarketPrice")

@@ -431,7 +431,11 @@ async def refresh_prices(pool=Depends(get_pool)):
     prices: dict[str, float] = {}
     errors: list[str] = []
 
+    CASH_SYMBOLS = {"XXCASH", "CASH", "SPAXX", "FDRXX", "FCASH"}
     for sym in symbols:
+        if sym.upper() in CASH_SYMBOLS or sym.upper().startswith("XX"):
+            prices[sym] = 1.0
+            continue
         try:
             info = yf.Ticker(sym).info
             price = info.get("currentPrice") or info.get("regularMarketPrice")

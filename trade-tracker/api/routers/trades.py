@@ -35,9 +35,10 @@ async def reset_all_data(pool=Depends(get_pool)):
     Use this when switching from a paper/test account to live.
     """
     try:
-        deleted_trades = await pool.fetchval("DELETE FROM trades RETURNING id")
+        await pool.execute("DELETE FROM trades")
         await pool.execute("DELETE FROM portfolio_snapshots")
-        trade_count = await pool.fetchval("SELECT COUNT(*) FROM trades")
+        await pool.execute("DELETE FROM imported_positions")
+        await pool.execute("DELETE FROM fidelity_imports")
         logger.info("Data reset: all trades and snapshots cleared")
         return {"message": "All trades and snapshots deleted.", "trades_remaining": trade_count}
     except Exception as exc:

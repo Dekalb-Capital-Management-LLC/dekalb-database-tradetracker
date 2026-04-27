@@ -208,23 +208,23 @@ export default function Dashboard() {
             </button>
           ))}
         </div>
-      </div>
 
-            {/* Search */}
-            <div
-              className="flex items-center gap-2 px-3 py-1.5 rounded-lg"
-              style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8', minWidth: 180 }}
-            >
-              <Search size={13} color="#9ca3af" />
-              <input
-                type="text"
-                placeholder="Search for..."
-                value={symbolSearch}
-                onChange={(e) => setSymbolSearch(e.target.value)}
-                className="text-sm bg-transparent outline-none w-full"
-                style={{ color: '#1a2744' }}
-              />
-            </div>
+        {/* Search */}
+        <div
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg"
+          style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8', minWidth: 180 }}
+        >
+          <Search size={13} color="#9ca3af" />
+          <input
+            type="text"
+            placeholder="Search..."
+            value={symbolSearch}
+            onChange={(e) => setSymbolSearch(e.target.value)}
+            className="text-sm bg-transparent outline-none w-full"
+            style={{ color: '#1a2744' }}
+          />
+        </div>
+      </div>
 
       {/* Error bar */}
       {error && (
