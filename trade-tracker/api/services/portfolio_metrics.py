@@ -136,17 +136,16 @@ async def upsert_snapshot(
     spy_daily_pct: Optional[Decimal] = None
 
     if spy_close is None:
-        # Fetch SPY close for this date via yfinance
+        # Fetch the last ~10 days of SPY so we always get the most recent close,
+        # even if today's market hasn't opened yet.
         try:
-            spy_hist = yf.Ticker("SPY").history(start=snapshot_date.isoformat(), end=(snapshot_date + timedelta(days=5)).isoformat())
+            spy_hist = yf.download("SPY", period="10d", auto_adjust=True, progress=False)
             if not spy_hist.empty:
-                spy_close = Decimal(str(round(float(spy_hist["Close"].iloc[0]), 4)))
-                spy_prev = yf.Ticker("SPY").history(
-                    start=(snapshot_date - timedelta(days=7)).isoformat(),
-                    end=snapshot_date.isoformat(),
-                )
-                if not spy_prev.empty:
-                    prev_spy = Decimal(str(round(float(spy_prev["Close"].iloc[-1]), 4)))
+                closes = spy_hist["Close"].dropna()
+                if len(closes) >= 1:
+                    spy_close = Decimal(str(round(float(closes.iloc[-1]), 4)))
+                if len(closes) >= 2:
+                    prev_spy = Decimal(str(round(float(closes.iloc[-2]), 4)))
                     if prev_spy > 0:
                         spy_daily_pct = ((spy_close - prev_spy) / prev_spy * 100).quantize(Decimal("0.000001"))
         except Exception as exc:

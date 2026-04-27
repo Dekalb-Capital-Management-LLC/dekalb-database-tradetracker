@@ -152,6 +152,14 @@ async def _apply_migrations(conn: asyncpg.Connection) -> None:
         )
     """)
 
+    # Widen daily_pnl_pct and spy_daily_pct from DECIMAL(10,6) to NUMERIC so
+    # large % swings (first snapshot vs tiny prev_nav) don't overflow the column.
+    for col in ("daily_pnl_pct", "spy_daily_pct"):
+        await conn.execute(f"""
+            ALTER TABLE portfolio_snapshots
+            ALTER COLUMN {col} TYPE NUMERIC
+        """)
+
     # Partial unique indexes for portfolio_snapshots ON CONFLICT upserts.
     # These must exist for upsert_snapshot to work correctly. Safe to re-run.
     await conn.execute("""

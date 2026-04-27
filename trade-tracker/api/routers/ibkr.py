@@ -75,6 +75,29 @@ def get_status():
     }
 
 
+@router.get("/debug/positions", summary="Raw IBKR positions API response for diagnostics")
+def debug_positions():
+    """
+    Returns the raw JSON from /portfolio/accounts and /portfolio/{id}/positions/0.
+    Use this to diagnose why positions are returning empty.
+    """
+    if not config.IBKR_ENABLED:
+        return {"error": "IBKR_ENABLED is false"}
+    if not ibkr_client.is_connected():
+        return {"error": "not connected"}
+
+    accounts_raw = ibkr_client._get("/portfolio/accounts")
+    positions_raw = ibkr_client._get(f"/portfolio/{config.IBKR_ACCOUNT_ID}/positions/0")
+
+    return {
+        "account_id_from_config": config.IBKR_ACCOUNT_ID,
+        "portfolio_accounts": accounts_raw,
+        "positions_page0_type": type(positions_raw).__name__,
+        "positions_page0_length": len(positions_raw) if isinstance(positions_raw, list) else "N/A",
+        "positions_page0_raw": positions_raw,
+    }
+
+
 @router.post("/connect", summary="Manually trigger IBKR reconnection")
 def reconnect():
     """
