@@ -74,17 +74,33 @@ async def _auto_refresh_loop():
                 symbols = list({r["symbol"] for r in rows})
                 CASH_SYMS = {"XXCASH", "CASH", "SPAXX", "FDRXX", "FCASH"}
                 prices: dict[str, float] = {}
-                for sym in symbols:
-                    if sym.upper() in CASH_SYMS or sym.upper().startswith("XX"):
-                        prices[sym] = 1.0
-                        continue
+                cash_syms = {s for s in symbols if s.upper() in CASH_SYMS or s.upper().startswith("XX")}
+                market_syms = [s for s in symbols if s not in cash_syms]
+                for s in cash_syms:
+                    prices[s] = 1.0
+                if market_syms:
                     try:
-                        info = yf.Ticker(sym).info
-                        p = info.get("currentPrice") or info.get("regularMarketPrice")
-                        if p:
-                            prices[sym] = float(p)
-                    except Exception:
-                        pass
+                        df = await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: yf.download(
+                                " ".join(market_syms),
+                                period="5d",
+                                auto_adjust=True,
+                                progress=False,
+                                threads=True,
+                            )
+                        )
+                        if not df.empty:
+                            close = df["Close"] if "Close" in df.columns else df.xs("Close", axis=1, level=0)
+                            for sym in market_syms:
+                                try:
+                                    val = float(close.dropna().iloc[-1]) if len(market_syms) == 1 else float(close[sym].dropna().iloc[-1])
+                                    if val > 0:
+                                        prices[sym] = val
+                                except Exception:
+                                    pass
+                    except Exception as exc:
+                        logger.warning("Auto-refresh batch price fetch failed: %s", exc)
 
                 updated = 0
                 for r in rows:

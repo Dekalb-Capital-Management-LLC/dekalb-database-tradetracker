@@ -434,19 +434,42 @@ async def update_all(pool=Depends(get_pool)):
     price_errors: list[str] = []
 
     CASH_SYMBOLS = {"XXCASH", "CASH", "SPAXX", "FDRXX", "FCASH"}
-    for sym in symbols:
-        if sym.upper() in CASH_SYMBOLS or sym.upper().startswith("XX"):
-            prices[sym] = 1.0
-            continue
+    cash_syms = {s for s in symbols if s.upper() in CASH_SYMBOLS or s.upper().startswith("XX")}
+    market_syms = [s for s in symbols if s not in cash_syms]
+
+    for s in cash_syms:
+        prices[s] = 1.0
+
+    # Batch-fetch all market symbols in one yfinance call (~1-2s regardless of count)
+    if market_syms:
         try:
-            info = yf.Ticker(sym).info
-            price = info.get("currentPrice") or info.get("regularMarketPrice")
-            if price:
-                prices[sym] = float(price)
-            else:
-                price_errors.append(f"{sym}: no price returned")
+            import asyncio
+            df = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: yf.download(
+                    " ".join(market_syms),
+                    period="5d",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=True,
+                )
+            )
+            if not df.empty:
+                close = df["Close"] if "Close" in df.columns else df.xs("Close", axis=1, level=0)
+                for sym in market_syms:
+                    try:
+                        if len(market_syms) == 1:
+                            val = float(close.dropna().iloc[-1])
+                        else:
+                            val = float(close[sym].dropna().iloc[-1])
+                        if val > 0:
+                            prices[sym] = val
+                        else:
+                            price_errors.append(f"{sym}: zero price")
+                    except Exception as exc:
+                        price_errors.append(f"{sym}: {exc}")
         except Exception as exc:
-            price_errors.append(f"{sym}: {exc}")
+            price_errors.append(f"batch fetch failed: {exc}")
 
     updated = 0
     for r in rows:
