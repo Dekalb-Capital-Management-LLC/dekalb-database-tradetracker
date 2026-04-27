@@ -416,18 +416,71 @@ async def get_positions(
 @router.post("/refresh-prices")  # keep old path working
 async def update_all(pool=Depends(get_pool)):
     """
-    Single endpoint to refresh live prices and write today's snapshot.
-    Fetches prices via yfinance for all symbols in imported_positions,
-    updates current_value / gain_loss, then upserts a portfolio snapshot.
+    One-shot update: sync IBKR positions (if connected), then price everything
+    via yfinance, then write today's snapshot. Both Fidelity and IBKR accounts
+    show up as separate entries — the existing account tab system handles it.
     """
+    import asyncio
     import yfinance as yf
     from services.portfolio_metrics import upsert_snapshot
 
+    # ── Step 1: sync IBKR holdings (symbols + qty + avg_cost) ──────────────
+    ibkr_synced = 0
+    if config.IBKR_ENABLED and config.IBKR_ACCOUNT_ID:
+        from services.ibkr_client import ibkr_client
+        if ibkr_client.is_connected():
+            try:
+                raw = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: ibkr_client.get_positions(config.IBKR_ACCOUNT_ID)
+                )
+                # Replace all IBKR positions in one go (handles closed positions cleanly)
+                await pool.execute(
+                    "DELETE FROM imported_positions WHERE account_id=$1 AND source='ibkr'",
+                    config.IBKR_ACCOUNT_ID,
+                )
+                for p in raw:
+                    qty = float(p.get("position", 0))
+                    if abs(qty) < 0.00001:
+                        continue
+                    symbol = (p.get("ticker") or p.get("contractDesc") or "").upper().strip()
+                    if not symbol:
+                        continue
+                    avg_cost = float(p.get("avgCost") or 0) or None
+                    cost_basis_total = (avg_cost * abs(qty)) if avg_cost else None
+                    await pool.execute(
+                        """
+                        INSERT INTO imported_positions
+                            (account_id, symbol, quantity, avg_cost, cost_basis_total,
+                             source, snapshot_date, updated_at)
+                        VALUES ($1,$2,$3,$4,$5,'ibkr',CURRENT_DATE,NOW())
+                        ON CONFLICT (account_id, symbol) DO UPDATE SET
+                            quantity=EXCLUDED.quantity,
+                            avg_cost=EXCLUDED.avg_cost,
+                            cost_basis_total=EXCLUDED.cost_basis_total,
+                            source='ibkr',
+                            snapshot_date=CURRENT_DATE,
+                            updated_at=NOW()
+                        """,
+                        config.IBKR_ACCOUNT_ID, symbol, qty, avg_cost, cost_basis_total,
+                    )
+                    ibkr_synced += 1
+                logger.info("IBKR positions synced: %d for account %s", ibkr_synced, config.IBKR_ACCOUNT_ID)
+            except Exception as exc:
+                logger.warning("IBKR position sync failed (yfinance will still run): %s", exc)
+
+    # ── Step 2: price ALL positions in imported_positions via yfinance ──────
     rows = await pool.fetch(
         "SELECT account_id, symbol, quantity, avg_cost, cost_basis_total FROM imported_positions"
     )
     if not rows:
-        return {"updated": 0, "snapshot_written": False, "message": "No positions — import a file first"}
+        return {
+            "ibkr_positions": ibkr_synced,
+            "yfinance_updated": 0,
+            "yfinance_total": 0,
+            "snapshot_written": False,
+            "portfolio_nav": None,
+            "message": "No positions found — import a Fidelity file or connect IBKR",
+        }
 
     symbols = list({r["symbol"] for r in rows})
     prices: dict[str, float] = {}
@@ -440,10 +493,8 @@ async def update_all(pool=Depends(get_pool)):
     for s in cash_syms:
         prices[s] = 1.0
 
-    # Batch-fetch all market symbols in one yfinance call (~1-2s regardless of count)
     if market_syms:
         try:
-            import asyncio
             df = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: yf.download(
@@ -458,10 +509,7 @@ async def update_all(pool=Depends(get_pool)):
                 close = df["Close"] if "Close" in df.columns else df.xs("Close", axis=1, level=0)
                 for sym in market_syms:
                     try:
-                        if len(market_syms) == 1:
-                            val = float(close.dropna().iloc[-1])
-                        else:
-                            val = float(close[sym].dropna().iloc[-1])
+                        val = float(close.dropna().iloc[-1]) if len(market_syms) == 1 else float(close[sym].dropna().iloc[-1])
                         if val > 0:
                             prices[sym] = val
                         else:
@@ -471,7 +519,7 @@ async def update_all(pool=Depends(get_pool)):
         except Exception as exc:
             price_errors.append(f"batch fetch failed: {exc}")
 
-    updated = 0
+    yf_updated = 0
     for r in rows:
         sym = r["symbol"]
         price = prices.get(sym)
@@ -492,17 +540,15 @@ async def update_all(pool=Depends(get_pool)):
             price, current_value, total_gl, total_gl_pct,
             r["account_id"], sym,
         )
-        updated += 1
+        yf_updated += 1
 
-    # Write today's snapshot so the performance graph accumulates history
+    # ── Step 3: write today's snapshot ─────────────────────────────────────
     snapshot_written = False
     snapshot_nav = None
-    if updated > 0:
+    if yf_updated > 0 or ibkr_synced > 0:
         try:
             today = date.today()
-            account_rows = await pool.fetch(
-                "SELECT DISTINCT account_id FROM imported_positions"
-            )
+            account_rows = await pool.fetch("SELECT DISTINCT account_id FROM imported_positions")
             combined_nav = Decimal(0)
             for ar in account_rows:
                 acct_id = ar["account_id"]
@@ -519,8 +565,8 @@ async def update_all(pool=Depends(get_pool)):
                     """,
                     acct_id, today,
                 )
-                prev_nav = Decimal(str(prev["total_nav"])) if prev else None
-                await upsert_snapshot(pool, today, nav, acct_id, nav, prev_nav)
+                await upsert_snapshot(pool, today, nav, acct_id, nav,
+                                      Decimal(str(prev["total_nav"])) if prev else None)
                 combined_nav += nav
 
             prev_comb = await pool.fetchrow(
@@ -535,14 +581,16 @@ async def update_all(pool=Depends(get_pool)):
                                   Decimal(str(prev_comb["total_nav"])) if prev_comb else None)
             snapshot_written = True
             snapshot_nav = float(combined_nav)
-            logger.info("update-all: snapshot written for %s, combined NAV=%s", today, combined_nav)
+            logger.info("update-all: snapshot written nav=%s", combined_nav)
         except Exception as exc:
             logger.error("update-all: snapshot write failed: %s", exc)
 
-    logger.info("update-all: %d/%d positions updated, %d price errors", updated, len(symbols), len(price_errors))
+    logger.info("update-all: ibkr=%d yfinance=%d/%d errors=%d",
+                ibkr_synced, yf_updated, len(symbols), len(price_errors))
     return {
-        "updated": updated,
-        "total_symbols": len(symbols),
+        "ibkr_positions": ibkr_synced,
+        "yfinance_updated": yf_updated,
+        "yfinance_total": len(symbols),
         "snapshot_written": snapshot_written,
         "portfolio_nav": snapshot_nav,
         "price_errors": price_errors[:5],

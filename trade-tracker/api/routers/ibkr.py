@@ -152,6 +152,72 @@ def get_live_positions():
 
 
 # ---------------------------------------------------------------------------
+# Position sync — pull live holdings into imported_positions
+# ---------------------------------------------------------------------------
+
+@router.post("/sync/positions", summary="Pull live IBKR positions into imported_positions")
+async def sync_positions(pool=Depends(get_pool)):
+    """
+    Fetches the current open positions from IBKR and upserts them into
+    imported_positions (source='ibkr'). After this, hitting Update Portfolio
+    will price them via yfinance and write a snapshot.
+
+    Old IBKR positions not returned by this call (i.e. closed trades) are
+    removed so the dashboard never shows stale holdings.
+    """
+    if not config.IBKR_ENABLED or not config.IBKR_ACCOUNT_ID:
+        return {"synced": 0, "message": "IBKR not configured — set IBKR_ENABLED=true and IBKR_ACCOUNT_ID"}
+    if not ibkr_client.is_connected():
+        return {"synced": 0, "message": "IBKR not connected — check /ibkr/status"}
+
+    import asyncio
+    try:
+        raw = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: ibkr_client.get_positions(config.IBKR_ACCOUNT_ID)
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"IBKR positions fetch failed: {exc}")
+
+    # Replace all IBKR positions atomically (handles closed positions)
+    await pool.execute(
+        "DELETE FROM imported_positions WHERE account_id=$1 AND source='ibkr'",
+        config.IBKR_ACCOUNT_ID,
+    )
+
+    synced = 0
+    for p in raw:
+        qty = float(p.get("position", 0))
+        if abs(qty) < 0.00001:
+            continue
+        symbol = (p.get("ticker") or p.get("contractDesc") or "").upper().strip()
+        if not symbol:
+            continue
+        avg_cost = float(p.get("avgCost") or 0) or None
+        cost_basis_total = (avg_cost * abs(qty)) if avg_cost else None
+        await pool.execute(
+            """
+            INSERT INTO imported_positions
+                (account_id, symbol, quantity, avg_cost, cost_basis_total,
+                 source, snapshot_date, updated_at)
+            VALUES ($1,$2,$3,$4,$5,'ibkr',CURRENT_DATE,NOW())
+            ON CONFLICT (account_id, symbol) DO UPDATE SET
+                quantity=EXCLUDED.quantity,
+                avg_cost=EXCLUDED.avg_cost,
+                cost_basis_total=EXCLUDED.cost_basis_total,
+                source='ibkr',
+                snapshot_date=CURRENT_DATE,
+                updated_at=NOW()
+            """,
+            config.IBKR_ACCOUNT_ID, symbol, qty, avg_cost, cost_basis_total,
+        )
+        synced += 1
+
+    logger.info("IBKR sync/positions: %d positions for %s", synced, config.IBKR_ACCOUNT_ID)
+    return {"synced": synced, "account_id": config.IBKR_ACCOUNT_ID,
+            "message": f"{synced} positions synced — hit Update Portfolio to price them"}
+
+
+# ---------------------------------------------------------------------------
 # Trade sync
 # ---------------------------------------------------------------------------
 

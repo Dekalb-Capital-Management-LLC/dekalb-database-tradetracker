@@ -96,9 +96,20 @@ export default function Dashboard() {
     setUpdating(true)
     setUpdateMsg(null)
     try {
-      const res = await post<{ updated: number; total_symbols: number; snapshot_written: boolean; portfolio_nav: number | null }>('/portfolio/update-all')
-      const nav = res.portfolio_nav != null ? ` · NAV $${res.portfolio_nav.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : ''
-      setUpdateMsg(`${res.updated}/${res.total_symbols} prices · snapshot ${res.snapshot_written ? '✓' : '✗'}${nav}`)
+      const res = await post<{
+        ibkr_positions: number
+        yfinance_updated: number
+        yfinance_total: number
+        snapshot_written: boolean
+        portfolio_nav: number | null
+      }>('/portfolio/update-all')
+      const parts: string[] = []
+      if (res.ibkr_positions > 0) parts.push(`IBKR: ${res.ibkr_positions} pos`)
+      parts.push(`yf: ${res.yfinance_updated}/${res.yfinance_total}`)
+      parts.push(`snapshot ${res.snapshot_written ? '✓' : '✗'}`)
+      if (res.portfolio_nav != null)
+        parts.push(`NAV $${res.portfolio_nav.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`)
+      setUpdateMsg(parts.join(' · '))
       await loadSummary()
     } catch (e: any) {
       setUpdateMsg(`Error: ${e.message}`)
