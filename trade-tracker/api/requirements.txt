@@ -1,7 +1,7 @@
 # FastAPI + server
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
-python-multipart==0.0.9     # required for UploadFile (CSV import)
+python-multipart==0.0.9
 
 # Database
 asyncpg==0.29.0
@@ -11,6 +11,10 @@ yfinance==0.2.54
 
 # Data validation
 pydantic==2.7.1
+
+# Auth
+PyJWT==2.8.0
+cryptography==42.0.5
 
 # Utilities
 python-dateutil==2.9.0

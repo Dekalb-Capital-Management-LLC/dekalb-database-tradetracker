@@ -1,0 +1,12 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
+
+# Required env vars: DATABASE_URL, DB_SSL=require, AUTH_ENABLED=true,
+# GOOGLE_CLIENT_ID, ALLOWED_EMAIL_DOMAIN, IBKR_*, FRONTEND_URL
