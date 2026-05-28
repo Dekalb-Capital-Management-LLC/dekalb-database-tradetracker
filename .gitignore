@@ -1,3 +1,6 @@
+node_modules/
+trade-tracker/frontend/dist/
+.venv/
 __pycache__/
 *.pyc
 venv/
