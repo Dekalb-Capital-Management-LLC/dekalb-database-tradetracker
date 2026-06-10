@@ -14,8 +14,11 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="DeKalb Trade Tracker API", version="0.1.0", docs_url="/docs", redoc_url="/redoc")
 
+_cors_origins = ["http://localhost:3000", "http://localhost:80", "http://localhost"]
+_cors_origins += [origin.strip() for origin in config.FRONTEND_URL.split(",") if origin.strip()]
+
 app.add_middleware(CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:80", "http://localhost"],
+    allow_origins=_cors_origins,
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 _BYPASS = ("/health", "/docs", "/redoc", "/openapi.json", "/auth/")

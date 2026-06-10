@@ -36,3 +36,7 @@ DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 AUTH_ENABLED = os.getenv("AUTH_ENABLED", "false").lower() == "true"
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 ALLOWED_EMAIL_DOMAIN = os.getenv("ALLOWED_EMAIL_DOMAIN", "dekalbcapitalmanagement.com")
+
+# Deployed frontend origin (e.g. https://dekalb-trade-tracker.vercel.app), used for CORS.
+# Comma-separated if there's more than one (e.g. production + preview deploys).
+FRONTEND_URL = os.getenv("FRONTEND_URL", "")

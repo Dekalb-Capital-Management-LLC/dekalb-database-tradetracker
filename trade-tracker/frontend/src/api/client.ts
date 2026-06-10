@@ -1,4 +1,9 @@
-const BASE = '/api'
+// Local dev (Vite proxy) and Docker (nginx) both forward /api -> backend with the
+// prefix stripped. In production (Vercel), set VITE_API_BASE_URL to the Railway
+// API URL (e.g. https://dekalb-trade-tracker-api.up.railway.app, no trailing slash) -
+// the browser then calls the API directly and CORS (FRONTEND_URL on the backend)
+// allows it.
+const BASE = import.meta.env.VITE_API_BASE_URL || '/api'
 const TOKEN_KEY = 'dekalb_id_token'
 const USER_KEY = 'dekalb_user'
 

@@ -3,23 +3,24 @@ IBKR Client Portal Gateway client.
 
 The IBKR Client Portal Gateway is a Java app you run locally. It handles
 authentication with IBKR (username/password + 2FA via browser) and exposes a
-local REST API at https://localhost:5000.
+local REST API at https://localhost:5001.
 
 To activate:
   1. Download the Client Portal Gateway from IBKR:
        https://www.interactivebrokers.com/en/trading/ib-api.php
        (look for "Client Portal API" -> download the .zip)
   2. Unzip it into the ibkr-gateway/ folder in this repo
-  3. Copy ibkr-gateway/conf.yaml.example -> ibkr-gateway/conf.yaml
-  4. Start the gateway:
-       cd ibkr-gateway && java -jar clientportal.gw/root/clientportal.gw.jar root/conf
-  5. Open https://localhost:5000 in your browser, log in with your IBKR
+  3. Start the gateway (no conf.yaml setup needed - the bundled config works as-is):
+       cd ibkr-gateway/clientportal.gw && bin/run.sh root/conf.yaml
+  4. Open https://localhost:5001 in your browser, log in with your IBKR
      username + password + 2FA. Do this once per session (~24h).
-  6. Set these env vars (in .env file at repo root):
+  5. Set these env vars (in .env file at repo root):
        IBKR_ENABLED=true
        IBKR_ACCOUNT_ID=U1234567   <- your IBKR account ID
-  7. If running in Docker: IBKR_GATEWAY_URL=https://host.docker.internal:5000
+  6. If running in Docker: IBKR_GATEWAY_URL=https://host.docker.internal:5001
+     (this is already the default in docker-compose.yml)
 
+This connects directly to the gateway - there is no VPN or proxy involved.
 API reference: https://www.interactivebrokers.com/campus/ibkr-api-page/cpapi-v1/
 """
 from __future__ import annotations
@@ -54,7 +55,8 @@ def _get_session() -> requests.Session:
 
 class IBKRClient:
     """
-    Thin wrapper around the IBKR Client Portal Web API, routed through Pangolin.
+    Thin wrapper around the IBKR Client Portal Web API (direct connection to the
+    locally-running Client Portal Gateway, see module docstring).
     All methods return None / [] when IBKR is disabled — callers should handle gracefully.
     """
 
@@ -75,10 +77,10 @@ class IBKRClient:
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.ConnectionError:
-            logger.error("Cannot reach Pangolin at %s — are you on the VPN?", self.base_url)
+            logger.error("Cannot reach IBKR Client Portal Gateway at %s — is it running and authenticated?", self.base_url)
             return None
         except requests.exceptions.Timeout:
-            logger.error("Pangolin request timed out [%s]", path)
+            logger.error("IBKR gateway request timed out [%s]", path)
             return None
         except requests.exceptions.HTTPError as exc:
             logger.error("IBKR HTTP error [%s]: %s", path, exc)

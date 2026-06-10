@@ -2,7 +2,7 @@
 IBKR router.
 
 Endpoints:
-  GET  /ibkr/status         - Pangolin connection + IBKR auth status
+  GET  /ibkr/status         - IBKR Client Portal Gateway connection + auth status
   GET  /ibkr/account        - Live NAV, cash, equity from IBKR
   GET  /ibkr/positions      - Live open positions from IBKR
   POST /ibkr/sync/trades    - Pull last ~24h of IBKR fills and insert new ones into DB

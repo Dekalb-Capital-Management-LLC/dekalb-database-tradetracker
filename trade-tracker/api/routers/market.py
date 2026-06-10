@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 async def get_quote(symbol: str):
     """
     Current price for a single symbol.
-    Source: yfinance (or IBKR gateway if IBKR_GATEWAY_ENABLED=true).
+    Source: yfinance (or IBKR gateway if IBKR_ENABLED=true).
     Results cached for PRICE_CACHE_TTL_SECONDS (default 60s).
     """
     quote = market_data.get_quote(symbol.upper())
