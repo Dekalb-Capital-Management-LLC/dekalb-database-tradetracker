@@ -2,7 +2,7 @@
 
 Backend infrastructure for DeKalb Capital Management. Houses the database layer, event ingestion pipeline, and trade tracker (API + dashboard).
 
-> **New here?** Also read [`CLAUDE.md`](CLAUDE.md) for architecture/conventions and [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) for what's done, what's broken, and what's next. Project planning lives in Linear — see [`docs/linear/`](docs/linear/).
+> **New here?** Also read [`CLAUDE.md`](CLAUDE.md) for architecture/conventions and [`docs/REPO_AUDIT.md`](docs/REPO_AUDIT.md) for what's done, what's broken, and what's next. Project planning lives in Linear — see [`docs/linear/`](docs/linear/).
 
 ---
 
@@ -66,9 +66,9 @@ dekalb-database-tradetracker/
 │   └── comprehensive_test.py   # Sends all event types across multiple symbols
 │
 ├── docs/
-│   ├── PROJECT_STATUS.md       # Audit: what's done / broken / next
-│   ├── linear/                 # Linear project template + workflow + issue lists
-│   └── features/               # Design docs for in-progress major features
+│   ├── REPO_AUDIT.md           # Audit + Linear project/issue backlog
+│   ├── FEATURES.md             # Feature catalog: what's live/planned/deprecated
+│   └── linear/                 # Linear templates + GitHub workflow + label setup
 │
 ├── .env.example                # Copy to .env and fill in your values
 └── docker-compose.yml
@@ -163,7 +163,7 @@ The dashboard supports Google Workspace SSO, gated by `AUTH_ENABLED`.
 3. The backend (`services/auth.py`) verifies the token's signature against Google's published JWKS, checks the issuer, audience (`GOOGLE_CLIENT_ID`), email verification, and `hd`/email domain.
 4. The frontend stores the ID token in `localStorage` and sends it as `Authorization: Bearer <token>` on every API call. `AuthMiddleware` in `main.py` re-verifies it on each request.
 
-ID tokens expire (~1h). There's currently no refresh flow — see [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).
+ID tokens expire (~1h). There's currently no refresh flow — see [`docs/REPO_AUDIT.md`](docs/REPO_AUDIT.md).
 
 ### Setting up a Google OAuth Client ID
 
@@ -241,7 +241,7 @@ curl http://localhost:8000/ibkr/status
 
 > **Docker note:** The gateway runs on your host machine. Docker reaches it via `host.docker.internal:5001`, which is already configured in `docker-compose.yml`. No extra steps needed.
 
-> **Production note:** The gateway is a desktop app tied to one person's 2FA session — it cannot run unattended on Railway. In production, leave `IBKR_ENABLED=false` (yfinance fallback) unless/until there's a plan for headless re-auth. See [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md).
+> **Production note:** The gateway is a desktop app tied to one person's 2FA session — it cannot run unattended on Railway. In production, leave `IBKR_ENABLED=false` (yfinance fallback) unless/until there's a plan for headless re-auth. See [`docs/REPO_AUDIT.md`](docs/REPO_AUDIT.md).
 
 ---
 
@@ -346,6 +346,6 @@ Calculated from daily NAV snapshots in `portfolio_snapshots`. The `snapshot-cron
 
 ## Project Status, Roadmap & Team Workflow
 
-- [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) — what's working, what's broken, what's next.
-- [`docs/linear/`](docs/linear/) — Linear project template, GitHub↔Linear workflow, and the current project/issue breakdown.
-- [`docs/features/`](docs/features/) — design docs for major in-progress features (e.g. the portfolio AI news sidebar).
+- [`docs/REPO_AUDIT.md`](docs/REPO_AUDIT.md) — what's working, what's broken, what's next, and the current project/issue backlog.
+- [`docs/FEATURES.md`](docs/FEATURES.md) — catalog of features (live/planned/deprecated) and where their code lives.
+- [`docs/linear/`](docs/linear/) — Linear project/issue templates and the GitHub↔Linear workflow.

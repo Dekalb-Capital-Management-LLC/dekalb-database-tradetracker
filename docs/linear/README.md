@@ -1,18 +1,30 @@
 # Linear Setup
 
-How we use Linear for project/issue tracking on this repo, and how it connects to GitHub.
+How we use Linear for project/issue tracking on this repo, and how it
+connects to GitHub.
 
-- [`PROJECT_TEMPLATE.md`](PROJECT_TEMPLATE.md) — a reusable "New Project" template (matches the fields in Linear's project creation screen) plus a description template that includes a GitHub branch field.
-- [`GITHUB_WORKFLOW.md`](GITHUB_WORKFLOW.md) — how the Linear↔GitHub integration works and the branch/PR conventions to use going forward.
-- [`TRADE_TRACKER_BACKLOG.md`](TRADE_TRACKER_BACKLOG.md) — ready-to-paste project + issues for hardening the Trade Tracker and finishing the Railway/Vercel deploy.
-- [`../features/PORTFOLIO_AI_NEWS_SIDEBAR.md`](../features/PORTFOLIO_AI_NEWS_SIDEBAR.md) — design doc + project/issue breakdown for the new AI news sidebar feature.
+- [`PROJECT_TEMPLATE.md`](PROJECT_TEMPLATE.md) — the "DeKalb Feature" (project)
+  and "DeKalb Issue" templates, including the label sets and branch format.
+- [`GITHUB_WORKFLOW.md`](GITHUB_WORKFLOW.md) — how the Linear↔GitHub
+  integration works and the branch/PR conventions to use going forward.
+- [`LABELS_TODO.md`](LABELS_TODO.md) — one-time setup checklist for the
+  label sets referenced by the templates; delete once done.
+- [`../REPO_AUDIT.md`](../REPO_AUDIT.md) — the current project/issue backlog,
+  ready to paste into Linear using the templates above.
+- [`../FEATURES.md`](../FEATURES.md) — table of what the repo can do today,
+  what's planned, and where the code lives.
 
 ## Quick orientation
 
-There's one Linear workspace. Suggested teams (create if they don't exist yet):
+One Linear team, key `ENG`. Branches look like
+`feature/eng-123-short-issue-title` (see [`PROJECT_TEMPLATE.md`](PROJECT_TEMPLATE.md)).
 
-- **Equities** — `trade-tracker/` (API + frontend), Fidelity/IBKR import, portfolio metrics.
-- **Quant** — `ingestion-service/`, trading engine integration.
-- **Platform** — cross-cutting infra: Docker, Railway, Vercel, schemas, CI.
+Instead of separate teams per area, use the 6 **project labels** (`AI`,
+`Equities`, `Quant`, `Platform`, `Frontend`, `IBKR`) to mark which part of the
+repo a project/issue touches — see [`LABELS_TODO.md`](LABELS_TODO.md).
 
-Each "major initiative" (the things on your roadmap — Trade Tracker hardening, the AI news sidebar, etc.) is a **Project**. Day-to-day bugs/tasks are **Issues** inside those projects. Use [`PROJECT_TEMPLATE.md`](PROJECT_TEMPLATE.md) every time you start a new initiative so they're consistent.
+Each "major initiative" (the things on the roadmap — Trade Tracker hardening,
+the AI news sidebar, etc.) is a **Project** ("DeKalb Feature" template).
+Day-to-day bugs/tasks are **Issues** ("DeKalb Issue" template) inside those
+projects, or standalone. [`../REPO_AUDIT.md`](../REPO_AUDIT.md) is laid out
+this way already — copy each section straight into Linear.

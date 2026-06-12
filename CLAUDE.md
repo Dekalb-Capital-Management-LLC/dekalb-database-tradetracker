@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for Claude Code when working in this repo. Read this first, then [`README.md`](README.md) for setup/usage and [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) for current known issues and roadmap.
+Guidance for Claude Code when working in this repo. Read this first, then [`README.md`](README.md) for setup/usage and [`docs/REPO_AUDIT.md`](docs/REPO_AUDIT.md) for current known issues and roadmap.
 
 ## What this repo is
 
@@ -16,7 +16,7 @@ When working on one half, you generally don't need to touch the other — they'r
 ## Hard rules
 
 - **Never read, cat, or grep the contents of `.env`.** It holds live credentials (IBKR keys, Polygon API key, etc.). If you need to know what variables exist, read `.env.example` instead — it's kept in sync and documents every variable with comments. If `.env.example` is missing something, ask the user what the variable is for rather than reading `.env`.
-- Don't fix everything at once. This codebase has a lot of unfinished/rough edges (see `docs/PROJECT_STATUS.md`). Small, well-scoped fixes are good; large speculative refactors should become Linear issues in `docs/linear/` instead, so the team can prioritize.
+- Don't fix everything at once. This codebase has a lot of unfinished/rough edges (see `docs/REPO_AUDIT.md`). Small, well-scoped fixes are good; large speculative refactors should become Linear issues (documented in `docs/REPO_AUDIT.md`) instead, so the team can prioritize.
 
 ## Trade Tracker API (`trade-tracker/api/`)
 
@@ -77,4 +77,4 @@ ZMQ PULL socket on port 5555 → routes events to Postgres (`trading` DB) and/or
 
 ## Project management
 
-Planning happens in Linear, not GitHub Issues. See [`docs/linear/`](docs/linear/) for the project template, GitHub↔Linear workflow conventions, and the current backlog breakdown. New bugs/features discovered while working in this repo should generally become Linear issues (documented in `docs/linear/`) rather than being silently fixed or left as TODO comments — flag them to the user.
+Planning happens in Linear, not GitHub Issues. See [`docs/linear/`](docs/linear/) for the project/issue templates and GitHub↔Linear workflow conventions, and [`docs/REPO_AUDIT.md`](docs/REPO_AUDIT.md) for the current backlog. New bugs/features discovered while working in this repo should generally become new entries in `docs/REPO_AUDIT.md` rather than being silently fixed or left as TODO comments — flag them to the user. User-facing changes should also update [`docs/FEATURES.md`](docs/FEATURES.md).
