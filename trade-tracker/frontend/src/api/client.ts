@@ -24,19 +24,6 @@ export async function get<T>(path: string): Promise<T> {
   return res.json()
 }
 
-export async function post<T>(path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    method: 'POST',
-    headers: body ? { 'Content-Type': 'application/json' } : {},
-    body: body ? JSON.stringify(body) : undefined,
-  })
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText)
-    throw new Error(`${res.status}: ${text}`)
-  }
-  return res.json()
-}
-
 export async function del<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`, { method: 'DELETE' })
   if (!res.ok) {
@@ -60,8 +47,8 @@ export async function postForm<T>(path: string, form: FormData): Promise<T> {
   return res.json()
 }
 
-export async function post<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: JSON.stringify(body) })
+export async function post<T>(path: string, body?: unknown): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders() }, body: body !== undefined ? JSON.stringify(body) : undefined })
   if (res.status === 401) { handle401(); throw new Error('Unauthenticated') }
   if (!res.ok) { const t = await res.text().catch(() => res.statusText); throw new Error(`${res.status}: ${t}`) }
   return res.json()

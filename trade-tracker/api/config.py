@@ -1,12 +1,7 @@
 import os
 from urllib.parse import urlparse
 
-# PostgreSQL - equities team's isolated database (trade_tracker)
-DB_HOST = os.getenv("DB_HOST", "localhost")
-POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
-POSTGRES_DB = os.getenv("POSTGRES_DB", "trade_tracker")
-POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "postgres")
+_DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 if _DATABASE_URL:
     _url = _DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -87,11 +82,6 @@ else:
 IBKR_TOKEN_URL       = "https://api.ibkr.com/oauth2/api/v1/token"
 IBKR_SSO_URL         = "https://api.ibkr.com/gw/api/v1/sso-sessions"
 IBKR_BASE_URL        = "https://api.ibkr.com/v1/api"
-
-# ---------------------------------------------------------------------------
-# Frontend URL — used for CORS
-# ---------------------------------------------------------------------------
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
 # IBKR snapshot cache TTL
 PRICE_CACHE_TTL_SECONDS = int(os.getenv("PRICE_CACHE_TTL_SECONDS", "300"))
