@@ -1,5 +1,17 @@
+"""
+Trade Tracker API - Entry point.
+
+Start locally:
+    uvicorn main:app --reload --port 8000
+
+In Docker:
+    CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+"""
+import asyncio
 import logging
-from fastapi import FastAPI, Request
+from datetime import date
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -12,49 +24,169 @@ logging.basicConfig(level=logging.DEBUG if config.DEBUG else logging.INFO,
                     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="DeKalb Trade Tracker API", version="0.1.0", docs_url="/docs", redoc_url="/redoc")
+app = FastAPI(
+    title="DeKalb Trade Tracker API",
+    version="0.1.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
 
-_cors_origins = ["http://localhost:3000", "http://localhost:80", "http://localhost"]
-_cors_origins += [origin.strip() for origin in config.FRONTEND_URL.split(",") if origin.strip()]
+_allowed_origins = [
+    "http://localhost:3000",
+    "http://localhost:80",
+    "http://localhost",
+]
+if config.FRONTEND_URL and config.FRONTEND_URL not in _allowed_origins:
+    _allowed_origins.append(config.FRONTEND_URL)
 
-app.add_middleware(CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-_BYPASS = ("/health", "/docs", "/redoc", "/openapi.json", "/auth/")
-
-class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if not config.AUTH_ENABLED or request.method == "OPTIONS":
-            return await call_next(request)
-        if any(request.url.path.startswith(p) for p in _BYPASS):
-            return await call_next(request)
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            return JSONResponse(status_code=401, content={"detail": "Missing Authorization header"})
-        try:
-            claims = verify_google_id_token(auth_header.removeprefix("Bearer ").strip())
-        except AuthError as exc:
-            return JSONResponse(status_code=401, content={"detail": str(exc)})
-        request.state.user = {"email": claims.get("email"), "name": claims.get("name"),
-                              "picture": claims.get("picture"), "sub": claims.get("sub")}
-        return await call_next(request)
-
-app.add_middleware(AuthMiddleware)
-app.include_router(auth_router.router)
 app.include_router(portfolio.router)
 app.include_router(trades.router)
 app.include_router(imports.router)
 app.include_router(market.router)
 app.include_router(ibkr.router)
 
+
+async def _auto_refresh_loop():
+    """Refresh yfinance prices + write snapshot every 5 minutes."""
+    import yfinance as yf
+    from datetime import date
+    from decimal import Decimal
+    from services.portfolio_metrics import upsert_snapshot
+
+    INTERVAL = 300  # seconds
+    await asyncio.sleep(30)  # wait for DB pool to be ready
+
+    while True:
+        try:
+            pool = db.get_pool()
+            rows = await pool.fetch(
+                "SELECT account_id, symbol, quantity, avg_cost, cost_basis_total FROM imported_positions"
+            )
+            if rows:
+                symbols = list({r["symbol"] for r in rows})
+                CASH_SYMS = {"XXCASH", "CASH", "SPAXX", "FDRXX", "FCASH"}
+                prices: dict[str, float] = {}
+                cash_syms = {s for s in symbols if s.upper() in CASH_SYMS or s.upper().startswith("XX")}
+                market_syms = [s for s in symbols if s not in cash_syms]
+                for s in cash_syms:
+                    prices[s] = 1.0
+                if market_syms:
+                    try:
+                        df = await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: yf.download(
+                                " ".join(market_syms),
+                                period="5d",
+                                auto_adjust=True,
+                                progress=False,
+                                threads=True,
+                            )
+                        )
+                        if not df.empty:
+                            close = df["Close"] if "Close" in df.columns else df.xs("Close", axis=1, level=0)
+                            for sym in market_syms:
+                                try:
+                                    val = float(close.dropna().iloc[-1]) if len(market_syms) == 1 else float(close[sym].dropna().iloc[-1])
+                                    if val > 0:
+                                        prices[sym] = val
+                                except Exception:
+                                    pass
+                    except Exception as exc:
+                        logger.warning("Auto-refresh batch price fetch failed: %s", exc)
+
+                updated = 0
+                for r in rows:
+                    price = prices.get(r["symbol"])
+                    if price is None:
+                        continue
+                    qty = float(r["quantity"] or 0)
+                    cost_basis = float(r["cost_basis_total"] or 0)
+                    current_value = qty * price
+                    total_gl = current_value - cost_basis
+                    total_gl_pct = (total_gl / cost_basis * 100) if cost_basis else None
+                    await pool.execute(
+                        """
+                        UPDATE imported_positions
+                        SET last_price=$1, current_value=$2, total_gain_loss=$3,
+                            total_gl_pct=$4, snapshot_date=CURRENT_DATE, updated_at=NOW()
+                        WHERE account_id=$5 AND symbol=$6
+                        """,
+                        price, current_value, total_gl, total_gl_pct,
+                        r["account_id"], r["symbol"],
+                    )
+                    updated += 1
+
+                if updated > 0:
+                    today = date.today()
+                    acct_rows = await pool.fetch(
+                        "SELECT DISTINCT account_id FROM imported_positions"
+                    )
+                    combined_nav = Decimal(0)
+                    for ar in acct_rows:
+                        acct_id = ar["account_id"]
+                        t = await pool.fetchrow(
+                            "SELECT SUM(current_value) AS nav FROM imported_positions WHERE account_id=$1",
+                            acct_id,
+                        )
+                        nav = Decimal(str(t["nav"] or 0))
+                        prev = await pool.fetchrow(
+                            """
+                            SELECT total_nav FROM portfolio_snapshots
+                            WHERE account_id=$1 AND snapshot_date < $2
+                            ORDER BY snapshot_date DESC LIMIT 1
+                            """,
+                            acct_id, today,
+                        )
+                        await upsert_snapshot(pool, today, nav, acct_id, nav,
+                                              Decimal(str(prev["total_nav"])) if prev else None)
+                        combined_nav += nav
+                    prev_comb = await pool.fetchrow(
+                        """
+                        SELECT total_nav FROM portfolio_snapshots
+                        WHERE account_id IS NULL AND snapshot_date < $1
+                        ORDER BY snapshot_date DESC LIMIT 1
+                        """,
+                        today,
+                    )
+                    await upsert_snapshot(pool, today, combined_nav, None, combined_nav,
+                                         Decimal(str(prev_comb["total_nav"])) if prev_comb else None)
+                    logger.info("Auto-refresh: updated %d positions, snapshot written", updated)
+        except Exception as exc:
+            logger.warning("Auto-refresh error: %s", exc)
+
+        await asyncio.sleep(INTERVAL)
+
+
 @app.on_event("startup")
 async def startup():
     await db.init_pool()
+    asyncio.create_task(_auto_refresh_loop())
     logger.info("Trade Tracker API started. Docs at /docs")
+    if config.IBKR_ENABLED:
+        import threading
+        from services.ibkr_client import ibkr_client
+        t = threading.Thread(target=ibkr_client.connect, daemon=True)
+        t.start()
+        logger.info("IBKR connection starting (client_id=%s)", config.IBKR_CLIENT_ID)
+    else:
+        logger.warning("IBKR disabled — no market data available. Set IBKR_ENABLED=true to activate.")
+
+
+
 
 @app.on_event("shutdown")
 async def shutdown():
+    if config.IBKR_ENABLED:
+        from services.ibkr_client import ibkr_client
+        ibkr_client.disconnect()
     await db.close_pool()
 
 @app.get("/health", tags=["health"])
@@ -65,5 +197,23 @@ async def health():
         db_ok = True
     except Exception:
         db_ok = False
-    return {"status": "ok" if db_ok else "degraded", "database": "connected" if db_ok else "unreachable",
-            "ibkr": "enabled" if config.IBKR_ENABLED else "disabled (yfinance fallback)", "version": "0.1.0"}
+
+    snap_date = None
+    trade_count = 0
+    if db_ok:
+        try:
+            snap_date = await pool.fetchval(
+                "SELECT MAX(snapshot_date) FROM portfolio_snapshots WHERE account_id IS NULL"
+            )
+            trade_count = await pool.fetchval("SELECT COUNT(*) FROM trades") or 0
+        except Exception:
+            pass
+
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "database": "connected" if db_ok else "unreachable",
+        "ibkr": "enabled" if config.IBKR_ENABLED else "disabled (no market data)",
+        "trades": trade_count,
+        "latest_snapshot": str(snap_date) if snap_date else "none",
+        "version": "0.1.0",
+    }

@@ -1,264 +1,186 @@
 # DeKalb Database — Monorepo
 
-Backend infrastructure for DeKalb Capital Management. Houses the database layer, event ingestion pipeline, and trade tracker (API + dashboard).
+---
 
-> **New here?** Also read [`CLAUDE.md`](CLAUDE.md) for architecture/conventions and [`docs/REPO_AUDIT.md`](docs/REPO_AUDIT.md) for what's done, what's broken, and what's next. Project planning lives in Linear — see [`docs/linear/`](docs/linear/).
+## ⚡ Quick-Start Command List (On Every Startup)
+
+Run these in order after `docker compose up --build`:
+
+```
+1. POST /ibkr/connect           ← reconnect to IBKR (auto-runs on boot, but use this if needed)
+2. POST /ibkr/sync/trades       ← pull latest fills from IBKR (last 7 days)
+3. POST /portfolio/snapshots/generate  ← generate today's NAV snapshot for performance chart
+4. GET  /portfolio/summary      ← verify everything loaded correctly
+```
+
+**One-time setup after first deploy or data reset:**
+```
+DELETE /trades/reset            ← wipe all old paper/test data (CAREFUL — irreversible)
+POST   /ibkr/sync/trades        ← pull live fills in
+POST   /import/fidelity         ← upload Fidelity CSV (positions snapshot or activity)
+POST   /portfolio/snapshots/generate  ← generate first NAV snapshot
+```
+
+**The dashboard auto-refreshes every 60 seconds. Trades auto-sync every hour.**
+
+---
+
+
+
+Backend infrastructure for DeKalb Capital. Runs on **Machine 2** (database server). Handles live trading event ingestion, portfolio storage, and the equities team's trade tracker dashboard.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  MACHINE 1 — Paper Trading Server                           │
+│                                                             │
+│  Trading Engine: Strategy → Risk Check → IB API            │
+│         │                                                   │
+│         ▼                                                   │
+│  Log Aggregator  (Orders, Executions, Logs, Signals)        │
+│         │                                                   │
+│         ▼                                                   │
+│  Bucket — batches events, sends every 1000 events or 5s     │
+│         │                                                   │
+│         │   ZMQ PUSH  →  tcp://machine2:5555               │
+└─────────┼───────────────────────────────────────────────────┘
+          │
+          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  MACHINE 2 — Database Server  (this repo)                   │
+│                                                             │
+│  Ingestion Service (ZMQ PULL port 5555)                     │
+│       │                                                     │
+│       ▼                                                     │
+│     Router                                                  │
+│    /       \                                                │
+│   ▼         ▼                                               │
+│  PostgreSQL   QuestDB                                       │
+│  (state)      (time-series)                                 │
+│                                                             │
+│  Trade Tracker API → Equities team web dashboard            │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Repo Structure
 
 ```
-dekalb-database-tradetracker/
-├── ingestion-service/          # ZMQ -> PostgreSQL/QuestDB event pipeline (quant team)
-│   ├── main.py                 # ZMQ listener entry point
-│   ├── router.py               # Event routing logic
-│   ├── config.py
+dekalb-database/
+│
+├── ingestion-service/              # ZMQ → DB pipeline (quant team)
+│   ├── main.py                     # Entry point — ZMQ listener loop
+│   ├── router.py                   # Routes events to correct DB writer
+│   ├── config.py                   # Hosts, ports, ZMQ address
 │   ├── db_writers/
-│   │   ├── postgres_writer.py
-│   │   └── questdb_writer.py
+│   │   ├── postgres_writer.py      # Writes orders + positions
+│   │   └── questdb_writer.py       # Writes executions, logs, signals via ILP
 │   ├── requirements.txt
 │   └── Dockerfile
 │
-├── trade-tracker/              # Trade tracker (equities team)
-│   ├── api/                    # FastAPI backend
+├── trade-tracker/                  # Equities team web app
+│   ├── api/                        # FastAPI backend
 │   │   ├── main.py
 │   │   ├── config.py
-│   │   ├── db.py               # asyncpg connection pool
-│   │   ├── models/schemas.py   # Pydantic models
+│   │   ├── db.py                   # Connection pool + auto-migrations
+│   │   ├── models/schemas.py
 │   │   ├── routers/
-│   │   │   ├── auth.py         # /auth/* (Google Workspace SSO)
-│   │   │   ├── portfolio.py    # /portfolio/*
-│   │   │   ├── trades.py       # /trades/*
-│   │   │   ├── imports.py      # /import/fidelity
-│   │   │   ├── market.py       # /market/*
-│   │   │   └── ibkr.py         # /ibkr/*
+│   │   │   ├── ibkr.py             # /ibkr/* — OAuth connect, sync trades
+│   │   │   ├── portfolio.py        # /portfolio/* — summary, positions, metrics
+│   │   │   ├── trades.py           # /trades/* — trade log, labels
+│   │   │   ├── imports.py          # /import/fidelity and /import/ibkr
+│   │   │   └── market.py           # /market/* — live prices, SPY history
 │   │   ├── services/
-│   │   │   ├── auth.py              # Google ID token verification (JWKS)
-│   │   │   ├── ibkr_client.py       # IBKR Client Portal Gateway client
-│   │   │   ├── market_data.py       # yfinance (IBKR when gateway is on)
-│   │   │   ├── portfolio_metrics.py # beta, std dev, sharpe, alpha
-│   │   │   └── fidelity_parser.py   # Fidelity CSV parser
+│   │   │   ├── ibkr_client.py      # IBKR Web API client (OAuth 2.0)
+│   │   │   ├── ibkr_parser.py      # IBKR Activity Statement CSV parser
+│   │   │   ├── fidelity_parser.py  # Fidelity CSV parser
+│   │   │   ├── market_data.py      # yfinance + IBKR price fetching with cache
+│   │   │   └── portfolio_metrics.py
 │   │   ├── requirements.txt
 │   │   ├── Dockerfile
-│   │   └── railway.toml        # Railway deploy config (backend)
-│   │
-│   └── frontend/               # React + Vite dashboard
+│   │   └── railway.toml
+│   └── frontend/                   # React + Vite + Tailwind
 │       ├── src/
-│       │   ├── auth/           # AuthContext (Google SSO)
-│       │   ├── pages/          # Dashboard, Trades, Import, Login
-│       │   ├── components/
-│       │   ├── api/client.ts   # fetch wrapper, auth headers, base URL
-│       │   └── types/
-│       ├── nginx.conf          # Docker: proxies /api/* -> trade-tracker:8000
-│       └── vercel.json         # Vercel deploy config (frontend)
-│
-├── ibkr-gateway/               # IBKR Client Portal Gateway config
-│   └── conf.yaml.example       # Reference only - gateway download includes its own conf.yaml
+│       │   ├── pages/              # Dashboard, Trades, Import
+│       │   └── components/
+│       ├── vercel.json
+│       └── package.json
 │
 ├── schemas/
-│   ├── postgresql_schema.sql       # orders, positions, accounts (quant team)
-│   ├── questdb_schema.sql          # time-series tables (apply via QuestDB console)
-│   └── trade_tracker_schema.sql    # trades, snapshots, imports (equities team)
+│   ├── postgresql_schema.sql        # Quant team DB (auto-applied on first boot)
+│   ├── questdb_schema.sql           # Quant team time-series (run manually in console)
+│   └── trade_tracker_schema.sql     # Equities team DB (auto-applied on first boot)
 │
 ├── tests/
-│   ├── fake_zmq_sender.py      # Send test events to ingestion service
-│   └── comprehensive_test.py   # Sends all event types across multiple symbols
+│   └── fake_zmq_sender.py           # Sends fake events to test the ingestion pipeline
 │
-├── docs/
-│   ├── REPO_AUDIT.md           # Audit + Linear project/issue backlog
-│   ├── FEATURES.md             # Feature catalog: what's live/planned/deprecated
-│   └── linear/                 # Linear templates + GitHub workflow + label setup
-│
-├── .env.example                # Copy to .env and fill in your values
+├── .env.example                     # Copy to .env and fill in
 └── docker-compose.yml
 ```
 
 ---
 
-## Quick Start (local dev)
+## Database Design
 
-```bash
-# 1. Copy env file and fill in your values
-cp .env.example .env
-# at minimum set IBKR_ACCOUNT_ID if you have it - everything else has working defaults
+### Why two databases on Machine 2?
 
-# 2. Start all services
-docker compose up --build
-
-# 3. Check the API
-curl http://localhost:8000/health
-
-# 4. Swagger docs
-open http://localhost:8000/docs
-
-# 5. Frontend dashboard
-open http://localhost:3000
-
-# 6. Database GUI (Adminer)
-open http://localhost:8080
-# System: PostgreSQL | Server: postgres | User: postgres | Password: postgres
-# Equities DB: trade_tracker  |  Quant DB: trading
-```
-
-By default `AUTH_ENABLED=false`, so the dashboard skips the Google sign-in screen entirely. See [Authentication](#authentication) to enable it.
-
----
-
-## Services
-
-| Service | Port | What it does |
+| | PostgreSQL | QuestDB |
 |---|---|---|
-| Trade Tracker API | 8000 | FastAPI backend — Swagger at `/docs` |
-| Frontend | 3000 | React dashboard |
-| PostgreSQL | 5432 | Main relational DB (two isolated databases) |
-| QuestDB | 9000 | Time-series DB (quant team only) |
-| Adminer | 8080 | DB GUI |
-| Ingestion Service | 5555 | ZMQ listener (quant team) |
-| IBKR Gateway | 5001 | Client Portal Gateway (runs on host, not in Docker) |
+| Best for | State that changes | Append-only time-series |
+| Storage | Row-based | Columnar |
+| Transactions | ACID | WAL |
+| Indexes | B-tree | Time-based partitions |
+| Updates | Fast UPDATEs | Append only |
+| Quant team use | Orders, positions, accounts | Executions, logs, signals, ticks |
 
 ---
 
-## Trade Tracker API Endpoints
+### PostgreSQL — `trading` database (quant team)
 
-| Endpoint | What it does |
+Applied automatically from `schemas/postgresql_schema.sql` on first boot.
+
+| Table | What it holds |
 |---|---|
-| `GET /health` | Service health check |
-| `GET /auth/config` | Returns whether SSO is enabled + Google client ID |
-| `POST /auth/verify` | Verify a Google ID token, returns user profile |
-| `GET /auth/me` | Current authenticated user (requires `Authorization: Bearer <id_token>`) |
-| `GET /portfolio/summary` | Combined + per-account P&L |
-| `GET /portfolio/positions` | Open positions with live P&L |
-| `GET /portfolio/performance?period=ytd` | NAV time series + SPY overlay |
-| `GET /portfolio/metrics?period=ytd` | Beta, std dev, Sharpe, alpha, max drawdown, win rate |
-| `GET /portfolio/snapshots` | Raw daily NAV snapshots (debugging) |
-| `POST /portfolio/snapshots/generate` | Store today's NAV snapshot |
-| `GET /trades` | Full trade log with filters |
-| `GET /trades/{id}` | Single trade detail |
-| `PATCH /trades/{id}/label` | Label a trade |
-| `POST /import/fidelity` | Upload Fidelity CSV |
-| `GET /import/fidelity` | List past CSV imports |
-| `GET /market/quote/{symbol}` | Current price (yfinance or IBKR) |
-| `GET /market/quotes?symbols=...` | Batch price quotes |
-| `GET /market/history/{symbol}` | Historical OHLCV bars |
-| `GET /market/spy` | SPY benchmark history |
-| `GET /ibkr/status` | Gateway connection status |
-| `GET /ibkr/account` | Live NAV + balances from IBKR |
-| `GET /ibkr/positions` | Live open positions from IBKR |
-| `POST /ibkr/sync/trades` | Pull last 24h of IBKR fills into trades table |
+| `orders` | Every order from submission to fill — status, fill price, commission |
+| `positions` | Current holdings by account and symbol — UPSERT on each execution |
+| `accounts` | Account-level cash, buying power, equity |
+| `strategies` | Strategy registry with JSONB parameters |
+| `ib_api_calls` | Audit log of every IB API call (compliance) |
 
 ---
 
-## Authentication
+### QuestDB — time-series (quant team)
 
-The dashboard supports Google Workspace SSO, gated by `AUTH_ENABLED`.
+Tables must be created manually. Open `http://localhost:9000`, paste `schemas/questdb_schema.sql`, run it. One time only.
 
-- **`AUTH_ENABLED=false`** (default): no login screen, all endpoints open. Good for local dev.
-- **`AUTH_ENABLED=true`**: every request except `/health`, `/docs`, `/redoc`, `/openapi.json`, and `/auth/*` requires `Authorization: Bearer <google id_token>`. The frontend shows a "Sign in with Google" button (Google Identity Services) restricted to `@<ALLOWED_EMAIL_DOMAIN>` accounts.
+| Table | What it holds |
+|---|---|
+| `executions` | Every trade fill — append-only, partitioned by day |
+| `engine_logs` | High-volume application logs |
+| `strategy_signals` | Buy/sell signals from strategies |
+| `tick_data` | Market prices (optional) |
 
-### How it works
-
-1. Frontend loads Google's `gsi/client` script and renders the Sign-In button, scoped to `hd=<ALLOWED_EMAIL_DOMAIN>`.
-2. On success, the browser gets a Google **ID token** (JWT) and POSTs it to `/auth/verify`.
-3. The backend (`services/auth.py`) verifies the token's signature against Google's published JWKS, checks the issuer, audience (`GOOGLE_CLIENT_ID`), email verification, and `hd`/email domain.
-4. The frontend stores the ID token in `localStorage` and sends it as `Authorization: Bearer <token>` on every API call. `AuthMiddleware` in `main.py` re-verifies it on each request.
-
-ID tokens expire (~1h). There's currently no refresh flow — see [`docs/REPO_AUDIT.md`](docs/REPO_AUDIT.md).
-
-### Setting up a Google OAuth Client ID
-
-1. Go to [Google Cloud Console → APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials).
-2. Create an **OAuth 2.0 Client ID** of type "Web application".
-3. Under **Authorized JavaScript origins**, add every origin the frontend is served from, e.g.:
-   - `http://localhost:3000` (local dev)
-   - `https://<your-app>.vercel.app` (production)
-4. Copy the Client ID into `GOOGLE_CLIENT_ID`.
-5. Set `ALLOWED_EMAIL_DOMAIN` (defaults to `dekalbcapitalmanagement.com`) and `AUTH_ENABLED=true`.
-
----
-
-## IBKR Gateway Setup
-
-The API works without IBKR — it falls back to **yfinance** for market prices. Enabling IBKR gives you live account data, position sync, and real-time prices.
-
-### How it works
-
-The **IBKR Client Portal Gateway** is a small Java app you run on your machine. You log into it once via browser (username + password + 2FA), and it keeps a session alive. The API talks to it directly at `https://localhost:5001` — there's no VPN or proxy involved.
-
-### Step-by-step
-
-**1. Download the gateway**
-
-Go to: https://www.interactivebrokers.com/en/trading/ib-api.php
-
-Find "Client Portal API" and download the `.zip`. Unzip it into `ibkr-gateway/`:
-
-```
-ibkr-gateway/
-└── clientportal.gw/
-    └── root/
-        └── clientportal.gw.jar
-```
-
-**2. Start the gateway**
-
-```bash
-cd ibkr-gateway/clientportal.gw
-bin/run.sh root/conf.yaml
-```
-
-You do **not** need to copy or edit `conf.yaml` — the download already includes a working one (listens on port 5001 by default). `ibkr-gateway/conf.yaml.example` in this repo is reference-only.
-
-Leave this terminal open.
-
-**3. Authenticate in your browser**
-
-Open `https://localhost:5001`. Your browser will warn about the self-signed cert — click through it. Log in with your IBKR username/password and complete 2FA.
-
-You'll see a confirmation page when it works. The session lasts ~24 hours. Repeat this step after it expires.
-
-**4. Set env vars in your .env file**
-
-```
-IBKR_ENABLED=true
-IBKR_ACCOUNT_ID=U1234567
-```
-
-Your account ID is on the IBKR homepage after login (top right), format: `U` followed by digits.
-
-**5. Restart the API**
-
-```bash
-docker compose up --build trade-tracker
-```
-
-**6. Verify**
-
-```bash
-curl http://localhost:8000/ibkr/status
-# {"enabled": true, "connected": true, "authenticated": true, ...}
-```
-
-> **Docker note:** The gateway runs on your host machine. Docker reaches it via `host.docker.internal:5001`, which is already configured in `docker-compose.yml`. No extra steps needed.
+QuestDB uses `SYMBOL` columns for low-cardinality strings (env, side, strategy) — stored as integers internally for fast filtering. All tables use `PARTITION BY DAY WAL`.
 
 > **Production note:** The gateway is a desktop app tied to one person's 2FA session — it cannot run unattended on Railway. In production, leave `IBKR_ENABLED=false` (yfinance fallback) unless/until there's a plan for headless re-auth. See [`docs/REPO_AUDIT.md`](docs/REPO_AUDIT.md).
 
 ---
 
-## Importing Trades
+### PostgreSQL — `trade_tracker` database (equities team)
 
-### From Fidelity (CSV)
+Applied automatically from `schemas/trade_tracker_schema.sql` on first boot. Auto-migrated on API startup — no manual steps ever needed.
 
-1. In Fidelity: Accounts & Trade > Portfolio > select account > Activity & Orders > Download CSV
-2. `POST /import/fidelity` with the file and an `account_id` string (e.g. `FIDELITY_MAIN`)
-3. Trades land unlabeled — use `PATCH /trades/{id}/label` to categorize them
-4. Labels: `event-driven`, `hedge`, `long-term`, `short-term`
-
-### From IBKR (live sync)
-
-Once the gateway is running and authenticated: `POST /ibkr/sync/trades`
-
-This pulls the last ~24h of fills. For older history, use IBKR Flex Queries and import the CSV.
+| Table | What it holds |
+|---|---|
+| `trades` | Unified trade ledger — IBKR + Fidelity in one table |
+| `portfolio_snapshots` | Daily NAV history for performance chart |
+| `fidelity_imports` | Audit log of all CSV uploads (Fidelity and IBKR history) |
+| `cash_flows` | Deposits/withdrawals (excluded from performance calculations) |
+| `ibkr_tokens` | OAuth 2.0 tokens for IBKR Web API — auto-managed |
 
 ---
 
@@ -300,52 +222,311 @@ At that point: browser → Vercel (static frontend) → directly to Railway API 
 
 ## Ingestion Service (Quant Team)
 
-Listens on ZMQ port 5555 for trading events from the live engine.
+Receives batched events from Machine 1 over ZMQ PULL and routes them.
 
-```bash
-# Send test events
-python tests/fake_zmq_sender.py
+### Event routing
+
+| Event type | PostgreSQL | QuestDB |
+|---|---|---|
+| `execution` | UPDATE orders + UPSERT positions | INSERT executions |
+| `order_update` | UPDATE orders | — |
+| `log` | — | INSERT engine_logs |
+| `signal` | — | INSERT strategy_signals |
+
+### ZMQ message format
+
+```json
+{
+  "type": "batch",
+  "batch_time": "2024-01-15T10:30:00Z",
+  "count": 3,
+  "events": [
+    {
+      "type": "execution",
+      "timestamp": "2024-01-15T10:30:00Z",
+      "server_env": "paper",
+      "data": {
+        "order_id": "ORD001",
+        "symbol": "AAPL",
+        "side": "BUY",
+        "quantity": 100,
+        "price": 185.40,
+        "commission": 1.00,
+        "strategy": "momentum_v1"
+      }
+    }
+  ]
+}
 ```
 
-| Event type | Destination |
-|---|---|
-| `execution` | PostgreSQL (orders + positions) + QuestDB |
-| `order_update` | PostgreSQL only |
-| `log` | QuestDB only |
-| `signal` | QuestDB only |
+### Testing the pipeline
+
+```bash
+# With ingestion-service running:
+python tests/fake_zmq_sender.py
+# Sends 5 batches of 3 events each. Check Adminer at http://localhost:8080.
+```
 
 ---
 
-## Database Schema
+## Trade Tracker — Equities Team
 
-PostgreSQL schemas are auto-applied on first boot.
+A web dashboard for tracking IBKR + Fidelity positions, P&L, and portfolio metrics vs SPY. Team members just open a URL.
 
-| Database | Schema file | Tables |
+### How data gets in
+
+**IBKR (fully automated):**
+- Set credentials in `.env` (see IBKR Web API Setup section below)
+- API connects automatically on startup — no user action, no login page
+- New fills sync automatically every hour — nothing to do
+
+**IBKR full history (one-time):**
+- The API only returns recent trades
+- For everything before that: export from IBKR → Client Portal → Performance & Reports → Activity Statements → set date range → Format: CSV → Download
+- Upload on the **Import** page — duplicates are skipped automatically
+- After this upload, the hourly sync handles everything going forward
+
+**Fidelity (manual CSV upload):**
+- Export from Fidelity → Accounts & Trade → Portfolio → Activity & Orders → Download
+- Upload on the **Import** page
+- Upload again whenever you want to pull in new Fidelity trades
+
+---
+
+## Running Locally
+
+### Option A — Docker (recommended, runs everything)
+
+```bash
+# 1. Configure
+cp .env.example .env
+# Edit .env — fill in IBKR credentials if you want live data (optional)
+
+# 2. Start
+docker compose up --build
+
+# 3. Check
+curl http://localhost:8000/health
+```
+
+Services that start:
+
+| Service | URL | What it is |
 |---|---|---|
-| `trading` | `postgresql_schema.sql` | orders, positions, accounts, strategies, ib_api_calls |
-| `trade_tracker` | `trade_tracker_schema.sql` | trades, portfolio_snapshots, fidelity_imports, cash_flows |
+| Trade Tracker | http://localhost:3000 | React dashboard |
+| API | http://localhost:8000/docs | Swagger UI |
+| Adminer | http://localhost:8080 | DB browser |
+| QuestDB | http://localhost:9000 | Time-series console |
+| PostgreSQL | localhost:5432 | Direct DB access |
+| Ingestion Service | port 5555 | ZMQ PULL for quant events |
 
-QuestDB tables are created manually — open `http://localhost:9000` and run `schemas/questdb_schema.sql`.
+IBKR credentials are optional for local dev — everything works with yfinance for prices and Fidelity CSV imports.
+
+### Option B — Without Docker
+
+Terminal 1 — start PostgreSQL locally (or point to any running Postgres), then run the API:
+```bash
+cd trade-tracker/api
+pip install -r requirements.txt
+export DB_HOST=localhost POSTGRES_DB=trade_tracker
+uvicorn main:app --reload --port 8000
+```
+
+Terminal 2 — frontend:
+```bash
+cd trade-tracker/frontend
+npm install
+npm run dev
+```
+
+Frontend at `http://localhost:5173`, API at `http://localhost:8000`.
 
 ---
 
-## Portfolio Metrics
+## Deploying for the Team (Vercel + Railway)
 
-Calculated from daily NAV snapshots in `portfolio_snapshots`. The `snapshot-cron` container runs `POST /portfolio/snapshots/generate` every hour automatically.
+Everyone on the team opens one URL — no one installs anything locally.
 
-| Metric | Formula |
+### Step 1 — Deploy API on Railway
+
+1. Create a project at [railway.app](https://railway.app)
+2. Add a PostgreSQL service (Railway provides the connection string)
+3. Connect this GitHub repo, set root directory to `trade-tracker/api`
+4. Railway picks up `railway.toml` automatically
+5. Set environment variables in the Railway dashboard:
+
+```
+DB_HOST               = (from Railway PostgreSQL, e.g. postgres.railway.internal)
+POSTGRES_PASSWORD     = (from Railway PostgreSQL)
+POSTGRES_DB           = trade_tracker
+POSTGRES_USER         = postgres
+IBKR_ENABLED          = true
+IBKR_CLIENT_ID        = (from IBKR — see setup below)
+IBKR_CLIENT_SECRET    = (from IBKR — see setup below)
+IBKR_ACCOUNT_ID       = U1234567
+IBKR_REDIRECT_URI     = https://YOUR-APP.railway.app/ibkr/auth/callback
+FRONTEND_URL          = https://YOUR-APP.vercel.app
+```
+
+Note the Railway API URL — you'll need it in the next step.
+
+### Step 2 — Deploy frontend on Vercel
+
+1. Import this repo at [vercel.com](https://vercel.com), root directory = `trade-tracker/frontend`
+2. Edit `trade-tracker/frontend/vercel.json` — replace the placeholder with your actual Railway URL:
+
+```json
+{
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://YOUR-ACTUAL-RAILWAY-URL.railway.app/:path*"
+    },
+    {
+      "source": "/((?!api/).*)",
+      "destination": "/index.html"
+    }
+  ]
+}
+```
+
+3. Deploy — this is the URL you share with the team.
+
+### Step 3 — Configure IBKR credentials in Railway
+
+In Railway → your service → Variables, add:
+```
+IBKR_ENABLED=true
+IBKR_CLIENT_ID=DekalbCapital-Paper   (or live value from ticket #619394)
+IBKR_CLIENT_KEY_ID=main              (or live value)
+IBKR_CREDENTIAL=dekalbcapitalpaper   (or live username)
+IBKR_ACCOUNT_ID=DFP321877            (or live account)
+IBKR_PRIVATE_KEY=<full privatekey.pem content with \n for newlines>
+IBKR_SERVER_IP=<Railway static outbound IP>
+```
+
+The API auto-connects on startup. No user action needed, no login page.
+
+---
+
+## IBKR Web API Setup
+
+IBKR's Web API uses **RSA key-based OAuth 2.0** — this is server-to-server authentication, not a browser login flow. There is no redirect URL, no login page, and no user action after initial setup.
+
+**How it works:**
+1. Your RSA private key signs a JWT
+2. That JWT is sent to IBKR → they return a bearer token
+3. The bearer token + your IBKR username + your server's IP → creates an IBKR session
+4. The session auto-renews in the background every 60 seconds
+
+**DeKalb already has approved credentials.** Ryan has the zip with the private key and ticket #619394 has the live account `clientId`, `clientKeyId`, and `credential`.
+
+**Setting it up:**
+
+1. Open Ryan's zip (password: `dcm1234`) — it contains `privatekey.pem` (and possibly the live credentials)
+2. Open your `.env` file and fill in:
+
+```
+IBKR_ENABLED=true
+
+# Paper account (ready to use now):
+IBKR_CLIENT_ID=DekalbCapital-Paper
+IBKR_CLIENT_KEY_ID=main
+IBKR_CREDENTIAL=dekalbcapitalpaper
+IBKR_ACCOUNT_ID=DFP321877
+
+# RSA private key — paste the FULL contents of privatekey.pem, with \n for each newline:
+IBKR_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----
+
+# The outbound IP of the machine running the trade-tracker API:
+# Local dev: google "what is my ip"
+# Railway: Settings → Networking → Outbound Static IP
+IBKR_SERVER_IP=YOUR.SERVER.IP.HERE
+```
+
+3. Restart the API — it connects automatically on startup. No further action needed.
+
+**Live account** (`clientId`, `clientKeyId`, `credential` from ticket #619394): same process, just swap those three values in `.env`. The RSA key file is the same for both paper and live.
+
+**Note on IP:** IBKR ties sessions to an IP address. If you're running locally, use your home IP. For Railway, you need their static outbound IP (Pro plan). If the IP changes, `POST /ibkr/connect` re-establishes the session with the new IP.
+
+---
+
+## Trade Tracker API Reference
+
+Full interactive docs at `/docs` (Swagger UI).
+
+| Endpoint | What it does |
 |---|---|
-| Beta | Cov(portfolio, SPY) / Var(SPY) |
-| Std Dev | Daily std dev x sqrt(252) |
-| Sharpe | Annualized return / Annualized std dev (risk-free rate = 0) |
-| Alpha | Portfolio return - Beta x SPY return |
-| Max Drawdown | Max peak-to-trough NAV decline |
-| Win Rate | % of SELL trades with positive `net_amount` (simplified, not FIFO-matched) |
+| `GET /health` | Health check |
+| **IBKR** | |
+| `GET /ibkr/status` | Is IBKR connected? (auto-connects on startup) |
+| `POST /ibkr/connect` | Manually trigger reconnect (useful after credential change) |
+| `GET /ibkr/account` | Live NAV, cash, equity from IBKR |
+| `GET /ibkr/positions` | Live open positions from IBKR |
+| `POST /ibkr/sync/trades` | Pull recent fills now (also runs automatically every hour) |
+| **Portfolio** | |
+| `GET /portfolio/summary` | Combined + per-account P&L snapshot |
+| `GET /portfolio/positions` | Open positions with live pricing |
+| `GET /portfolio/performance?period=ytd` | NAV time series + SPY overlay |
+| `GET /portfolio/metrics?period=ytd` | Beta, std dev, Sharpe, alpha, drawdown, win rate |
+| `POST /portfolio/snapshots/generate` | Generate today's NAV snapshot (also runs automatically every hour) |
+| **Trades** | |
+| `GET /trades` | Full trade log — filter by symbol, side, label, date |
+| `PATCH /trades/{id}/label` | Set label, hedge flag, notes |
+| **Imports** | |
+| `POST /import/ibkr` | Upload IBKR Activity Statement CSV (historical data) |
+| `POST /import/fidelity` | Upload Fidelity CSV |
+| `GET /import/fidelity` | List all past imports |
+| **Market** | |
+| `GET /market/quote/{symbol}` | Current price (IBKR or yfinance fallback) |
+| `GET /market/quotes?symbols=AAPL,MSFT` | Batch quotes |
+| `GET /market/spy` | SPY benchmark data |
+
+Period options: `1m`, `3m`, `6m`, `ytd`, `1y`
 
 ---
 
-## Project Status, Roadmap & Team Workflow
+## 🔮 Next Steps — Member Browser Login (To Implement Later)
 
-- [`docs/REPO_AUDIT.md`](docs/REPO_AUDIT.md) — what's working, what's broken, what's next, and the current project/issue backlog.
-- [`docs/FEATURES.md`](docs/FEATURES.md) — catalog of features (live/planned/deprecated) and where their code lives.
-- [`docs/linear/`](docs/linear/) — Linear project/issue templates and the GitHub↔Linear workflow.
+Currently the dashboard is a single shared view with no user auth. To let each team member log in with their own browser and see their own account:
+
+### Option A — Simple Password Protection (1-2 days work)
+Add HTTP Basic Auth via nginx in front of the app. One shared password for the whole team. Simplest option, zero code changes.
+
+### Option B — Per-Member Login with IBKR OAuth (1-2 weeks work)
+Let each member authenticate with their own IBKR account via the browser. This is a real OAuth 2.0 flow — each user gets redirected to IBKR to log in, then comes back with their own session.
+
+**What needs to be built:**
+1. **User table in PostgreSQL** — map IBKR credentials to team member profiles
+2. **OAuth callback endpoint** — `GET /auth/ibkr/callback` — receives the auth code after IBKR login
+3. **Session management** — store session tokens in `ibkr_tokens` table (already exists), issue JWTs to the browser
+4. **Auth middleware on FastAPI** — protect all endpoints, extract user from JWT
+5. **Login page on frontend** — a simple page with a "Login with IBKR" button
+6. **Per-user data filtering** — trades/positions filtered by the logged-in user's account IDs
+
+**IBKR's OAuth 2.0 Browser Flow (different from what we have):**
+- What we have now: RSA key-based server-to-server auth (one fixed service account)
+- What members need: browser-based OAuth where users log in to IBKR in a popup, approve access, and get redirected back
+- IBKR calls this "Third-party OAuth 2.0" — it requires a redirect URI registered with IBKR
+- Contact IBKR API team to register a redirect URI for your Railway/Vercel URL
+
+**IBKR docs:** https://www.interactivebrokers.com/campus/ibkr-api-page/webapi-doc/
+
+**Key config needed from IBKR:**
+- A registered redirect URI: `https://YOUR-APP.vercel.app/auth/callback`
+- The OAuth 2.0 authorization endpoint URL from IBKR
+- This is a separate app registration from the current service account
+
+---
+
+## Adminer — DB Browser
+
+`http://localhost:8080`
+
+| Team | Database |
+|---|---|
+| Quant | System: PostgreSQL / Server: postgres / DB: **trading** |
+| Equities | System: PostgreSQL / Server: postgres / DB: **trade_tracker** |
+
+User: `postgres` — Password: `postgres`

@@ -7,7 +7,7 @@ python-multipart==0.0.9     # required for UploadFile (CSV import)
 asyncpg==0.31.0
 
 # Spreadsheet parsing (CSV, XLSX, XLSM, XLS)
-pandas==3.0.2
+pandas==3.0.1
 openpyxl==3.1.5
 xlrd==2.0.1
 

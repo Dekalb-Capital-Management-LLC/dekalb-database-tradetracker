@@ -1,23 +1,18 @@
 """
-Fidelity CSV trade history parser.
+Fidelity CSV parser — handles two export formats:
 
-Fidelity's exported trade history CSV format (Activity & Orders export):
+FORMAT A: Activity & Orders (trade history)
+  Columns: Run Date, Account, Action, Symbol, Security Description,
+           Security Type, Quantity, Price ($), Commission ($), Fees ($), Amount ($), Settlement Date
+  Detected by: has "Action" column
 
-Row layout:
-  "Run Date","Account","Action","Symbol","Security Description",
-  "Security Type","Quantity","Price ($)","Commission ($)",
-  "Fees ($)","Accrued Interest ($)","Amount ($)","Settlement Date"
-
-Notes:
-- The file typically has several header/footer garbage lines before and after
-  the actual data rows (Fidelity love doing this).
-- We skip rows where Symbol is blank or not a valid equity symbol.
-- "Action" maps to BUY/SELL: rows containing "YOU BOUGHT" / "YOU SOLD".
-- Amounts in Fidelity CSV use parentheses for negatives: (100.00) = -100.00.
-
-Usage:
-    from services.fidelity_parser import parse_fidelity_csv
-    trades, errors = parse_fidelity_csv(csv_text, account_id="FIDELITY_001", import_id=1)
+FORMAT B: Portfolio Positions (current holdings snapshot)
+  Columns: Account Number, Account Name, Symbol, Description, Quantity,
+           Last Price, Last Price Change, Current Value, Today's Gain/Loss Dollar,
+           Today's Gain/Loss Percent, Total Gain/Loss Dollar, Total Gain/Loss Percent,
+           Percent Of Account, Cost Basis Total, Average Cost Basis, Type
+  Detected by: has "Average Cost Basis" column (no "Action" column)
+  Positions are converted to synthetic BUY/SELL trades using avg cost basis as price.
 """
 from __future__ import annotations
 
@@ -25,7 +20,7 @@ import csv
 import io
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
@@ -33,27 +28,17 @@ from models.schemas import TradeCreate
 
 logger = logging.getLogger(__name__)
 
-# Actions that indicate a buy trade
-_BUY_KEYWORDS = {"YOU BOUGHT", "BOUGHT", "BUY", "PURCHASE"}
-# Actions that indicate a sell trade
+_BUY_KEYWORDS = {"YOU BOUGHT", "BOUGHT", "BUY", "PURCHASE", "REINVESTMENT"}
 _SELL_KEYWORDS = {"YOU SOLD", "SOLD", "SELL"}
 
-# Expected Fidelity column headers (case-insensitive match)
-_EXPECTED_COLS = {
-    "run date", "account", "action", "symbol",
-    "quantity", "price ($)", "commission ($)", "amount ($)",
-}
+# Symbols to always skip
+_SKIP_SYMBOLS = {"SPAXX**", "SPAXX", "FDRXX", "FDRXX**", "FCASH**"}
 
 
 def _parse_fidelity_decimal(raw: str) -> Optional[Decimal]:
-    """
-    Handle Fidelity's number format:
-      - parentheses = negative: (1,234.56) -> -1234.56
-      - commas as thousands separator
-      - empty / '--' / 'n/a' -> None
-    """
-    raw = raw.strip().replace(",", "")
-    if not raw or raw in ("--", "n/a", "N/A"):
+    """Handle Fidelity number formats: (1,234.56) = -1234.56, +$1.23 = 1.23"""
+    raw = raw.strip().replace(",", "").replace("$", "").replace("+", "")
+    if not raw or raw in ("--", "n/a", "N/A", ""):
         return None
     negative = False
     if raw.startswith("(") and raw.endswith(")"):
@@ -70,9 +55,8 @@ def _parse_fidelity_decimal(raw: str) -> Optional[Decimal]:
 
 
 def _parse_fidelity_date(raw: str) -> Optional[datetime]:
-    """Try several date formats Fidelity uses."""
     raw = raw.strip()
-    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y"):
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y", "%b-%d-%Y"):
         try:
             return datetime.strptime(raw, fmt)
         except ValueError:
@@ -96,120 +80,367 @@ def _normalise_header(h: str) -> str:
 
 
 def _find_header_row(lines: list[str]) -> Optional[int]:
-    """
-    Fidelity CSVs have junk at the top. Scan for the line that looks like
-    a proper header (contains 'action' and 'symbol').
-    """
+    """Scan for the data header line (contains 'symbol' and at least one other key column)."""
     for i, line in enumerate(lines):
         lower = line.lower()
-        if "action" in lower and "symbol" in lower:
+        if "symbol" in lower and ("action" in lower or "average cost basis" in lower or "quantity" in lower):
             return i
     return None
 
 
-def parse_fidelity_csv(
-    csv_text: str,
+def _clean_symbol(raw: str) -> str:
+    """Normalize a Fidelity symbol, preserving leading dash so we can detect options."""
+    return raw.strip().upper()
+
+
+def _is_option_symbol(raw: str) -> bool:
+    """
+    Fidelity option symbols start with a dash: '-ONDS260402P8', '-PR260417P20'.
+    They also embed a YYMMDD expiry date followed by P or C and a strike.
+    Skip both patterns.
+    """
+    s = raw.strip()
+    if s.startswith("-"):
+        return True
+    # Pattern: 6 digits (YYMMDD) followed by P or C and digits (strike)
+    if re.search(r'\d{6}[PC]\d', s):
+        return True
+    return False
+
+
+def _is_skip_row(symbol: str, description: str) -> bool:
+    """Return True for rows we should silently skip."""
+    sym = symbol.upper().strip()
+    desc = description.upper().strip()
+    if not sym:
+        return True
+    if _is_option_symbol(sym):
+        return True
+    # Strip the leading dash for further checks (money market funds, etc.)
+    clean = sym.lstrip("-").strip()
+    if clean in _SKIP_SYMBOLS or clean.startswith("SPAXX") or clean.startswith("FDRXX"):
+        return True
+    if "PENDING ACTIVITY" in sym or "PENDING ACTIVITY" in desc:
+        return True
+    if "HELD IN MONEY MARKET" in desc:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Format A: Activity / Trade History
+# ---------------------------------------------------------------------------
+
+def _parse_activity(
+    lines: list[str],
+    header_idx: int,
     account_id: str,
     import_id: int,
 ) -> tuple[list[TradeCreate], list[str]]:
-    """
-    Parse Fidelity activity CSV text into TradeCreate objects.
-
-    Returns:
-        (trades, errors) where errors is a list of human-readable strings
-        describing rows that were skipped/failed.
-    """
-    lines = csv_text.splitlines()
-    header_row_idx = _find_header_row(lines)
-    if header_row_idx is None:
-        return [], ["Could not find header row in CSV. Expected columns: Action, Symbol, Quantity, Price."]
-
-    # Re-parse from header row onward
-    data_section = "\n".join(lines[header_row_idx:])
+    data_section = "\n".join(lines[header_idx:])
     reader = csv.DictReader(io.StringIO(data_section))
-
-    # Normalise header keys
     if reader.fieldnames is None:
-        return [], ["CSV has no columns after header detection."]
-    fieldnames_normalised = {_normalise_header(f): f for f in reader.fieldnames if f}
+        return [], ["CSV has no columns after header."]
+
+    norm = {_normalise_header(f): f for f in reader.fieldnames if f}
 
     def col(row: dict, *candidates: str) -> str:
-        for candidate in candidates:
-            original = fieldnames_normalised.get(candidate)
-            if original and original in row:
-                return (row[original] or "").strip()
+        for c in candidates:
+            orig = norm.get(c)
+            if orig and orig in row:
+                return (row[orig] or "").strip()
         return ""
 
     trades: list[TradeCreate] = []
     errors: list[str] = []
 
-    for row_num, row in enumerate(reader, start=header_row_idx + 2):
-        # Skip blank / footer rows
-        raw_symbol = col(row, "symbol")
-        if not raw_symbol or len(raw_symbol) > 10 or not re.match(r"^[A-Z.\-]+$", raw_symbol.upper()):
+    for row_num, row in enumerate(reader, start=header_idx + 2):
+        raw_symbol = _clean_symbol(col(row, "symbol"))
+        description = col(row, "security description", "description")
+        if not raw_symbol or len(raw_symbol) > 20:
+            continue
+        if _is_skip_row(raw_symbol, description):
+            continue
+        # Strip any remaining leading dash after option check (shouldn't happen, but safety)
+        raw_symbol = raw_symbol.lstrip("-").strip()
+        if not raw_symbol or not re.match(r"^[A-Z0-9.]+$", raw_symbol):
             continue
 
         raw_action = col(row, "action")
         side = _detect_side(raw_action)
         if side is None:
-            errors.append(f"Row {row_num}: unrecognised action '{raw_action}' for {raw_symbol} - skipped")
+            errors.append(f"Row {row_num}: unrecognised action '{raw_action}' for {raw_symbol} — skipped")
             continue
 
         raw_date = col(row, "run date", "date", "settlement date")
         trade_date = _parse_fidelity_date(raw_date)
         if trade_date is None:
-            errors.append(f"Row {row_num}: invalid date '{raw_date}' for {raw_symbol} - skipped")
+            errors.append(f"Row {row_num}: invalid date '{raw_date}' for {raw_symbol} — skipped")
             continue
 
         quantity = _parse_fidelity_decimal(col(row, "quantity"))
         if quantity is None or quantity == 0:
-            errors.append(f"Row {row_num}: invalid quantity for {raw_symbol} on {raw_date} - skipped")
+            errors.append(f"Row {row_num}: invalid quantity for {raw_symbol} — skipped")
             continue
         quantity = abs(quantity)
 
         price = _parse_fidelity_decimal(col(row, "price ($)", "price"))
         if price is None or price <= 0:
-            errors.append(f"Row {row_num}: invalid price for {raw_symbol} on {raw_date} - skipped")
+            errors.append(f"Row {row_num}: invalid price for {raw_symbol} — skipped")
             continue
 
-        commission = _parse_fidelity_decimal(col(row, "commission ($)", "commission")) or Decimal("0")
-        commission = abs(commission)
-
-        fees = _parse_fidelity_decimal(col(row, "fees ($)", "fees")) or Decimal("0")
-        fees = abs(fees)
+        commission = abs(_parse_fidelity_decimal(col(row, "commission ($)", "commission")) or Decimal(0))
+        fees = abs(_parse_fidelity_decimal(col(row, "fees ($)", "fees")) or Decimal(0))
         total_commission = commission + fees
 
-        gross_amount = (quantity * price).quantize(Decimal("0.01"))
-        net_amount_raw = _parse_fidelity_decimal(col(row, "amount ($)", "amount"))
-        # Fidelity amount = net already signed; use it if available, else compute
-        if net_amount_raw is not None:
-            net_amount = net_amount_raw
-        else:
-            net_amount = (-gross_amount - total_commission) if side == "BUY" else (gross_amount - total_commission)
-
-        raw_data = {k.strip(): v.strip() for k, v in row.items() if k}
-
-        trades.append(
-            TradeCreate(
-                source="fidelity",
-                account_id=account_id,
-                trade_date=trade_date,
-                symbol=raw_symbol.upper(),
-                side=side,
-                quantity=quantity,
-                price=price,
-                commission=total_commission,
-                gross_amount=gross_amount,
-                net_amount=net_amount,
-                label=None,          # user assigns labels manually after import
-                is_hedge=False,
-                fidelity_import_id=import_id,
-                raw_data=raw_data,
-            )
+        gross = (quantity * price).quantize(Decimal("0.01"))
+        net_raw = _parse_fidelity_decimal(col(row, "amount ($)", "amount"))
+        net = net_raw if net_raw is not None else (
+            (-gross - total_commission) if side == "BUY" else (gross - total_commission)
         )
 
-    logger.info(
-        "Fidelity parse complete: %d trades, %d errors (import_id=%d)",
-        len(trades), len(errors), import_id,
-    )
+        trades.append(TradeCreate(
+            source="fidelity",
+            account_id=account_id,
+            trade_date=trade_date,
+            symbol=raw_symbol,
+            side=side,
+            quantity=quantity,
+            price=price,
+            commission=total_commission,
+            gross_amount=gross,
+            net_amount=net,
+            label=None,
+            is_hedge=False,
+            fidelity_import_id=import_id,
+            raw_data={k.strip(): v.strip() for k, v in row.items() if k},
+        ))
+
     return trades, errors
+
+
+# ---------------------------------------------------------------------------
+# Format B: Portfolio Positions Snapshot
+# ---------------------------------------------------------------------------
+
+def _parse_positions(
+    lines: list[str],
+    header_idx: int,
+    account_id: str,
+    import_id: int,
+) -> tuple[list[TradeCreate], list[str]]:
+    """
+    Convert a Fidelity positions snapshot into synthetic trades.
+    Each position becomes a BUY (long) or SELL (short) using avg cost basis as price.
+    Trade date = today (the export date is not embedded per-row).
+    """
+    data_section = "\n".join(lines[header_idx:])
+    reader = csv.DictReader(io.StringIO(data_section))
+    if reader.fieldnames is None:
+        return [], ["CSV has no columns after header."]
+
+    norm = {_normalise_header(f): f for f in reader.fieldnames if f}
+
+    def col(row: dict, *candidates: str) -> str:
+        for c in candidates:
+            orig = norm.get(c)
+            if orig and orig in row:
+                return (row[orig] or "").strip()
+        return ""
+
+    trades: list[TradeCreate] = []
+    errors: list[str] = []
+    today = datetime.combine(date.today(), datetime.min.time())
+
+    for row_num, row in enumerate(reader, start=header_idx + 2):
+        raw_symbol = _clean_symbol(col(row, "symbol"))
+        description = col(row, "description", "security description")
+
+        if not raw_symbol:
+            continue
+        if _is_skip_row(raw_symbol, description):
+            continue
+        raw_symbol = raw_symbol.lstrip("-").strip()
+        # Skip footer/disclaimer text rows and invalid tickers
+        if not raw_symbol or len(raw_symbol) > 10 or not re.match(r"^[A-Z0-9.]+$", raw_symbol):
+            continue
+        if raw_symbol.startswith("BROKERAGE") or raw_symbol.startswith("THE DATA"):
+            continue
+
+        raw_qty = col(row, "quantity")
+        quantity_raw = _parse_fidelity_decimal(raw_qty)
+        if quantity_raw is None or quantity_raw == 0:
+            continue
+
+        # Determine side: negative qty = short (SELL), positive = long (BUY)
+        side = "SELL" if quantity_raw < 0 else "BUY"
+        quantity = abs(quantity_raw)
+
+        # Price: use Average Cost Basis; fall back to Cost Basis Total / quantity
+        avg_cost = _parse_fidelity_decimal(col(row, "average cost basis"))
+        if avg_cost is None or avg_cost <= 0:
+            cost_basis_total = _parse_fidelity_decimal(col(row, "cost basis total"))
+            if cost_basis_total and quantity > 0:
+                avg_cost = abs(cost_basis_total) / quantity
+        if avg_cost is None or avg_cost <= 0:
+            # Last resort: use Last Price
+            avg_cost = _parse_fidelity_decimal(col(row, "last price"))
+        if avg_cost is None or avg_cost <= 0:
+            errors.append(f"Row {row_num}: no valid price/cost basis for {raw_symbol} — skipped")
+            continue
+
+        gross = (quantity * avg_cost).quantize(Decimal("0.01"))
+        net = (-gross) if side == "BUY" else gross  # no commission info in positions export
+
+        trades.append(TradeCreate(
+            source="fidelity",
+            account_id=account_id,
+            trade_date=today,
+            symbol=raw_symbol,
+            side=side,
+            quantity=quantity,
+            price=avg_cost,
+            commission=Decimal(0),
+            gross_amount=gross,
+            net_amount=net,
+            label=None,
+            is_hedge=False,
+            fidelity_import_id=import_id,
+            raw_data={k.strip(): v.strip() for k, v in row.items() if k},
+        ))
+
+    return trades, errors
+
+
+# ---------------------------------------------------------------------------
+# Rich position snapshot extraction (Positions CSV only)
+# Returns list of dicts with all numeric fields Fidelity provides.
+# ---------------------------------------------------------------------------
+
+def extract_positions_snapshot(
+    csv_text: str,
+    account_id: str,
+    import_id: int,
+) -> list[dict]:
+    """
+    Parse a Fidelity Portfolio Positions CSV and return a list of position
+    dicts with all the financial data Fidelity already computed for us:
+    last_price, current_value, total_gain_loss, etc.
+    """
+    lines = csv_text.splitlines()
+    header_idx = _find_header_row(lines)
+    if header_idx is None:
+        return []
+    if "average cost basis" not in lines[header_idx].lower():
+        return []  # not a positions file
+
+    data_section = "\n".join(lines[header_idx:])
+    reader = csv.DictReader(io.StringIO(data_section))
+    if reader.fieldnames is None:
+        return []
+
+    norm = {_normalise_header(f): f for f in reader.fieldnames if f}
+
+    def col(row: dict, *candidates: str) -> str:
+        for c in candidates:
+            orig = norm.get(c)
+            if orig and orig in row:
+                return (row[orig] or "").strip()
+        return ""
+
+    results: list[dict] = []
+    for row in reader:
+        raw_symbol = _clean_symbol(col(row, "symbol"))
+        description = col(row, "description", "security description")
+        if not raw_symbol or _is_skip_row(raw_symbol, description):
+            continue
+        raw_symbol = raw_symbol.lstrip("-").strip()
+        if not raw_symbol or len(raw_symbol) > 10 or not re.match(r"^[A-Z0-9.]+$", raw_symbol):
+            continue
+
+        qty = _parse_fidelity_decimal(col(row, "quantity"))
+        if qty is None or qty == 0:
+            continue
+
+        results.append({
+            "symbol":          raw_symbol,
+            "account_id":      account_id,
+            "import_id":       import_id,
+            "quantity":        abs(qty),
+            "last_price":      _parse_fidelity_decimal(col(row, "last price")),
+            "current_value":   _parse_fidelity_decimal(col(row, "current value")),
+            "today_gain_loss": _parse_fidelity_decimal(col(row, "today's gain/loss dollar", "today gain/loss dollar")),
+            "today_gl_pct":    _parse_fidelity_decimal(col(row, "today's gain/loss percent", "today gain/loss percent")),
+            "total_gain_loss": _parse_fidelity_decimal(col(row, "total gain/loss dollar")),
+            "total_gl_pct":    _parse_fidelity_decimal(col(row, "total gain/loss percent")),
+            "cost_basis_total": _parse_fidelity_decimal(col(row, "cost basis total")),
+            "avg_cost":        _parse_fidelity_decimal(col(row, "average cost basis")),
+        })
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Public entry point — auto-detects format
+# ---------------------------------------------------------------------------
+
+def extract_account_id(csv_text: str) -> Optional[str]:
+    """
+    Auto-detect the Fidelity account ID from the CSV data.
+    The Activity CSV has an "Account" column with values like "Z12345678".
+    The Positions CSV has an "Account Number" column.
+    """
+    lines = csv_text.splitlines()
+    header_idx = _find_header_row(lines)
+    if header_idx is None:
+        return None
+    try:
+        header_lower = lines[header_idx].lower()
+        data_section = "\n".join(lines[header_idx:])
+        reader = csv.DictReader(io.StringIO(data_section))
+        norm = {_normalise_header(f): f for f in (reader.fieldnames or []) if f}
+
+        def col(row: dict, *candidates: str) -> str:
+            for c in candidates:
+                orig = norm.get(c)
+                if orig and orig in row:
+                    return (row[orig] or "").strip()
+            return ""
+
+        for row in reader:
+            # Activity format: "Account" column
+            acct = col(row, "account", "account number")
+            if acct and len(acct) >= 4:
+                return acct
+    except Exception:
+        pass
+    return None
+
+
+def parse_fidelity_csv(
+    csv_text: str,
+    account_id: Optional[str],
+    import_id: int,
+) -> tuple[list[TradeCreate], list[str], str]:
+    """
+    Parse a Fidelity CSV export into TradeCreate objects.
+    Automatically detects whether it's an Activity/Orders export or a
+    Portfolio Positions snapshot and uses the appropriate parser.
+    Auto-detects account_id from the file if not provided.
+    Returns (trades, errors, resolved_account_id).
+    """
+    resolved_account_id = account_id or extract_account_id(csv_text) or "FIDELITY"
+
+    lines = csv_text.splitlines()
+    header_idx = _find_header_row(lines)
+    if header_idx is None:
+        return [], ["Could not find header row. Expected columns: Symbol, Action or Average Cost Basis."], resolved_account_id
+
+    header_lower = lines[header_idx].lower()
+    if "average cost basis" in header_lower:
+        logger.info("Fidelity CSV detected as POSITIONS format (import_id=%d, account=%s)", import_id, resolved_account_id)
+        trades, errors = _parse_positions(lines, header_idx, resolved_account_id, import_id)
+    else:
+        logger.info("Fidelity CSV detected as ACTIVITY format (import_id=%d, account=%s)", import_id, resolved_account_id)
+        trades, errors = _parse_activity(lines, header_idx, resolved_account_id, import_id)
+
+    return trades, errors, resolved_account_id
