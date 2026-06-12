@@ -13,15 +13,15 @@ from datetime import date
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-import config
-import db
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+import config, db
 from routers import ibkr, imports, market, portfolio, trades
+from routers import auth as auth_router
+from services.auth import AuthError, verify_google_id_token
 
-logging.basicConfig(
-    level=logging.DEBUG if config.DEBUG else logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-)
+logging.basicConfig(level=logging.DEBUG if config.DEBUG else logging.INFO,
+                    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -188,8 +188,6 @@ async def shutdown():
         from services.ibkr_client import ibkr_client
         ibkr_client.disconnect()
     await db.close_pool()
-    logger.info("Trade Tracker API stopped")
-
 
 @app.get("/health", tags=["health"])
 async def health():

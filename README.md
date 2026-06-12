@@ -166,6 +166,8 @@ Tables must be created manually. Open `http://localhost:9000`, paste `schemas/qu
 
 QuestDB uses `SYMBOL` columns for low-cardinality strings (env, side, strategy) — stored as integers internally for fast filtering. All tables use `PARTITION BY DAY WAL`.
 
+> **Production note:** The gateway is a desktop app tied to one person's 2FA session — it cannot run unattended on Railway. In production, leave `IBKR_ENABLED=false` (yfinance fallback) unless/until there's a plan for headless re-auth. See [`docs/REPO_AUDIT.md`](docs/REPO_AUDIT.md).
+
 ---
 
 ### PostgreSQL — `trade_tracker` database (equities team)
@@ -179,6 +181,42 @@ Applied automatically from `schemas/trade_tracker_schema.sql` on first boot. Aut
 | `fidelity_imports` | Audit log of all CSV uploads (Fidelity and IBKR history) |
 | `cash_flows` | Deposits/withdrawals (excluded from performance calculations) |
 | `ibkr_tokens` | OAuth 2.0 tokens for IBKR Web API — auto-managed |
+
+---
+
+## Deploying to Production (Railway + Vercel)
+
+The backend deploys to **Railway**, the frontend to **Vercel**. They're separate projects/repos-as-monorepo deployments, connected via env vars (no shared secrets file).
+
+### 1. Backend → Railway
+
+1. Create a new Railway project from this GitHub repo.
+2. In the service's **Settings → Source**, set **Root Directory** to `trade-tracker/api`. Railway will then pick up `trade-tracker/api/railway.toml` (Dockerfile build, `/health` healthcheck).
+3. Add a **PostgreSQL** plugin to the project. Railway injects `DATABASE_URL` automatically — `config.py` parses it and turns on `DB_SSL=require`.
+4. Set these service env vars:
+
+   | Variable | Value |
+   |---|---|
+   | `AUTH_ENABLED` | `true` |
+   | `GOOGLE_CLIENT_ID` | from Google Cloud Console (see [Authentication](#authentication)) |
+   | `ALLOWED_EMAIL_DOMAIN` | `dekalbcapitalmanagement.com` |
+   | `FRONTEND_URL` | the Vercel URL from step 2 below (set this *after* step 2) |
+   | `IBKR_ENABLED` | `false` (gateway can't run on Railway — see IBKR section) |
+
+5. Deploy. Railway gives you a public URL like `https://<service>.up.railway.app`.
+6. Verify: `curl https://<service>.up.railway.app/health` → `{"status": "ok", ...}`.
+
+### 2. Frontend → Vercel
+
+1. Create a new Vercel project from this repo, with **Root Directory** set to `trade-tracker/frontend`. Vercel auto-detects Vite via `vercel.json`.
+2. Set the env var `VITE_API_BASE_URL` to the Railway URL from step 1.6 above (no trailing slash, no `/api` suffix — the API has no path prefix).
+3. Deploy. Vercel gives you a URL like `https://<project>.vercel.app`.
+
+### 3. Close the loop
+
+Go back to Railway and set `FRONTEND_URL` to the Vercel URL from step 2.3 (comma-separate if you also want to allow a preview-deploy domain). Redeploy the backend so CORS picks up the new origin, then add the Vercel URL(s) to the Google OAuth Client's **Authorized JavaScript origins**.
+
+At that point: browser → Vercel (static frontend) → directly to Railway API (cross-origin, allowed by `FRONTEND_URL` CORS) → Railway Postgres.
 
 ---
 
