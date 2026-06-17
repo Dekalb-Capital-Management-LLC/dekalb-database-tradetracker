@@ -314,7 +314,7 @@ export default function Dashboard() {
               positive={metrics?.sharpe_ratio == null ? null : Number(metrics.sharpe_ratio) >= 1}
             />
             <MetricCard
-              label="Win Rate"
+              label="Approx. Win Rate"
               value={
                 chartLoading
                   ? '...'

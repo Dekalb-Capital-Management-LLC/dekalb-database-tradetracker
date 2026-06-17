@@ -15,11 +15,11 @@ build on it).
 | Trade tracking | List/filter/label trades | Planned | `trade-tracker/api/routers/trades.py`, `frontend/src/pages/Trades.tsx` |
 | Fidelity CSV import | Parse Fidelity activity export into `trades` | Planned | `trade-tracker/api/services/fidelity_parser.py`, `routers/imports.py`, `frontend/src/pages/Import.tsx` |
 | Portfolio dashboard | Summary, positions, performance chart, snapshots | Planned | `trade-tracker/api/routers/portfolio.py`, `frontend/src/pages/Dashboard.tsx` |
-| Portfolio performance metrics | Beta, Sharpe, alpha, max drawdown, win rate | Planned (approximate — see `REPO_AUDIT.md`) | `trade-tracker/api/services/portfolio_metrics.py` |
+| Portfolio performance metrics | Cash-flow-adjusted beta, Sharpe, alpha, max drawdown, approximate win rate | Planned (approximate win rate — see `REPO_AUDIT.md`) | `trade-tracker/api/services/portfolio_metrics.py` |
 | Market data | Quotes/history via yfinance, optional IBKR | Planned | `trade-tracker/api/services/market_data.py`, `routers/market.py` |
 | IBKR integration | Gateway status, account, positions, trade-fill sync | Planned (local only — no production story yet) | `trade-tracker/api/services/ibkr_client.py`, `routers/ibkr.py`, `ibkr-gateway/` |
 | Daily snapshot cron | Hourly `POST /portfolio/snapshots/generate` | Planned | `docker-compose.yml` (`snapshot-cron` service) |
-| Cash flow tracking | Deposits/withdrawals excluded from NAV performance | Planned | `schemas/trade_tracker_schema.sql` (`cash_flows` table, unused) |
+| Cash flow tracking | Record deposits/withdrawals and exclude them from performance calculations | Planned | `schemas/trade_tracker_schema.sql`, `trade-tracker/api/routers/portfolio.py`, `trade-tracker/api/services/portfolio_metrics.py` |
 | Production deploy | Railway (API) + Vercel (frontend) | Planned / in progress | `trade-tracker/api/railway.toml`, `trade-tracker/frontend/vercel.json` |
 | Trading event ingestion | ZMQ listener → Postgres (`trading`) + QuestDB | Planned | `ingestion-service/`, `schemas/postgresql_schema.sql`, `schemas/questdb_schema.sql` |
 | Portfolio AI news sidebar | AI-summarized X/Twitter content relevant to open positions, without exposing positions to the AI | Planned | none yet — see `REPO_AUDIT.md` (Project: `[AI] Portfolio News Sidebar`) |

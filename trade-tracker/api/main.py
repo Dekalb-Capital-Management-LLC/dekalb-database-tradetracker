@@ -7,18 +7,13 @@ Start locally:
 In Docker:
     CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 """
-import asyncio
 import logging
-from datetime import date
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
 import config, db
 from routers import ibkr, imports, market, portfolio, trades
 from routers import auth as auth_router
-from services.auth import AuthError, verify_google_id_token
 
 logging.basicConfig(level=logging.DEBUG if config.DEBUG else logging.INFO,
                     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
@@ -54,121 +49,9 @@ app.include_router(market.router)
 app.include_router(ibkr.router)
 
 
-async def _auto_refresh_loop():
-    """Refresh yfinance prices + write snapshot every 5 minutes."""
-    import yfinance as yf
-    from datetime import date
-    from decimal import Decimal
-    from services.portfolio_metrics import upsert_snapshot
-
-    INTERVAL = 300  # seconds
-    await asyncio.sleep(30)  # wait for DB pool to be ready
-
-    while True:
-        try:
-            pool = db.get_pool()
-            rows = await pool.fetch(
-                "SELECT account_id, symbol, quantity, avg_cost, cost_basis_total FROM imported_positions"
-            )
-            if rows:
-                symbols = list({r["symbol"] for r in rows})
-                CASH_SYMS = {"XXCASH", "CASH", "SPAXX", "FDRXX", "FCASH"}
-                prices: dict[str, float] = {}
-                cash_syms = {s for s in symbols if s.upper() in CASH_SYMS or s.upper().startswith("XX")}
-                market_syms = [s for s in symbols if s not in cash_syms]
-                for s in cash_syms:
-                    prices[s] = 1.0
-                if market_syms:
-                    try:
-                        df = await asyncio.get_event_loop().run_in_executor(
-                            None,
-                            lambda: yf.download(
-                                " ".join(market_syms),
-                                period="5d",
-                                auto_adjust=True,
-                                progress=False,
-                                threads=True,
-                            )
-                        )
-                        if not df.empty:
-                            close = df["Close"] if "Close" in df.columns else df.xs("Close", axis=1, level=0)
-                            for sym in market_syms:
-                                try:
-                                    val = float(close.dropna().iloc[-1]) if len(market_syms) == 1 else float(close[sym].dropna().iloc[-1])
-                                    if val > 0:
-                                        prices[sym] = val
-                                except Exception:
-                                    pass
-                    except Exception as exc:
-                        logger.warning("Auto-refresh batch price fetch failed: %s", exc)
-
-                updated = 0
-                for r in rows:
-                    price = prices.get(r["symbol"])
-                    if price is None:
-                        continue
-                    qty = float(r["quantity"] or 0)
-                    cost_basis = float(r["cost_basis_total"] or 0)
-                    current_value = qty * price
-                    total_gl = current_value - cost_basis
-                    total_gl_pct = (total_gl / cost_basis * 100) if cost_basis else None
-                    await pool.execute(
-                        """
-                        UPDATE imported_positions
-                        SET last_price=$1, current_value=$2, total_gain_loss=$3,
-                            total_gl_pct=$4, snapshot_date=CURRENT_DATE, updated_at=NOW()
-                        WHERE account_id=$5 AND symbol=$6
-                        """,
-                        price, current_value, total_gl, total_gl_pct,
-                        r["account_id"], r["symbol"],
-                    )
-                    updated += 1
-
-                if updated > 0:
-                    today = date.today()
-                    acct_rows = await pool.fetch(
-                        "SELECT DISTINCT account_id FROM imported_positions"
-                    )
-                    combined_nav = Decimal(0)
-                    for ar in acct_rows:
-                        acct_id = ar["account_id"]
-                        t = await pool.fetchrow(
-                            "SELECT SUM(current_value) AS nav FROM imported_positions WHERE account_id=$1",
-                            acct_id,
-                        )
-                        nav = Decimal(str(t["nav"] or 0))
-                        prev = await pool.fetchrow(
-                            """
-                            SELECT total_nav FROM portfolio_snapshots
-                            WHERE account_id=$1 AND snapshot_date < $2
-                            ORDER BY snapshot_date DESC LIMIT 1
-                            """,
-                            acct_id, today,
-                        )
-                        await upsert_snapshot(pool, today, nav, acct_id, nav,
-                                              Decimal(str(prev["total_nav"])) if prev else None)
-                        combined_nav += nav
-                    prev_comb = await pool.fetchrow(
-                        """
-                        SELECT total_nav FROM portfolio_snapshots
-                        WHERE account_id IS NULL AND snapshot_date < $1
-                        ORDER BY snapshot_date DESC LIMIT 1
-                        """,
-                        today,
-                    )
-                    await upsert_snapshot(pool, today, combined_nav, None, combined_nav,
-                                         Decimal(str(prev_comb["total_nav"])) if prev_comb else None)
-                    logger.info("Auto-refresh: updated %d positions, snapshot written", updated)
-        except Exception as exc:
-            logger.warning("Auto-refresh error: %s", exc)
-
-        await asyncio.sleep(INTERVAL)
-
-
 @app.on_event("startup")
 async def startup():
     await db.init_pool()
-    asyncio.create_task(_auto_refresh_loop())
     logger.info("Trade Tracker API started. Docs at /docs")
     if config.IBKR_ENABLED:
         import threading

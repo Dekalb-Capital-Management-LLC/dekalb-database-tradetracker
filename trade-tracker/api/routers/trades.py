@@ -37,10 +37,11 @@ async def reset_all_data(pool=Depends(get_pool)):
     try:
         await pool.execute("DELETE FROM trades")
         await pool.execute("DELETE FROM portfolio_snapshots")
+        await pool.execute("DELETE FROM cash_flows")
         await pool.execute("DELETE FROM imported_positions")
         await pool.execute("DELETE FROM fidelity_imports")
         logger.info("Data reset: all trades and snapshots cleared")
-        return {"message": "All trades and snapshots deleted.", "trades_remaining": trade_count}
+        return {"message": "All trades, snapshots, cash flows, imports, and positions deleted.", "trades_remaining": 0}
     except Exception as exc:
         logger.error("reset error: %s", exc)
         raise HTTPException(status_code=500, detail=f"Reset failed: {exc}")

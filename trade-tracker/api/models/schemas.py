@@ -18,6 +18,8 @@ from pydantic import BaseModel, Field
 TradeSource = Literal["ibkr", "fidelity", "portfolio"]
 TradeSide = Literal["BUY", "SELL"]
 TradeLabel = Literal["event-driven", "hedge", "long-term", "short-term", "unclassified"]
+CashFlowType = Literal["deposit", "withdrawal", "dividend", "interest"]
+CashFlowSource = Literal["ibkr", "fidelity", "portfolio", "manual"]
 
 
 # ---------------------------------------------------------------------------
@@ -125,8 +127,26 @@ class PortfolioMetrics(BaseModel):
     spy_return_pct: Optional[Decimal]         # benchmark return over same period
     alpha: Optional[Decimal]                  # portfolio return - beta * spy return
     max_drawdown_pct: Optional[Decimal]
-    win_rate: Optional[Decimal]               # % of trades that were profitable
+    win_rate: Optional[Decimal]               # approximate % of SELL trades with positive net_amount
     as_of: datetime
+
+
+# ---------------------------------------------------------------------------
+# Cash flow models
+# ---------------------------------------------------------------------------
+
+class CashFlowCreate(BaseModel):
+    account_id: str
+    flow_date: datetime
+    flow_type: CashFlowType
+    amount: Decimal = Field(..., description="Positive inflow; negative outflow")
+    source: CashFlowSource = "manual"
+    notes: Optional[str] = None
+
+
+class CashFlowResponse(CashFlowCreate):
+    id: int
+    created_at: datetime
 
 
 # ---------------------------------------------------------------------------

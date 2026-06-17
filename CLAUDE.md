@@ -30,7 +30,7 @@ FastAPI + asyncpg, Python 3.11.
   - `auth.py` — Google ID token verification against Google's JWKS (cached).
   - `ibkr_client.py` — thin wrapper over the IBKR Client Portal Gateway REST API (`https://localhost:5001` locally, `https://host.docker.internal:5001` in Docker). **Direct connection, no proxy/VPN** — if you see references to "Pangolin" or port 5000 anywhere, that's stale leftover docs from an earlier architecture; fix them when you find them.
   - `market_data.py` — yfinance by default; routes through IBKR if `IBKR_ENABLED=true` and the gateway is reachable/authenticated.
-  - `portfolio_metrics.py` — beta/std dev/Sharpe/alpha/drawdown/win-rate from `portfolio_snapshots`. `RISK_FREE_RATE_ANNUAL` is currently hardcoded to `0.0`.
+  - `portfolio_metrics.py` — cash-flow-adjusted beta/std dev/Sharpe/alpha/drawdown plus approximate win-rate from `portfolio_snapshots` and `cash_flows`. `RISK_FREE_RATE_ANNUAL` comes from config/environment.
   - `fidelity_parser.py` — Fidelity CSV → `trades` rows.
 - `models/schemas.py` — Pydantic request/response models.
 
@@ -41,7 +41,7 @@ Gated by `AUTH_ENABLED` (default `false`). When `true`: Google Workspace SSO via
 ### Database
 
 - Two separate Postgres databases in the same instance: `trading` (quant, schema = `schemas/postgresql_schema.sql`) and `trade_tracker` (equities, schema = `schemas/trade_tracker_schema.sql`). The trade-tracker API only ever touches `trade_tracker`.
-- `trade_tracker` tables: `trades`, `portfolio_snapshots`, `fidelity_imports`, `cash_flows`. Note the partial unique indexes on `portfolio_snapshots` to handle `account_id IS NULL` (combined portfolio) vs per-account snapshots.
+- `trade_tracker` tables: `trades`, `portfolio_snapshots`, `fidelity_imports`, `cash_flows`, `ibkr_tokens`, `instrument_conids`, `imported_positions`. Note the partial unique indexes on `portfolio_snapshots` to handle `account_id IS NULL` (combined portfolio) vs per-account snapshots.
 
 ## Frontend (`trade-tracker/frontend/`)
 

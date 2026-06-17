@@ -5,8 +5,8 @@ Provides:
 - NAV-based return series from portfolio_snapshots
 - Beta (portfolio vs SPY) for rolling 12-month and YTD periods
 - Annualized standard deviation
-- Sharpe ratio (risk-free rate = 0 for simplicity; can be updated)
-- Alpha, max drawdown, win rate
+- Sharpe ratio with configurable annual risk-free rate
+- Alpha, max drawdown, approximate win rate
 """
 from __future__ import annotations
 
@@ -18,11 +18,10 @@ from typing import Optional
 
 import asyncpg
 
+import config
 from models.schemas import PerformancePoint, PortfolioMetrics
 
 logger = logging.getLogger(__name__)
-
-RISK_FREE_RATE_ANNUAL = 0.0   # update to e.g. 0.05 for 5% T-bill rate
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +114,141 @@ async def _fetch_snapshots(
     return rows
 
 
+async def _fetch_cash_flows(
+    pool: asyncpg.Pool,
+    start: date,
+    end: date,
+    account_id: Optional[str] = None,
+) -> dict[date, Decimal]:
+    """Return net cash flow by date for the requested account scope."""
+    if account_id:
+        rows = await pool.fetch(
+            """
+            SELECT flow_date::date AS flow_day, COALESCE(SUM(amount), 0) AS amount
+            FROM cash_flows
+            WHERE account_id = $1
+              AND flow_type IN ('deposit', 'withdrawal')
+              AND flow_date::date BETWEEN $2 AND $3
+            GROUP BY flow_day
+            """,
+            account_id, start, end,
+        )
+    else:
+        rows = await pool.fetch(
+            """
+            SELECT flow_date::date AS flow_day, COALESCE(SUM(amount), 0) AS amount
+            FROM cash_flows
+            WHERE flow_type IN ('deposit', 'withdrawal')
+              AND flow_date::date BETWEEN $1 AND $2
+            GROUP BY flow_day
+            """,
+            start, end,
+        )
+    return {r["flow_day"]: Decimal(str(r["amount"])) for r in rows}
+
+
+async def _sum_cash_flows_between(
+    pool: asyncpg.Pool,
+    start_exclusive: date,
+    end_inclusive: date,
+    account_id: Optional[str],
+) -> Decimal:
+    """Sum cash flows in (start_exclusive, end_inclusive] for snapshot P&L."""
+    if account_id:
+        value = await pool.fetchval(
+            """
+            SELECT COALESCE(SUM(amount), 0)
+            FROM cash_flows
+            WHERE account_id = $1
+              AND flow_type IN ('deposit', 'withdrawal')
+              AND flow_date::date > $2
+              AND flow_date::date <= $3
+            """,
+            account_id, start_exclusive, end_inclusive,
+        )
+    else:
+        value = await pool.fetchval(
+            """
+            SELECT COALESCE(SUM(amount), 0)
+            FROM cash_flows
+            WHERE flow_type IN ('deposit', 'withdrawal')
+              AND flow_date::date > $1
+              AND flow_date::date <= $2
+            """,
+            start_exclusive, end_inclusive,
+        )
+    return Decimal(str(value or 0))
+
+
+def _interval_cash_flow(
+    cash_flows_by_date: dict[date, Decimal],
+    start_exclusive: date,
+    end_inclusive: date,
+) -> Decimal:
+    return sum(
+        (
+            amount
+            for flow_day, amount in cash_flows_by_date.items()
+            if start_exclusive < flow_day <= end_inclusive
+        ),
+        Decimal("0"),
+    )
+
+
+def _modified_dietz_return(
+    begin_nav: Decimal,
+    end_nav: Decimal,
+    net_flow: Decimal,
+) -> Optional[Decimal]:
+    """
+    Approximate interval return excluding external cash flows.
+
+    Snapshot data is daily, so flows within the interval are assumed to occur
+    mid-period (0.5 weight). This prevents deposits/withdrawals from being
+    counted as investment gain/loss while keeping the model simple.
+    """
+    denominator = begin_nav + (net_flow * Decimal("0.5"))
+    if denominator == 0:
+        return None
+    return (end_nav - begin_nav - net_flow) / denominator
+
+
+def _adjusted_return_points(
+    rows: list[asyncpg.Record],
+    cash_flows_by_date: dict[date, Decimal],
+) -> list[dict[str, Optional[Decimal]]]:
+    points: list[dict[str, Optional[Decimal]]] = []
+    wealth_index = Decimal("1")
+
+    for i, row in enumerate(rows):
+        if i == 0:
+            points.append({
+                "daily_return": None,
+                "cumulative_pct": Decimal("0"),
+                "wealth_index": wealth_index,
+            })
+            continue
+
+        prev = rows[i - 1]
+        prev_date = prev["snapshot_date"]
+        current_date = row["snapshot_date"]
+        begin_nav = Decimal(str(prev["total_nav"]))
+        end_nav = Decimal(str(row["total_nav"]))
+        net_flow = _interval_cash_flow(cash_flows_by_date, prev_date, current_date)
+        daily_return = _modified_dietz_return(begin_nav, end_nav, net_flow)
+
+        if daily_return is not None:
+            wealth_index *= (Decimal("1") + daily_return)
+
+        points.append({
+            "daily_return": daily_return,
+            "cumulative_pct": (wealth_index - Decimal("1")) * Decimal("100"),
+            "wealth_index": wealth_index,
+        })
+
+    return points
+
+
 # ---------------------------------------------------------------------------
 # Snapshot upsert (called by nightly job or on-demand)
 # ---------------------------------------------------------------------------
@@ -156,8 +290,35 @@ async def upsert_snapshot(
     daily_pnl: Optional[Decimal] = None
     daily_pnl_pct: Optional[Decimal] = None
     if prev_nav and prev_nav > 0:
-        daily_pnl = total_nav - prev_nav
-        daily_pnl_pct = (daily_pnl / prev_nav * 100).quantize(Decimal("0.000001"))
+        if account_id is None:
+            prev_snapshot_date = await pool.fetchval(
+                """
+                SELECT MAX(snapshot_date)
+                FROM portfolio_snapshots
+                WHERE account_id IS NULL AND snapshot_date < $1
+                """,
+                snapshot_date,
+            )
+        else:
+            prev_snapshot_date = await pool.fetchval(
+                """
+                SELECT MAX(snapshot_date)
+                FROM portfolio_snapshots
+                WHERE account_id = $1 AND snapshot_date < $2
+                """,
+                account_id, snapshot_date,
+            )
+
+        net_flow = Decimal("0")
+        if prev_snapshot_date:
+            net_flow = await _sum_cash_flows_between(
+                pool, prev_snapshot_date, snapshot_date, account_id
+            )
+
+        daily_return = _modified_dietz_return(prev_nav, total_nav, net_flow)
+        daily_pnl = (total_nav - prev_nav - net_flow).quantize(Decimal("0.01"))
+        if daily_return is not None:
+            daily_pnl_pct = (daily_return * Decimal("100")).quantize(Decimal("0.000001"))
 
     if account_id is None:
         conflict_clause = "ON CONFLICT (snapshot_date) WHERE account_id IS NULL"
@@ -200,14 +361,17 @@ async def get_performance_series(
     if not rows:
         return []
 
-    # Build cumulative returns from first day
-    base_nav = float(rows[0]["total_nav"])
+    cash_flows_by_date = await _fetch_cash_flows(pool, start, end, account_id)
+    adjusted_points = _adjusted_return_points(rows, cash_flows_by_date)
+
     points: list[PerformancePoint] = []
     spy_base: Optional[float] = None
 
     for i, row in enumerate(rows):
         nav = float(row["total_nav"])
-        port_cum = ((nav - base_nav) / base_nav * 100) if base_nav else None
+        daily_return = adjusted_points[i]["daily_return"]
+        port_daily_pct = daily_return * Decimal("100") if daily_return is not None else None
+        port_cum = adjusted_points[i]["cumulative_pct"]
 
         spy_daily = float(row["spy_daily_pct"]) if row["spy_daily_pct"] else None
 
@@ -225,12 +389,12 @@ async def get_performance_series(
                 date=row["snapshot_date"],
                 portfolio_nav=Decimal(str(round(nav, 2))),
                 portfolio_pct_change=(
-                    Decimal(str(round(float(row["daily_pnl_pct"]), 6)))
-                    if row["daily_pnl_pct"] else None
+                    Decimal(str(round(float(port_daily_pct), 6)))
+                    if port_daily_pct is not None else None
                 ),
                 spy_pct_change=Decimal(str(round(spy_daily, 6))) if spy_daily is not None else None,
                 spy_cumulative_pct=Decimal(str(round(spy_cum, 4))) if spy_cum is not None else None,
-                portfolio_cumulative_pct=Decimal(str(round(port_cum, 4))) if port_cum is not None else None,
+                portfolio_cumulative_pct=Decimal(str(round(float(port_cum), 4))) if port_cum is not None else None,
             )
         )
     return points
@@ -279,19 +443,22 @@ async def calculate_metrics(
             as_of=datetime.utcnow(),
         )
 
+    cash_flows_by_date = await _fetch_cash_flows(pool, start, end, account_id)
+    adjusted_points = _adjusted_return_points(rows, cash_flows_by_date)
+
     port_daily_returns = [
-        float(r["daily_pnl_pct"]) / 100 for r in rows if r["daily_pnl_pct"] is not None
-    ]
-    spy_daily_returns = [
-        float(r["spy_daily_pct"]) / 100 for r in rows if r["spy_daily_pct"] is not None
+        float(p["daily_return"])
+        for p in adjusted_points
+        if p["daily_return"] is not None
     ]
 
-    nav_series = [float(r["total_nav"]) for r in rows]
-
-    # Align lengths (in case some days missing spy data)
-    min_len = min(len(port_daily_returns), len(spy_daily_returns))
-    port_r = port_daily_returns[:min_len]
-    spy_r = spy_daily_returns[:min_len]
+    paired_returns = [
+        (float(p["daily_return"]), float(row["spy_daily_pct"]) / 100)
+        for p, row in zip(adjusted_points, rows)
+        if p["daily_return"] is not None and row["spy_daily_pct"] is not None
+    ]
+    port_r = [p for p, _ in paired_returns]
+    spy_r = [s for _, s in paired_returns]
 
     # Beta
     beta_val = _beta(port_r, spy_r)
@@ -300,10 +467,12 @@ async def calculate_metrics(
     std_dev_daily = _std_dev(port_daily_returns)
     std_dev_annual = std_dev_daily * math.sqrt(252) * 100 if std_dev_daily else None
 
-    # Total return
-    first_nav = float(rows[0]["total_nav"])
-    last_nav = float(rows[-1]["total_nav"])
-    total_return = (last_nav - first_nav) / first_nav * 100 if first_nav > 0 else None
+    # Total return is linked from cash-flow-adjusted daily returns.
+    total_return = (
+        float(adjusted_points[-1]["cumulative_pct"])
+        if adjusted_points and adjusted_points[-1]["cumulative_pct"] is not None
+        else None
+    )
 
     # SPY total return
     first_spy = float(rows[0]["spy_close"]) if rows[0]["spy_close"] else None
@@ -315,16 +484,21 @@ async def calculate_metrics(
     if total_return is not None and beta_val is not None and spy_return is not None:
         alpha = total_return - beta_val * spy_return
 
-    # Sharpe (annualized, risk-free = 0)
+    # Sharpe (annualized, configurable risk-free rate)
     sharpe = None
     if std_dev_annual and std_dev_annual != 0 and total_return is not None:
         trading_days = len(port_daily_returns)
         annual_factor = 252 / trading_days if trading_days else 1
         annualized_return = total_return * annual_factor
-        sharpe = (annualized_return - RISK_FREE_RATE_ANNUAL * 100) / std_dev_annual
+        sharpe = (annualized_return - config.RISK_FREE_RATE_ANNUAL * 100) / std_dev_annual
 
-    # Max drawdown
-    max_dd = _max_drawdown(nav_series)
+    # Max drawdown on the adjusted wealth index, not raw NAV.
+    wealth_series = [
+        float(p["wealth_index"])
+        for p in adjusted_points
+        if p["wealth_index"] is not None
+    ]
+    max_dd = _max_drawdown(wealth_series)
 
     # Win rate: % of profitable trades in the period
     win_rate_val = await _calculate_win_rate(pool, start, end, account_id)

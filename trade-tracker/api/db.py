@@ -123,6 +123,9 @@ async def _apply_migrations(conn: asyncpg.Connection) -> None:
             UNIQUE (account_id, symbol)
         )
     """)
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_imported_positions_account ON imported_positions(account_id)"
+    )
 
     # Widen daily_pnl_pct and spy_daily_pct from DECIMAL(10,6) to NUMERIC so
     # large % swings (first snapshot vs tiny prev_nav) don't overflow the column.
