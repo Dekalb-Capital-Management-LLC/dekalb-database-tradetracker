@@ -21,7 +21,7 @@ POST   /import/fidelity         ← upload Fidelity CSV (positions snapshot or a
 POST   /portfolio/snapshots/generate  ← generate first NAV snapshot
 ```
 
-**The dashboard auto-refreshes every 60 seconds. Trades auto-sync every hour.**
+**The backend cron syncs trades and writes NAV snapshots every hour. The dashboard refreshes summary data every 5 minutes.**
 
 ---
 
@@ -178,9 +178,11 @@ Applied automatically from `schemas/trade_tracker_schema.sql` on first boot. Aut
 |---|---|
 | `trades` | Unified trade ledger — IBKR + Fidelity in one table |
 | `portfolio_snapshots` | Daily NAV history for performance chart |
-| `fidelity_imports` | Audit log of all CSV uploads (Fidelity and IBKR history) |
+| `fidelity_imports` | Audit log of portfolio, Fidelity, and IBKR uploads |
 | `cash_flows` | Deposits/withdrawals (excluded from performance calculations) |
 | `ibkr_tokens` | OAuth 2.0 tokens for IBKR Web API — auto-managed |
+| `instrument_conids` | Symbol-to-IBKR contract ID cache for market data |
+| `imported_positions` | Latest broker/imported position snapshot for dashboard P&L |
 
 ---
 
@@ -201,6 +203,7 @@ The backend deploys to **Railway**, the frontend to **Vercel**. They're separate
    | `GOOGLE_CLIENT_ID` | from Google Cloud Console (see [Authentication](#authentication)) |
    | `ALLOWED_EMAIL_DOMAIN` | `dekalbcapitalmanagement.com` |
    | `FRONTEND_URL` | the Vercel URL from step 2 below (set this *after* step 2) |
+   | `RISK_FREE_RATE_ANNUAL` | `0.0` by default; set `0.05` for 5% |
    | `IBKR_ENABLED` | `false` (gateway can't run on Railway — see IBKR section) |
 
 5. Deploy. Railway gives you a public URL like `https://<service>.up.railway.app`.
@@ -366,6 +369,7 @@ IBKR_CLIENT_SECRET    = (from IBKR — see setup below)
 IBKR_ACCOUNT_ID       = U1234567
 IBKR_REDIRECT_URI     = https://YOUR-APP.railway.app/ibkr/auth/callback
 FRONTEND_URL          = https://YOUR-APP.vercel.app
+RISK_FREE_RATE_ANNUAL = 0.0
 ```
 
 Note the Railway API URL — you'll need it in the next step.
@@ -469,7 +473,10 @@ Full interactive docs at `/docs` (Swagger UI).
 | `GET /portfolio/summary` | Combined + per-account P&L snapshot |
 | `GET /portfolio/positions` | Open positions with live pricing |
 | `GET /portfolio/performance?period=ytd` | NAV time series + SPY overlay |
-| `GET /portfolio/metrics?period=ytd` | Beta, std dev, Sharpe, alpha, drawdown, win rate |
+| `GET /portfolio/metrics?period=ytd` | Cash-flow-adjusted beta, std dev, Sharpe, alpha, drawdown, approximate win rate |
+| `GET /portfolio/cash-flows` | List recorded cash flows |
+| `POST /portfolio/cash-flows` | Record a deposit/withdrawal cash flow for performance adjustment |
+| `DELETE /portfolio/cash-flows/{id}` | Delete a recorded cash flow |
 | `POST /portfolio/snapshots/generate` | Generate today's NAV snapshot (also runs automatically every hour) |
 | **Trades** | |
 | `GET /trades` | Full trade log — filter by symbol, side, label, date |

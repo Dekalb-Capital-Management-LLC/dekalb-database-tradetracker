@@ -21,6 +21,8 @@ import config
 import db
 from models.schemas import (
     AccountSummary,
+    CashFlowCreate,
+    CashFlowResponse,
     PerformancePoint,
     PortfolioMetrics,
     PortfolioSnapshotResponse,
@@ -410,6 +412,95 @@ async def get_positions(
     except Exception as exc:
         logger.error("positions error: %s", exc)
         raise HTTPException(status_code=500, detail="Error computing positions")
+
+
+def _normalise_cash_flow_amount(flow: CashFlowCreate) -> Decimal:
+    amount = Decimal(str(flow.amount))
+    if flow.flow_type == "withdrawal":
+        return -abs(amount)
+    if flow.flow_type == "deposit":
+        return abs(amount)
+    return amount
+
+
+@router.get("/cash-flows", response_model=list[CashFlowResponse])
+async def list_cash_flows(
+    account_id: Optional[str] = Query(None),
+    start_date: Optional[date] = Query(None),
+    end_date: Optional[date] = Query(None),
+    limit: int = Query(250, ge=1, le=1000),
+    pool=Depends(get_pool),
+):
+    """List recorded cash flows, newest first."""
+    conditions = []
+    params: list = []
+    idx = 1
+
+    if account_id:
+        conditions.append(f"account_id = ${idx}")
+        params.append(account_id)
+        idx += 1
+    if start_date:
+        conditions.append(f"flow_date::date >= ${idx}")
+        params.append(start_date)
+        idx += 1
+    if end_date:
+        conditions.append(f"flow_date::date <= ${idx}")
+        params.append(end_date)
+        idx += 1
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(limit)
+
+    rows = await pool.fetch(
+        f"""
+        SELECT id, account_id, flow_date, flow_type, amount, source, notes, created_at
+        FROM cash_flows
+        {where}
+        ORDER BY flow_date DESC, id DESC
+        LIMIT ${idx}
+        """,
+        *params,
+    )
+    return [dict(r) for r in rows]
+
+
+@router.post("/cash-flows", response_model=CashFlowResponse)
+async def create_cash_flow(
+    flow: CashFlowCreate,
+    pool=Depends(get_pool),
+):
+    """
+    Record an external cash flow.
+
+    Deposits are stored positive and withdrawals negative. Performance and
+    metrics exclude deposit/withdrawal flows from investment returns.
+    """
+    amount = _normalise_cash_flow_amount(flow)
+    row = await pool.fetchrow(
+        """
+        INSERT INTO cash_flows
+            (account_id, flow_date, flow_type, amount, source, notes)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, account_id, flow_date, flow_type, amount, source, notes, created_at
+        """,
+        flow.account_id,
+        flow.flow_date,
+        flow.flow_type,
+        amount,
+        flow.source,
+        flow.notes,
+    )
+    return dict(row)
+
+
+@router.delete("/cash-flows/{cash_flow_id}")
+async def delete_cash_flow(cash_flow_id: int, pool=Depends(get_pool)):
+    result = await pool.execute("DELETE FROM cash_flows WHERE id = $1", cash_flow_id)
+    deleted = int(result.split()[-1])
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail=f"Cash flow {cash_flow_id} not found")
+    return {"deleted": cash_flow_id}
 
 
 @router.post("/update-all")

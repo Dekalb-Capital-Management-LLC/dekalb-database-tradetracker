@@ -91,27 +91,30 @@ use as the team grows.
 #### [Platform] Design and implement cash flow tracking (deposits/withdrawals)
 - **Labels:** Bug
 - **Priority:** High
-- **What:** `cash_flows` exists in `trade_tracker_schema.sql` (comment says
-  "excluded from NAV performance calc") but nothing writes or reads it, so
-  deposits/withdrawals currently show up as portfolio gains/losses in
+- **Status:** Resolved 2026-06-17. `POST /portfolio/cash-flows` records
+  deposits/withdrawals and performance/metrics use cash-flow-adjusted returns.
+- **Original finding:** `cash_flows` existed in `trade_tracker_schema.sql` (comment says
+  "excluded from NAV performance calc") but nothing wrote or read it, so
+  deposits/withdrawals showed up as portfolio gains/losses in
   `/portfolio/performance` and `/portfolio/metrics` (beta, Sharpe, alpha,
-  drawdown all wrong around those dates). Add a way to record cash flows and
-  adjust the return calc (Modified Dietz or similar) to exclude them.
+  drawdown all wrong around those dates).
 
 #### [Platform] Make risk-free rate configurable
 - **Labels:** Improvement
 - **Priority:** Medium
-- **What:** `RISK_FREE_RATE_ANNUAL` is hardcoded to `0.0` in
-  `portfolio_metrics.py`. Move it to `config.py` as an env var with a
-  documented default; Sharpe should change when the env var changes.
+- **Status:** Resolved 2026-06-17. `RISK_FREE_RATE_ANNUAL` is read from
+  `config.py`/environment and documented in `.env.example`.
+- **Original finding:** `RISK_FREE_RATE_ANNUAL` was hardcoded to `0.0` in
+  `portfolio_metrics.py`; Sharpe needed to change when the env var changes.
 
 #### [Platform] Document or improve win-rate calculation
 - **Labels:** Chore
 - **Priority:** Low
-- **What:** Win rate is "% of SELL trades with positive `net_amount`", not
-  FIFO-matched realized P&L. Either label it as approximate in the UI, or
-  implement FIFO lot matching (bigger effort — split into its own issue if
-  pursued).
+- **Status:** Resolved 2026-06-17 by labeling the dashboard metric as
+  approximate; FIFO matching remains a separate larger enhancement.
+- **Original finding:** Win rate is "% of SELL trades with positive `net_amount`", not
+  FIFO-matched realized P&L. The shipped fix labels it approximate in the UI;
+  FIFO lot matching remains a separate larger issue if pursued.
 
 ### Milestone 3: Test coverage & CI
 

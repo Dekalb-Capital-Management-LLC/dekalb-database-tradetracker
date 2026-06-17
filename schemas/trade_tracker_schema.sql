@@ -10,7 +10,7 @@
 -- Fidelity trades come in via CSV upload.
 CREATE TABLE trades (
     id                  BIGSERIAL PRIMARY KEY,
-    source              VARCHAR(20)     NOT NULL,           -- 'ibkr' | 'fidelity'
+    source              VARCHAR(20)     NOT NULL,           -- 'ibkr' | 'fidelity' | 'portfolio'
     account_id          VARCHAR(50)     NOT NULL,
     trade_date          TIMESTAMPTZ     NOT NULL,
     symbol              VARCHAR(20)     NOT NULL,
@@ -49,9 +49,9 @@ CREATE TABLE portfolio_snapshots (
     cash_balance    DECIMAL(18, 2),
     equity_value    DECIMAL(18, 2),                     -- market value of all open positions
     daily_pnl       DECIMAL(18, 2),                     -- absolute P&L vs prior day
-    daily_pnl_pct   DECIMAL(10, 6),                     -- pct vs prior day NAV
+    daily_pnl_pct   NUMERIC,                            -- pct vs prior day NAV, adjusted for cash flows
     spy_close       DECIMAL(18, 4),                     -- SPY closing price (for overlay calc)
-    spy_daily_pct   DECIMAL(10, 6),                     -- SPY daily % change (for overlay)
+    spy_daily_pct   NUMERIC,                            -- SPY daily % change (for overlay)
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
     -- NOTE: no inline UNIQUE here — PostgreSQL treats NULL != NULL in standard
     -- UNIQUE constraints, so ON CONFLICT (snapshot_date, account_id) silently
@@ -102,6 +102,60 @@ CREATE TABLE cash_flows (
 );
 
 CREATE INDEX idx_cashflows_account_date ON cash_flows(account_id, flow_date DESC);
+
+
+-- ibkr_tokens: OAuth 2.0 tokens for IBKR Web API
+-- Runtime migrations keep existing DBs current; this schema is the source of
+-- truth for new empty trade_tracker databases.
+CREATE TABLE ibkr_tokens (
+    id            INTEGER      PRIMARY KEY DEFAULT 1,
+    access_token  TEXT         NOT NULL,
+    refresh_token TEXT,
+    token_type    VARCHAR(50)  NOT NULL DEFAULT 'Bearer',
+    expires_at    TIMESTAMPTZ,
+    account_id    VARCHAR(50),
+    scope         TEXT,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+
+-- instrument_conids: persistent symbol -> IBKR contract ID cache
+CREATE TABLE instrument_conids (
+    symbol       VARCHAR(20) PRIMARY KEY,
+    conid        BIGINT      NOT NULL,
+    description  TEXT,
+    asset_class  VARCHAR(16),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_instrument_conids_conid ON instrument_conids(conid);
+
+
+-- imported_positions: latest imported/live position snapshot.
+-- This stores broker/export values directly so the dashboard can show accurate
+-- P&L without reconstructing every position from trades and live quotes.
+CREATE TABLE imported_positions (
+    id               SERIAL PRIMARY KEY,
+    import_id        INT,
+    account_id       VARCHAR(50) NOT NULL,
+    symbol           VARCHAR(20) NOT NULL,
+    quantity         DECIMAL,
+    last_price       DECIMAL,
+    current_value    DECIMAL,
+    today_gain_loss  DECIMAL,
+    today_gl_pct     DECIMAL,
+    total_gain_loss  DECIMAL,
+    total_gl_pct     DECIMAL,
+    cost_basis_total DECIMAL,
+    avg_cost         DECIMAL,
+    source           VARCHAR(20) NOT NULL DEFAULT 'fidelity',
+    snapshot_date    DATE        NOT NULL DEFAULT CURRENT_DATE,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (account_id, symbol)
+);
+
+CREATE INDEX idx_imported_positions_account ON imported_positions(account_id);
 
 
 -- trigger to keep trades.updated_at current

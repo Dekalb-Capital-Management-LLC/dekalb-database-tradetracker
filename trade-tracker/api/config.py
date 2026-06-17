@@ -89,6 +89,10 @@ PRICE_CACHE_TTL_SECONDS = int(os.getenv("PRICE_CACHE_TTL_SECONDS", "300"))
 # SPY symbol for benchmark overlay
 BENCHMARK_SYMBOL = os.getenv("BENCHMARK_SYMBOL", "SPY")
 
+# Annual risk-free rate as a decimal, used in Sharpe ratio.
+# Example: 0.05 = 5%.
+RISK_FREE_RATE_ANNUAL = float(os.getenv("RISK_FREE_RATE_ANNUAL", "0.0"))
+
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("API_PORT", "8000"))
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"

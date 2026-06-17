@@ -6,7 +6,9 @@ services:
   #                     tables: orders, positions, accounts, strategies, ib_api_calls
   #
   #   "trade_tracker" → equities team (trade-tracker API)
-  #                     tables: trades, portfolio_snapshots, fidelity_imports, cash_flows
+  #                     tables: trades, portfolio_snapshots, fidelity_imports,
+  #                             cash_flows, ibkr_tokens, instrument_conids,
+  #                             imported_positions
   #
   # Init order (alphabetical in docker-entrypoint-initdb.d):
   #   01_trading.sql  → quant schema applied to "trading" DB automatically
@@ -156,6 +158,7 @@ services:
       - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
       # Tune as needed
       - PRICE_CACHE_TTL_SECONDS=60
+      - RISK_FREE_RATE_ANNUAL=${RISK_FREE_RATE_ANNUAL:-0.0}
       - DEBUG=false
     volumes:
       - ./schemas/trade_tracker_schema.sql:/etc/schemas/trade_tracker_schema.sql:ro
