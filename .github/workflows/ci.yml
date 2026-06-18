@@ -1,0 +1,63 @@
+name: CI
+
+# Lint + build checks that run on every pull request (and on pushes to main,
+# so the default branch always has a known-good status).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same branch/PR to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # --- Equities frontend: TypeScript typecheck + Vite production build ---
+  frontend:
+    name: Frontend (typecheck + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: trade-tracker/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: trade-tracker/frontend/package-lock.json
+      - run: npm ci
+      # `npm run build` is `tsc && vite build` — the tsc step is our TS lint/typecheck.
+      - run: npm run build
+
+  # --- Python lint (ruff) for the API + ingestion service ---
+  # Non-blocking for now: the existing code has known lint debt (unused imports,
+  # intentional auth placeholders in main.py, etc. — see docs/REPO_AUDIT.md).
+  # This surfaces violations in the logs without blocking PRs. Flip
+  # continue-on-error to false once the backlog is cleaned up.
+  python-lint:
+    name: Python lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff
+      - run: ruff check trade-tracker/api ingestion-service
+        continue-on-error: true
+
+  # --- Python build: install deps and compile-check both services ---
+  python-build:
+    name: Python build (deps + compile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      # Byte-compile to catch syntax errors against the installed dependencies.
+      - run: python -m compileall trade-tracker/api ingestion-service
