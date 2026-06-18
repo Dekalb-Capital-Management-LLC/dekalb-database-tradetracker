@@ -22,10 +22,10 @@ function fmtDate(d: string) {
 export default function PerformanceChart({ data }: Props) {
   if (!data.length) {
     return (
-      <div className="flex flex-col items-center justify-center h-64 text-gray-500 text-sm gap-2">
-        <p>No performance data yet.</p>
-        <p className="text-xs text-gray-600">
-          Call <code className="text-gray-500">POST /portfolio/snapshots/generate</code> to generate your first snapshot.
+      <div className="flex flex-col items-center justify-center h-64 gap-2" style={{ color: '#9ca3af' }}>
+        <p className="text-sm">No performance data yet.</p>
+        <p className="text-xs" style={{ color: '#c0ccd8' }}>
+          Call <code>POST /portfolio/snapshots/generate</code> to generate a snapshot.
         </p>
       </div>
     )
@@ -38,45 +38,46 @@ export default function PerformanceChart({ data }: Props) {
   }))
 
   return (
-    <ResponsiveContainer width="100%" height={300}>
+    <ResponsiveContainer width="100%" height={260}>
       <LineChart data={chartData} margin={{ top: 5, right: 20, left: 5, bottom: 5 }}>
-        <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" vertical={false} />
+        <CartesianGrid strokeDasharray="3 3" stroke="#e8edf5" vertical={false} />
         <XAxis
           dataKey="date"
           tickFormatter={fmtDate}
-          tick={{ fill: '#6b7280', fontSize: 11 }}
+          tick={{ fill: '#9ca3af', fontSize: 11 }}
           tickLine={false}
-          axisLine={{ stroke: '#1f2937' }}
+          axisLine={{ stroke: '#e8edf5' }}
           interval="preserveStartEnd"
           minTickGap={60}
         />
         <YAxis
           tickFormatter={(v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`}
-          tick={{ fill: '#6b7280', fontSize: 11 }}
+          tick={{ fill: '#9ca3af', fontSize: 11 }}
           tickLine={false}
           axisLine={false}
           width={58}
         />
-        <ReferenceLine y={0} stroke="#374151" strokeDasharray="4 2" />
+        <ReferenceLine y={0} stroke="#d0dce8" strokeDasharray="4 2" />
         <Tooltip
           contentStyle={{
-            backgroundColor: '#111827',
-            border: '1px solid #374151',
-            borderRadius: 6,
+            backgroundColor: '#ffffff',
+            border: '1px solid #d0dce8',
+            borderRadius: 8,
             fontSize: 12,
+            boxShadow: '0 4px 12px rgba(0,0,0,0.08)',
           }}
-          labelStyle={{ color: '#9ca3af', marginBottom: 4 }}
+          labelStyle={{ color: '#6b7a99', marginBottom: 4 }}
           formatter={(value: number, name: string) => [
             `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`,
             name,
           ]}
           labelFormatter={fmtDate}
         />
-        <Legend wrapperStyle={{ fontSize: 12, color: '#9ca3af', paddingTop: 12 }} />
+        <Legend wrapperStyle={{ fontSize: 12, color: '#6b7a99', paddingTop: 12 }} />
         <Line
           type="monotone"
           dataKey="Portfolio"
-          stroke="#60a5fa"
+          stroke="#2563eb"
           dot={false}
           strokeWidth={2}
           connectNulls

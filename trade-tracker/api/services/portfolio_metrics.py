@@ -19,7 +19,6 @@ from typing import Optional
 import asyncpg
 
 from models.schemas import PerformancePoint, PortfolioMetrics
-from services.market_data import get_spy_history
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +69,7 @@ def _max_drawdown(nav_series: list[float]) -> float:
         if nav > peak:
             peak = nav
         if peak == 0:
-            continue  # skip — nav=0 means no real data (yfinance failed that day)
+            continue  # skip — nav=0 means no price data available that day
         dd = (nav - peak) / peak
         if dd < max_dd:
             max_dd = dd
@@ -125,19 +124,34 @@ async def upsert_snapshot(
     snapshot_date: date,
     total_nav: Decimal,
     account_id: Optional[str],
-    cash_balance: Optional[Decimal] = None,
     equity_value: Optional[Decimal] = None,
     prev_nav: Optional[Decimal] = None,
+    cash_balance: Optional[Decimal] = None,
+    spy_close: Optional[Decimal] = None,
+    spy_prev_close: Optional[Decimal] = None,
 ) -> None:
-    """
-    Upsert a portfolio NAV snapshot.
-    Also fetches SPY close for the date and stores it for overlay calculations.
-    """
-    from services.market_data import get_historical_bars
+    """Upsert a portfolio NAV snapshot with SPY close from yfinance."""
+    import yfinance as yf
 
-    # Get SPY data for this date
-    spy_bars = get_historical_bars("SPY", snapshot_date, snapshot_date)
-    spy_close = Decimal(str(spy_bars[0].close)) if spy_bars else None
+    spy_daily_pct: Optional[Decimal] = None
+
+    if spy_close is None:
+        # Fetch the last ~10 days of SPY so we always get the most recent close,
+        # even if today's market hasn't opened yet.
+        try:
+            spy_hist = yf.download("SPY", period="10d", auto_adjust=True, progress=False)
+            if not spy_hist.empty:
+                closes = spy_hist["Close"].dropna()
+                if len(closes) >= 1:
+                    spy_close = Decimal(str(round(float(closes.iloc[-1]), 4)))
+                if len(closes) >= 2:
+                    prev_spy = Decimal(str(round(float(closes.iloc[-2]), 4)))
+                    if prev_spy > 0:
+                        spy_daily_pct = ((spy_close - prev_spy) / prev_spy * 100).quantize(Decimal("0.000001"))
+        except Exception as exc:
+            logger.warning("SPY fetch failed for %s: %s", snapshot_date, exc)
+    elif spy_prev_close is not None and spy_prev_close > 0:
+        spy_daily_pct = ((spy_close - spy_prev_close) / spy_prev_close * 100).quantize(Decimal("0.000001"))
 
     daily_pnl: Optional[Decimal] = None
     daily_pnl_pct: Optional[Decimal] = None
@@ -145,25 +159,6 @@ async def upsert_snapshot(
         daily_pnl = total_nav - prev_nav
         daily_pnl_pct = (daily_pnl / prev_nav * 100).quantize(Decimal("0.000001"))
 
-    # Fetch previous SPY close to calculate daily pct
-    spy_daily_pct: Optional[Decimal] = None
-    if spy_close:
-        prev_spy_bars = get_historical_bars(
-            "SPY",
-            snapshot_date - timedelta(days=5),  # look back enough to find last trading day
-            snapshot_date - timedelta(days=1),
-        )
-        if prev_spy_bars:
-            prev_spy_close = prev_spy_bars[-1].close
-            if prev_spy_close > 0:
-                spy_daily_pct = (
-                    (spy_close - prev_spy_close) / prev_spy_close * 100
-                ).quantize(Decimal("0.000001"))
-
-    # ON CONFLICT must reference different partial indexes depending on whether
-    # account_id is NULL (combined portfolio) or NOT NULL (per-account).
-    # A plain UNIQUE(date, account_id) silently fails for NULLs in PostgreSQL
-    # because NULL != NULL in standard equality — so we use partial indexes.
     if account_id is None:
         conflict_clause = "ON CONFLICT (snapshot_date) WHERE account_id IS NULL"
     else:
@@ -188,7 +183,7 @@ async def upsert_snapshot(
         snapshot_date, account_id, total_nav, cash_balance, equity_value,
         daily_pnl, daily_pnl_pct, spy_close, spy_daily_pct,
     )
-    logger.info("Upserted snapshot %s account=%s nav=%s", snapshot_date, account_id, total_nav)
+    logger.info("Upserted snapshot %s account=%s nav=%s spy=%s", snapshot_date, account_id, total_nav, spy_close)
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +348,177 @@ async def calculate_metrics(
     )
 
 
+async def backfill_snapshots(
+    pool: asyncpg.Pool,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+) -> dict:
+    """
+    Generate daily historical portfolio NAV snapshots from trade history + IBKR prices.
+    This is what powers the performance graph.
+
+    Algorithm:
+      1. Walk through each trading day from first trade to today
+      2. Maintain running positions per account as trades are applied
+      3. For each day, fetch historical close prices from IBKR
+      4. NAV = SUM(qty × close_price) for all open positions
+      5. Upsert snapshot rows (safe to re-run — ON CONFLICT DO UPDATE)
+    """
+
+    # Date range
+    first_trade_date = await pool.fetchval(
+        "SELECT MIN(trade_date::date) FROM trades"
+    )
+    if not first_trade_date:
+        return {"error": "No trades found"}
+
+    start = start_date or first_trade_date
+    end = end_date or date.today()
+
+    logger.info("Backfilling snapshots from %s to %s", start, end)
+
+    # Load all trades sorted by date
+    trade_rows = await pool.fetch(
+        """
+        SELECT account_id, symbol, side,
+               quantity::float AS quantity,
+               trade_date::date AS trade_date
+        FROM trades
+        ORDER BY trade_date ASC, id ASC
+        """
+    )
+    if not trade_rows:
+        return {"error": "No trades to process"}
+
+    # All unique symbols and accounts
+    symbols = list({r["symbol"] for r in trade_rows})
+    account_ids = list({r["account_id"] for r in trade_rows})
+
+    # Batch-fetch ALL symbols + SPY via IBKR
+    from services.market_data import get_historical_bars_batch
+    all_symbols_to_fetch = list(set(symbols + ["SPY"]))
+    logger.info("Batch-fetching %d symbols from IBKR...", len(all_symbols_to_fetch))
+    batch = await get_historical_bars_batch(pool, all_symbols_to_fetch, start, end)
+
+    symbol_price_map: dict[str, dict[date, Decimal]] = {s: batch.get(s, {}) for s in symbols}
+    spy_price_map: dict[date, Decimal] = batch.get("SPY", {})
+    spy_dates = sorted(spy_price_map.keys())
+    logger.info("Batch fetch complete: %d SPY bars", len(spy_dates))
+
+    # Build list of all calendar days in range
+    all_dates: list[date] = []
+    cur = start
+    while cur <= end:
+        all_dates.append(cur)
+        cur += timedelta(days=1)
+
+    # Group trades by account
+    trades_by_account: dict[str, list] = {a: [] for a in account_ids}
+    for r in trade_rows:
+        trades_by_account[r["account_id"]].append(r)
+
+    snapshots_written = 0
+
+    for acct_id in account_ids:
+        acct_trades = trades_by_account[acct_id]
+        positions: dict[str, float] = {}  # symbol -> net qty
+        trade_idx = 0
+        prev_nav: Optional[Decimal] = None
+
+        for d in all_dates:
+            # Apply all trades on or before this date
+            while trade_idx < len(acct_trades) and acct_trades[trade_idx]["trade_date"] <= d:
+                t = acct_trades[trade_idx]
+                sym = t["symbol"]
+                qty = float(t["quantity"])
+                if t["side"] == "BUY":
+                    positions[sym] = positions.get(sym, 0.0) + qty
+                else:
+                    positions[sym] = positions.get(sym, 0.0) - qty
+                trade_idx += 1
+
+            # Compute NAV for this day
+            nav = Decimal("0")
+            any_price = False
+            for sym, qty in positions.items():
+                if qty <= 0.00001:
+                    continue
+                px = symbol_price_map.get(sym, {}).get(d)
+                if px:
+                    nav += Decimal(str(round(qty, 6))) * px
+                    any_price = True
+
+            if not any_price:
+                # Weekend / market holiday with no prices — skip to avoid zero-value noise
+                continue
+
+            # Pre-fetch SPY close for this date (and previous trading day for daily pct)
+            spy_close_d = spy_price_map.get(d)
+            spy_prev_d: Optional[Decimal] = None
+            if spy_close_d is not None:
+                # Find the most recent SPY date before d
+                prev_spy_dates = [sd for sd in spy_dates if sd < d]
+                if prev_spy_dates:
+                    spy_prev_d = spy_price_map[prev_spy_dates[-1]]
+
+            await upsert_snapshot(
+                pool=pool,
+                snapshot_date=d,
+                total_nav=nav.quantize(Decimal("0.01")),
+                account_id=acct_id,
+                equity_value=nav.quantize(Decimal("0.01")),
+                prev_nav=prev_nav,
+                spy_close=spy_close_d,
+                spy_prev_close=spy_prev_d,
+            )
+            prev_nav = nav
+            snapshots_written += 1
+
+    # Combined snapshot: sum of all accounts for each date
+    combined_rows = await pool.fetch(
+        """
+        SELECT snapshot_date, SUM(total_nav) AS combined_nav
+        FROM portfolio_snapshots
+        WHERE account_id IS NOT NULL
+          AND snapshot_date BETWEEN $1 AND $2
+        GROUP BY snapshot_date
+        ORDER BY snapshot_date ASC
+        """,
+        start, end,
+    )
+    prev_combined: Optional[Decimal] = None
+    for row in combined_rows:
+        nav = Decimal(str(row["combined_nav"]))
+        d = row["snapshot_date"]
+        spy_close_d = spy_price_map.get(d)
+        spy_prev_d = None
+        if spy_close_d is not None:
+            prev_spy_dates = [sd for sd in spy_dates if sd < d]
+            if prev_spy_dates:
+                spy_prev_d = spy_price_map[prev_spy_dates[-1]]
+        await upsert_snapshot(
+            pool=pool,
+            snapshot_date=d,
+            total_nav=nav,
+            account_id=None,
+            equity_value=nav,
+            prev_nav=prev_combined,
+            spy_close=spy_close_d,
+            spy_prev_close=spy_prev_d,
+        )
+        prev_combined = nav
+        snapshots_written += 1
+
+    logger.info("Backfill complete: %d snapshots written", snapshots_written)
+    return {
+        "start": str(start),
+        "end": str(end),
+        "accounts": account_ids,
+        "symbols": len(symbols),
+        "snapshots_written": snapshots_written,
+    }
+
+
 async def _calculate_win_rate(
     pool: asyncpg.Pool,
     start: date,
@@ -395,3 +561,5 @@ async def _calculate_win_rate(
     except Exception as exc:
         logger.error("Win rate calculation failed: %s", exc)
     return None
+
+

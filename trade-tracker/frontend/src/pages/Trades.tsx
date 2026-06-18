@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { Search } from 'lucide-react'
 import type { Trade, TradeLabel } from '../types'
 import { get, patch } from '../api/client'
 import LabelBadge from '../components/LabelBadge'
@@ -15,13 +16,11 @@ export default function Trades() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  // Filters
   const [source, setSource] = useState<'' | 'ibkr' | 'fidelity'>('')
   const [symbol, setSymbol] = useState('')
   const [side, setSide] = useState<'' | 'BUY' | 'SELL'>('')
   const [labelFilter, setLabelFilter] = useState('')
 
-  // Label editor
   const [editingId, setEditingId] = useState<number | null>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
 
@@ -41,11 +40,8 @@ export default function Trades() {
       .finally(() => setLoading(false))
   }, [source, symbol, side, labelFilter])
 
-  useEffect(() => {
-    fetchTrades()
-  }, [fetchTrades])
+  useEffect(() => { fetchTrades() }, [fetchTrades])
 
-  // Close popover when clicking outside
   useEffect(() => {
     function handler(e: MouseEvent) {
       if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) {
@@ -66,81 +62,110 @@ export default function Trades() {
     setEditingId(null)
   }
 
+  /* ── pill toggle helper ── */
+  function PillGroup<T extends string>({
+    options,
+    value,
+    onChange,
+    labelFn,
+  }: {
+    options: T[]
+    value: T
+    onChange: (v: T) => void
+    labelFn?: (v: T) => string
+  }) {
+    return (
+      <div
+        className="flex rounded-lg p-0.5"
+        style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8' }}
+      >
+        {options.map((o) => (
+          <button
+            key={o}
+            onClick={() => onChange(o)}
+            className="px-3 py-1.5 rounded-md text-xs font-medium transition-colors"
+            style={
+              value === o
+                ? { backgroundColor: '#1a2744', color: '#ffffff' }
+                : { color: '#6b7a99' }
+            }
+          >
+            {labelFn ? labelFn(o) : o || 'All'}
+          </button>
+        ))}
+      </div>
+    )
+  }
+
   return (
-    <div className="p-6 max-w-screen-xl mx-auto">
+    <div className="p-8">
       <div className="flex items-center justify-between mb-6">
-        <h2 className="text-xl font-semibold text-white">Trade Log</h2>
-        <span className="text-xs text-gray-500">{trades.length} trades shown</span>
+        <h2 className="text-2xl font-bold" style={{ color: '#1a2744' }}>Trade Log</h2>
+        <span className="text-sm" style={{ color: '#9ca3af' }}>{trades.length} trades</span>
       </div>
 
       {/* Filters */}
-      <div className="flex flex-wrap gap-2 mb-5">
-        {/* Source */}
-        <div className="flex bg-gray-900 border border-gray-800 rounded-lg p-1 gap-0.5 text-xs">
-          {(['', 'ibkr', 'fidelity'] as const).map((s) => (
-            <button
-              key={s}
-              onClick={() => setSource(s)}
-              className={`px-3 py-1.5 rounded transition-colors ${
-                source === s ? 'bg-gray-700 text-white font-medium' : 'text-gray-400 hover:text-white'
-              }`}
-            >
-              {s === '' ? 'All' : s === 'ibkr' ? 'IBKR' : 'Fidelity'}
-            </button>
-          ))}
-        </div>
-
-        {/* Side */}
-        <div className="flex bg-gray-900 border border-gray-800 rounded-lg p-1 gap-0.5 text-xs">
-          {(['', 'BUY', 'SELL'] as const).map((s) => (
-            <button
-              key={s}
-              onClick={() => setSide(s)}
-              className={`px-3 py-1.5 rounded transition-colors ${
-                side === s ? 'bg-gray-700 text-white font-medium' : 'text-gray-400 hover:text-white'
-              }`}
-            >
-              {s === '' ? 'All' : s}
-            </button>
-          ))}
-        </div>
-
-        {/* Symbol */}
-        <input
-          type="text"
-          placeholder="Symbol…"
-          value={symbol}
-          onChange={(e) => setSymbol(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && fetchTrades()}
-          className="bg-gray-900 border border-gray-800 rounded-lg px-3 py-1.5 text-sm text-white placeholder-gray-600 focus:outline-none focus:border-blue-500 w-36"
+      <div className="flex flex-wrap gap-2 mb-5 items-center">
+        <PillGroup
+          options={['', 'ibkr', 'fidelity'] as const}
+          value={source}
+          onChange={(v) => setSource(v as '' | 'ibkr' | 'fidelity')}
+          labelFn={(s) => s === '' ? 'All' : s === 'ibkr' ? 'IBKR' : 'Fidelity'}
+        />
+        <PillGroup
+          options={['', 'BUY', 'SELL'] as const}
+          value={side}
+          onChange={(v) => setSide(v as '' | 'BUY' | 'SELL')}
+          labelFn={(s) => s || 'All Sides'}
         />
 
-        {/* Label filter */}
+        <div
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg"
+          style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8' }}
+        >
+          <Search size={13} color="#9ca3af" />
+          <input
+            type="text"
+            placeholder="Symbol…"
+            value={symbol}
+            onChange={(e) => setSymbol(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && fetchTrades()}
+            className="text-sm bg-transparent outline-none w-28"
+            style={{ color: '#1a2744' }}
+          />
+        </div>
+
         <select
           value={labelFilter}
           onChange={(e) => setLabelFilter(e.target.value)}
-          className="bg-gray-900 border border-gray-800 rounded-lg px-3 py-1.5 text-sm text-gray-300 focus:outline-none focus:border-blue-500"
+          className="px-3 py-1.5 rounded-lg text-xs focus:outline-none"
+          style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8', color: '#374151' }}
         >
           <option value="">All Labels</option>
-          {LABELS.map((l) => (
-            <option key={l} value={l}>
-              {l}
-            </option>
-          ))}
+          {LABELS.map((l) => <option key={l} value={l}>{l}</option>)}
           <option value="__none">Unlabelled</option>
         </select>
       </div>
 
       {error && (
-        <div className="bg-red-950/50 border border-red-800/50 text-red-300 px-4 py-3 rounded-lg mb-4 text-sm">
+        <div
+          className="px-4 py-2.5 rounded-lg mb-4 text-sm"
+          style={{ backgroundColor: '#fef2f2', border: '1px solid #fecaca', color: '#dc2626' }}
+        >
           {error}
         </div>
       )}
 
-      <div className="bg-gray-900 rounded-lg border border-gray-800 overflow-x-auto">
+      <div
+        className="rounded-xl overflow-x-auto"
+        style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8' }}
+      >
         <table className="w-full text-sm">
           <thead>
-            <tr className="border-b border-gray-800 text-xs text-gray-500 uppercase tracking-wider">
+            <tr
+              className="text-xs uppercase tracking-wider"
+              style={{ borderBottom: '1px solid #e8edf5', color: '#9ca3af' }}
+            >
               <th className="text-left px-4 py-3 font-medium">Date</th>
               <th className="text-left px-4 py-3 font-medium">Account</th>
               <th className="text-left px-4 py-3 font-medium">Source</th>
@@ -157,14 +182,14 @@ export default function Trades() {
           <tbody>
             {loading && (
               <tr>
-                <td colSpan={11} className="text-center py-10 text-gray-600">
+                <td colSpan={11} className="text-center py-10" style={{ color: '#9ca3af' }}>
                   Loading...
                 </td>
               </tr>
             )}
             {!loading && trades.length === 0 && (
               <tr>
-                <td colSpan={11} className="text-center py-10 text-gray-600">
+                <td colSpan={11} className="text-center py-10" style={{ color: '#9ca3af' }}>
                   No trades found.
                 </td>
               </tr>
@@ -172,54 +197,53 @@ export default function Trades() {
             {trades.map((t) => (
               <tr
                 key={t.id}
-                className="border-b border-gray-800/40 hover:bg-gray-800/30 transition-colors"
+                className="transition-colors"
+                style={{ borderBottom: '1px solid #f1f5f9' }}
               >
-                <td className="px-4 py-2.5 text-gray-400 whitespace-nowrap text-xs">
+                <td className="px-4 py-2.5 whitespace-nowrap text-xs" style={{ color: '#6b7a99' }}>
                   {new Date(t.trade_date).toLocaleDateString('en-US', {
-                    month: 'short',
-                    day: 'numeric',
-                    year: 'numeric',
+                    month: 'short', day: 'numeric', year: 'numeric',
                   })}
                 </td>
-                <td className="px-4 py-2.5 text-gray-500 text-xs">{t.account_id}</td>
+                <td className="px-4 py-2.5 text-xs" style={{ color: '#9ca3af' }}>{t.account_id}</td>
                 <td className="px-4 py-2.5">
                   <span
-                    className={`text-xs px-1.5 py-0.5 rounded ${
+                    className="text-xs px-1.5 py-0.5 rounded font-medium"
+                    style={
                       t.source === 'ibkr'
-                        ? 'bg-blue-900/50 text-blue-300'
-                        : 'bg-green-900/50 text-green-300'
-                    }`}
+                        ? { backgroundColor: '#eff6ff', color: '#1d4ed8' }
+                        : { backgroundColor: '#f0fdf4', color: '#15803d' }
+                    }
                   >
                     {t.source === 'ibkr' ? 'IB' : 'Fidelity'}
                   </span>
                 </td>
-                <td className="px-4 py-2.5 font-semibold text-white">{t.symbol}</td>
+                <td className="px-4 py-2.5 font-semibold" style={{ color: '#1a2744' }}>{t.symbol}</td>
                 <td className="px-4 py-2.5">
                   <span
-                    className={`text-xs font-semibold ${
-                      t.side === 'BUY' ? 'text-emerald-400' : 'text-red-400'
-                    }`}
+                    className="text-xs font-semibold"
+                    style={{ color: t.side === 'BUY' ? '#16a34a' : '#dc2626' }}
                   >
                     {t.side}
                   </span>
                 </td>
-                <td className="px-4 py-2.5 text-right tabular-nums">
+                <td className="px-4 py-2.5 text-right tabular-nums" style={{ color: '#374151' }}>
                   {Number(t.quantity).toLocaleString()}
                 </td>
-                <td className="px-4 py-2.5 text-right tabular-nums">{fmt$(Number(t.price))}</td>
-                <td className="px-4 py-2.5 text-right tabular-nums text-gray-500">
+                <td className="px-4 py-2.5 text-right tabular-nums" style={{ color: '#374151' }}>
+                  {fmt$(Number(t.price))}
+                </td>
+                <td className="px-4 py-2.5 text-right tabular-nums" style={{ color: '#9ca3af' }}>
                   {fmt$(Number(t.commission))}
                 </td>
                 <td
-                  className={`px-4 py-2.5 text-right tabular-nums ${
-                    Number(t.net_amount) >= 0 ? 'text-emerald-400' : 'text-red-400'
-                  }`}
+                  className="px-4 py-2.5 text-right tabular-nums font-medium"
+                  style={{ color: Number(t.net_amount) >= 0 ? '#16a34a' : '#dc2626' }}
                 >
                   {Number(t.net_amount) < 0 ? '-' : ''}
                   {fmt$(Number(t.net_amount))}
                 </td>
 
-                {/* Label cell with inline editor */}
                 <td className="px-4 py-2.5">
                   <div className="relative" ref={editingId === t.id ? popoverRef : undefined}>
                     <button
@@ -230,12 +254,16 @@ export default function Trades() {
                       <LabelBadge label={t.label} />
                     </button>
                     {editingId === t.id && (
-                      <div className="absolute z-20 left-0 top-7 bg-gray-800 border border-gray-700 rounded-lg shadow-xl p-1.5 min-w-max">
+                      <div
+                        className="absolute z-20 left-0 top-7 rounded-xl shadow-xl p-1.5 min-w-max"
+                        style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8' }}
+                      >
                         {LABELS.map((l) => (
                           <button
                             key={l}
                             onClick={() => applyLabel(t.id, l)}
-                            className="block w-full text-left px-3 py-1.5 text-xs text-gray-300 hover:bg-gray-700 hover:text-white rounded transition-colors"
+                            className="block w-full text-left px-3 py-1.5 text-xs rounded-lg transition-colors hover:bg-gray-50"
+                            style={{ color: '#374151' }}
                           >
                             {l}
                           </button>
@@ -247,7 +275,10 @@ export default function Trades() {
 
                 <td className="px-4 py-2.5">
                   {t.is_hedge && (
-                    <span className="text-xs bg-yellow-900/50 text-yellow-400 px-1.5 py-0.5 rounded">
+                    <span
+                      className="text-xs px-1.5 py-0.5 rounded font-medium"
+                      style={{ backgroundColor: '#fefce8', color: '#a16207' }}
+                    >
                       Hedge
                     </span>
                   )}

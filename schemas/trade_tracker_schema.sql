@@ -77,6 +77,7 @@ CREATE TABLE fidelity_imports (
     id              BIGSERIAL PRIMARY KEY,
     filename        VARCHAR(255)    NOT NULL,
     account_id      VARCHAR(50),                        -- extracted from CSV header if present
+    source          VARCHAR(20)     NOT NULL DEFAULT 'fidelity', -- 'ibkr' | 'fidelity'
     imported_at     TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     row_count       INTEGER,                            -- number of trade rows parsed
     success_count   INTEGER DEFAULT 0,

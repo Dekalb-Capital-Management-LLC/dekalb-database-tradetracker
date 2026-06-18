@@ -1,180 +1,417 @@
 """
-IBKR Client Portal Gateway client.
+IBKR Web API client — RSA-based OAuth 2.0 (JWT Bearer Token flow, RFC 7523).
 
-The IBKR Client Portal Gateway is a Java app you run locally. It handles
-authentication with IBKR (username/password + 2FA via browser) and exposes a
-local REST API at https://localhost:5000.
+This is NOT standard browser OAuth. There is no redirect URL or login page.
+Authentication is entirely server-side using RSA keys. The full flow:
 
-To activate:
-  1. Download the Client Portal Gateway from IBKR:
-       https://www.interactivebrokers.com/en/trading/ib-api.php
-       (look for "Client Portal API" -> download the .zip)
-  2. Unzip it into the ibkr-gateway/ folder in this repo
-  3. Copy ibkr-gateway/conf.yaml.example -> ibkr-gateway/conf.yaml
-  4. Start the gateway:
-       cd ibkr-gateway && java -jar clientportal.gw/root/clientportal.gw.jar root/conf
-  5. Open https://localhost:5000 in your browser, log in with your IBKR
-     username + password + 2FA. Do this once per session (~24h).
-  6. Set these env vars (in .env file at repo root):
-       IBKR_ENABLED=true
-       IBKR_ACCOUNT_ID=U1234567   <- your IBKR account ID
-  7. If running in Docker: IBKR_GATEWAY_URL=https://host.docker.internal:5000
+  1. Build a JWT signed with your RSA private key
+  2. POST to token endpoint → get OAuth2 bearer token
+  3. POST to sso-sessions with bearer token + IBKR username + server IP → session cookie
+  4. POST to iserver/auth/ssodh/init → activate trading/data session
+  5. Sleep 3-5s, then GET iserver/accounts (required warm-up call)
+  6. Make API calls using the session cookie
+  7. POST /tickle every 60s to keep session alive
 
-API reference: https://www.interactivebrokers.com/campus/ibkr-api-page/cpapi-v1/
+This module handles all of that automatically. Call ibkr_client.connect() once
+at startup (done by main.py). After that, just call the data methods.
+Re-authentication is automatic when the session expires.
+
+Required env vars (set in .env):
+  IBKR_CLIENT_ID      - e.g. DekalbCapital-Paper
+  IBKR_CLIENT_KEY_ID  - e.g. main
+  IBKR_CREDENTIAL     - IBKR username (e.g. dekalbcapitalpaper)
+  IBKR_PRIVATE_KEY    - full RSA private key PEM content
+  IBKR_ACCOUNT_ID     - account ID (e.g. DFP321877)
+  IBKR_SERVER_IP      - outbound IP of this server
 """
 from __future__ import annotations
 
 import logging
+import threading
+import time
+import uuid
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Optional
 
+import jwt
 import requests
-import urllib3
-
-# The local IBKR gateway uses a self-signed cert. We disable verification for
-# localhost-only calls and suppress the resulting warnings to keep logs clean.
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 import config
 
 logger = logging.getLogger(__name__)
 
-# Shared session — keeps connection alive between calls
-_session: Optional[requests.Session] = None
+
+def _is_configured() -> bool:
+    return bool(
+        config.IBKR_ENABLED
+        and config.IBKR_CLIENT_ID
+        and config.IBKR_CLIENT_KEY_ID
+        and config.IBKR_CREDENTIAL
+        and config.IBKR_PRIVATE_KEY
+        and config.IBKR_ACCOUNT_ID
+    )
 
 
-def _get_session() -> requests.Session:
-    global _session
-    if _session is None:
-        _session = requests.Session()
-        _session.headers.update({"User-Agent": "dekalb-trade-tracker/1.0"})
-        # The local IBKR gateway uses a self-signed cert — skip verification
-        _session.verify = False
-    return _session
+def _load_private_key():
+    """Load RSA private key from config."""
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    key_bytes = config.IBKR_PRIVATE_KEY.encode()
+    return load_pem_private_key(key_bytes, password=None)
+
+
+def _build_jwt() -> str:
+    """
+    Build a signed JWT assertion for the OAuth2 token request.
+    Header: alg=RS256, kid=<clientKeyId>
+    Claims: iss/sub=clientId, aud=token URL, standard timing fields
+    """
+    now = int(time.time())
+    payload = {
+        "iss": config.IBKR_CLIENT_ID,
+        "sub": config.IBKR_CLIENT_ID,
+        "aud": config.IBKR_TOKEN_URL,
+        "iat": now,
+        "exp": now + 300,
+        "jti": str(uuid.uuid4()),
+    }
+    private_key = _load_private_key()
+    return jwt.encode(
+        payload,
+        private_key,
+        algorithm="RS256",
+        headers={"kid": config.IBKR_CLIENT_KEY_ID},
+    )
 
 
 class IBKRClient:
     """
-    Thin wrapper around the IBKR Client Portal Web API, routed through Pangolin.
-    All methods return None / [] when IBKR is disabled — callers should handle gracefully.
+    Manages the IBKR Web API session lifecycle.
+    Once connected, all data methods use the active session automatically.
     """
 
     def __init__(self) -> None:
-        self.base_url = config.IBKR_GATEWAY_URL.rstrip("/")
-        self.enabled = config.IBKR_ENABLED
+        self._session = requests.Session()
+        self._session.headers.update({"User-Agent": "dekalb-trade-tracker/1.0"})
+        self._connected = False
+        self._tickle_thread: Optional[threading.Thread] = None
+        self._stop_tickle = threading.Event()
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Connection lifecycle
+    # ------------------------------------------------------------------
+
+    def connect(self) -> bool:
+        """
+        Establish a full IBKR session. Safe to call on startup or after expiry.
+        Returns True if successful, False otherwise.
+        """
+        if not _is_configured():
+            logger.info("IBKR not configured — skipping connection attempt")
+            return False
+
+        with self._lock:
+            try:
+                return self._do_connect()
+            except Exception as exc:
+                logger.error("IBKR connection failed: %s", exc)
+                self._connected = False
+                return False
+
+    def _do_connect(self) -> bool:
+        logger.info("IBKR: starting connection (client_id=%s)", config.IBKR_CLIENT_ID)
+
+        # Step 1: Get OAuth2 bearer token using RSA-signed JWT
+        bearer_token = self._get_bearer_token()
+        if not bearer_token:
+            return False
+
+        # Step 2: Set bearer token on session for all subsequent requests
+        self._session.headers.update({"Authorization": f"Bearer {bearer_token}"})
+        logger.info("IBKR: bearer token set on session")
+
+        # Step 3: Create SSO session (establishes portal session for the account)
+        sso_token = self._create_sso_session()
+        if not sso_token:
+            return False
+
+        # Step 4: Swap to SSO session token for iserver calls
+        self._session.headers.update({"Authorization": f"Bearer {sso_token}"})
+
+        # Step 5: Init iserver trading/data session (opens brokerage session)
+        self._init_iserver()
+
+        # Step 6: Wait for session to activate (IBKR requirement)
+        time.sleep(4)
+
+        # Step 7: Warm-up call — required before portfolio/iserver endpoints work
+        self._warmup()
+
+        self._connected = True
+        logger.info("IBKR: connected (account=%s)", config.IBKR_ACCOUNT_ID)
+
+        # Start background tickle to keep session alive
+        self._start_tickle()
+        return True
+
+    def _get_bearer_token(self) -> Optional[str]:
+        """Step 1: exchange RSA-signed JWT for OAuth2 bearer token."""
+        try:
+            assertion = _build_jwt()
+            resp = self._session.post(
+                config.IBKR_TOKEN_URL,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                    "client_assertion": assertion,
+                    "scope": "sso-sessions.write",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            token = resp.json().get("access_token")
+            if token:
+                logger.info("IBKR: OAuth2 bearer token obtained")
+            else:
+                logger.error("IBKR: token response missing access_token: %s", resp.text[:200])
+            return token
+        except requests.exceptions.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.response.text[:500]
+            except Exception:
+                pass
+            logger.error("IBKR: failed to get bearer token: %s | body: %s", exc, body)
+            return None
+        except Exception as exc:
+            logger.error("IBKR: failed to get bearer token: %s", exc)
+            return None
+
+    def _create_sso_session(self) -> Optional[str]:
+        """
+        Step 3: create SSO session.
+        Endpoint: POST /gw/api/v1/sso-sessions
+        Body: signed JWT (Content-Type: application/jwt) containing credential + ip.
+        Returns the SSO access_token on success, None on failure.
+        """
+        try:
+            ip = config.IBKR_SERVER_IP or self._detect_ip()
+            now = int(time.time())
+            payload = {
+                "iss": config.IBKR_CLIENT_ID,
+                "sub": config.IBKR_CLIENT_ID,
+                "iat": now,
+                "exp": now + 300,
+                "jti": str(uuid.uuid4()),
+                "credential": config.IBKR_CREDENTIAL,
+                "ip": ip,
+            }
+            private_key = _load_private_key()
+            sso_jwt = jwt.encode(
+                payload,
+                private_key,
+                algorithm="RS256",
+                headers={"kid": config.IBKR_CLIENT_KEY_ID},
+            )
+            resp = self._session.post(
+                config.IBKR_SSO_URL,
+                data=sso_jwt,
+                headers={"Content-Type": "application/jwt"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            token = resp.json().get("access_token")
+            logger.info("IBKR: SSO session created (credential=%s)", config.IBKR_CREDENTIAL)
+            return token
+        except Exception as exc:
+            logger.error("IBKR: SSO session creation failed: %s", exc)
+            return None
+
+    def _init_iserver(self) -> None:
+        """Step 3: activate trading/data session."""
+        try:
+            resp = self._session.post(
+                f"{config.IBKR_BASE_URL}/iserver/auth/ssodh/init",
+                json={"publish": True, "compete": True},
+                timeout=15,
+            )
+            logger.debug("IBKR: iserver init response: %s", resp.status_code)
+        except Exception as exc:
+            logger.warning("IBKR: iserver init warning (may still work): %s", exc)
+
+    def _warmup(self) -> None:
+        """Step 5: GET /iserver/accounts — required before other iserver calls."""
+        try:
+            self._session.get(f"{config.IBKR_BASE_URL}/iserver/accounts", timeout=10)
+        except Exception:
+            pass
+
+    def _detect_ip(self) -> str:
+        """Detect this server's outbound IP as a fallback when IBKR_SERVER_IP is not set."""
+        try:
+            resp = requests.get("https://api.ipify.org", timeout=5)
+            ip = resp.text.strip()
+            logger.warning("IBKR_SERVER_IP not set — auto-detected %s. Set it explicitly for stability.", ip)
+            return ip
+        except Exception:
+            logger.warning("Could not detect outbound IP — using 0.0.0.0 (likely to fail)")
+            return "0.0.0.0"
+
+    def disconnect(self) -> None:
+        """Close the session and stop the tickle thread."""
+        self._stop_tickle.set()
+        try:
+            self._session.post(f"{config.IBKR_BASE_URL}/logout", timeout=10)
+        except Exception:
+            pass
+        self._connected = False
+        logger.info("IBKR: disconnected")
+
+    def is_connected(self) -> bool:
+        return self._connected
+
+    # ------------------------------------------------------------------
+    # Tickle — keeps the session alive
+    # ------------------------------------------------------------------
+
+    def _start_tickle(self) -> None:
+        self._stop_tickle.clear()
+        self._tickle_thread = threading.Thread(target=self._tickle_loop, daemon=True)
+        self._tickle_thread.start()
+
+    def _tickle_loop(self) -> None:
+        """POST /tickle every 60s to prevent session timeout."""
+        while not self._stop_tickle.wait(60):
+            try:
+                resp = self._session.post(f"{config.IBKR_BASE_URL}/tickle", timeout=10)
+                if resp.status_code == 401:
+                    logger.warning("IBKR: tickle 401 — session expired, reconnecting...")
+                    self._connected = False
+                    self._do_connect()
+            except Exception as exc:
+                logger.warning("IBKR: tickle error: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Internal request helper
     # ------------------------------------------------------------------
 
     def _get(self, path: str, **kwargs) -> Optional[Any]:
-        if not self.enabled:
+        if not self._connected:
+            logger.warning("IBKR not connected — call connect() first")
             return None
-        url = f"{self.base_url}{path}"
+        url = f"{config.IBKR_BASE_URL}{path}"
         try:
-            resp = _get_session().get(url, timeout=10, **kwargs)
+            resp = self._session.get(url, timeout=10, **kwargs)
+            if resp.status_code == 401:
+                logger.warning("IBKR: 401 on %s — reconnecting...", path)
+                self._connected = False
+                if self.connect():
+                    resp = self._session.get(url, timeout=10, **kwargs)
+                else:
+                    return None
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.ConnectionError:
-            logger.error("Cannot reach Pangolin at %s — are you on the VPN?", self.base_url)
+            logger.error("IBKR: cannot reach API at %s", url)
             return None
         except requests.exceptions.Timeout:
-            logger.error("Pangolin request timed out [%s]", path)
-            return None
-        except requests.exceptions.HTTPError as exc:
-            logger.error("IBKR HTTP error [%s]: %s", path, exc)
+            logger.error("IBKR: request timed out [%s]", path)
             return None
         except Exception as exc:
-            logger.error("IBKR request failed [%s]: %s", path, exc)
-            return None
-
-    def _post(self, path: str, json: Optional[dict] = None) -> Optional[Any]:
-        if not self.enabled:
-            return None
-        url = f"{self.base_url}{path}"
-        try:
-            resp = _get_session().post(url, json=json or {}, timeout=10)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as exc:
-            logger.error("IBKR POST failed [%s]: %s", path, exc)
+            logger.error("IBKR: request failed [%s]: %s", path, exc)
             return None
 
     # ------------------------------------------------------------------
-    # Auth
+    # Data methods
     # ------------------------------------------------------------------
-
-    def auth_status(self) -> Optional[dict]:
-        """
-        GET /v1/api/iserver/auth/status
-        Returns dict with 'authenticated', 'connected', 'competing' fields.
-        """
-        return self._get("/v1/api/iserver/auth/status")
-
-    def reauthenticate(self) -> Optional[dict]:
-        """POST /v1/api/iserver/reauthenticate — use if session goes stale."""
-        return self._post("/v1/api/iserver/reauthenticate")
-
-    # ------------------------------------------------------------------
-    # Accounts
-    # ------------------------------------------------------------------
-
-    def get_accounts(self) -> list[dict]:
-        """
-        GET /v1/api/portfolio/accounts
-        MUST be called before any per-account portfolio endpoint to warm up the session.
-        Returns list of account dicts with 'id', 'accountId', 'type', etc.
-        """
-        data = self._get("/v1/api/portfolio/accounts")
-        if data is None:
-            return []
-        return data if isinstance(data, list) else [data]
 
     def get_account_summary(self, account_id: str) -> Optional[dict]:
-        """
-        GET /v1/api/portfolio/{accountId}/summary
-        Returns NAV, cash, equity, margin.
+        # Must call /portfolio/accounts before other /portfolio endpoints
+        self._get("/portfolio/accounts")
+        return self._get(f"/portfolio/{account_id}/summary")
 
-        Key fields (each is a dict with 'amount' and 'currency'):
-          netliquidation       -> total NAV
-          totalcashvalue       -> cash balance
-          equitywithloanvalue  -> equity value
-          grosspositionvalue   -> gross market value
+    def get_ledger(self, account_id: str) -> Optional[dict]:
         """
-        self.get_accounts()  # required warm-up
-        return self._get(f"/v1/api/portfolio/{account_id}/summary")
+        Returns per-currency balances including cashbalance, netliquidationvalue,
+        unrealizedpnl, realizedpnl. Use 'BASE' key for base-currency totals.
+        """
+        self._get("/portfolio/accounts")
+        return self._get(f"/portfolio/{account_id}/ledger")
+
+    def get_historical_bars(
+        self,
+        conid: int,
+        period: str = "2y",
+        bar: str = "1d",
+    ) -> list[dict]:
+        """
+        Fetch daily OHLCV history for an instrument.
+        period: '2y' | '1y' | '6m' | '3m' | '1m'
+        bar:    '1d' | '1w' | '1m'
+        Returns list of {'date': date, 'close': Decimal}
+        """
+        from datetime import timezone
+        data = self._get(
+            "/iserver/marketdata/history",
+            params={"conid": conid, "period": period, "bar": bar, "outsideRth": True},
+        )
+        if not data or "data" not in data:
+            return []
+        bars = []
+        for b in data["data"]:
+            ts_ms = b.get("t")
+            close = b.get("c")
+            if ts_ms is None or close is None:
+                continue
+            try:
+                d = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc).date()
+                bars.append({"date": d, "close": Decimal(str(round(float(close), 4)))})
+            except Exception:
+                continue
+        return bars
 
     def get_positions(self, account_id: str) -> list[dict]:
-        """
-        GET /v1/api/portfolio/{accountId}/positions/0
-        Returns list of current open positions.
+        # Portfolio endpoints require /portfolio/accounts to be called first
+        self._get("/portfolio/accounts")
 
-        Key fields per position:
-          ticker / contractDesc  -> symbol
-          conid                  -> IBKR contract ID
-          position               -> quantity (negative = short)
-          mktPrice               -> current market price
-          mktValue               -> total market value
-          avgCost                -> average cost basis
-          unrealizedPnl
-          realizedPnl
-        """
-        self.get_accounts()  # required warm-up
-        data = self._get(f"/v1/api/portfolio/{account_id}/positions/0")
+        all_positions: list[dict] = []
+        page = 0
+
+        while True:
+            # IBKR returns [] on the first call (subscription delay). Retry up to 3x.
+            data = None
+            for attempt in range(3):
+                data = self._get(f"/portfolio/{account_id}/positions/{page}")
+                if data and isinstance(data, list) and len(data) > 0:
+                    break
+                if attempt < 2:
+                    time.sleep(1.5)
+
+            if not data or not isinstance(data, list) or len(data) == 0:
+                break  # no more pages
+
+            all_positions.extend(data)
+            logger.info("IBKR positions page %d: got %d rows (total so far %d)",
+                        page, len(data), len(all_positions))
+
+            # IBKR paginates in chunks of 30; if we got a full page, fetch the next
+            if len(data) < 30:
+                break
+            page += 1
+
+        logger.info("IBKR get_positions: %d total positions for %s", len(all_positions), account_id)
+        return all_positions
+
+    def get_recent_trades(self, account_id: str) -> list[dict]:
+        # days=7 fetches up to 7 days of fills (IBKR max for this endpoint)
+        data = self._get("/iserver/account/trades", params={"days": 7})
         if data is None:
             return []
         return data if isinstance(data, list) else []
 
-    # ------------------------------------------------------------------
-    # Market data
-    # ------------------------------------------------------------------
-
     def get_conid(self, symbol: str) -> Optional[int]:
-        """
-        GET /v1/api/trsrv/stocks?symbols={symbol}
-        Look up IBKR contract ID — required before market snapshot calls.
-        Response format: {"AAPL": [{"contracts": [{"conid": 265598, ...}]}]}
-        """
-        data = self._get("/v1/api/trsrv/stocks", params={"symbols": symbol})
+        data = self._get("/trsrv/stocks", params={"symbols": symbol})
         if not data:
             return None
         try:
@@ -182,51 +419,79 @@ class IBKRClient:
             if contracts:
                 return contracts[0]["contracts"][0]["conid"]
         except (KeyError, IndexError, TypeError):
-            logger.warning("Unexpected conid response for %s: %s", symbol, data)
+            pass
         return None
 
     def get_market_snapshot(self, conid: int) -> Optional[dict]:
-        """
-        GET /v1/api/iserver/marketdata/snapshot?conids={conid}&fields=31,84,86
-        Field 31 = last price, 84 = bid, 86 = ask.
+        result = self.get_market_snapshot_batch([conid])
+        return result.get(conid)
 
-        IBKR quirk: first call may return the row with no price yet (subscription
-        is being set up). We retry once if that happens.
+    def get_market_snapshot_batch(
+        self,
+        conids: list[int],
+        max_retries: int = 4,
+        retry_delay: float = 0.5,
+    ) -> dict[int, dict]:
         """
-        params = {"conids": conid, "fields": "31,84,86"}
-        data = self._get("/v1/api/iserver/marketdata/snapshot", params=params)
-        if not data or not isinstance(data, list):
-            return None
-        # Retry once if price field is missing (IBKR subscription warm-up)
-        if not data[0].get("31"):
-            data = self._get("/v1/api/iserver/marketdata/snapshot", params=params)
+        Batch snapshot for multiple conids.
+        IBKR requires polling: the first call subscribes to the stream; subsequent
+        calls return actual prices. We retry until field 31 (last) appears for
+        every conid or max_retries is exhausted.
+        Returns {conid: snapshot_dict}.
+        """
+        if not conids:
+            return {}
+        # Dedup while preserving order
+        unique_conids = list(dict.fromkeys(conids))
+        conids_csv = ",".join(str(c) for c in unique_conids)
+        # Fields: 31=last, 84=bid, 86=ask, 82=change$, 83=change%, 7296=prev_close
+        params = {"conids": conids_csv, "fields": "31,84,86,82,83,7296"}
+
+        results: dict[int, dict] = {}
+        for attempt in range(max_retries):
+            data = self._get("/iserver/marketdata/snapshot", params=params)
             if not data or not isinstance(data, list):
-                return None
-        return data[0]
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                return results
 
-    # ------------------------------------------------------------------
-    # Trade history
-    # ------------------------------------------------------------------
+            for entry in data:
+                cid = entry.get("conid") or entry.get("conidEx")
+                if cid is None:
+                    continue
+                try:
+                    cid = int(str(cid).split(".")[0])
+                except (ValueError, TypeError):
+                    continue
+                if entry.get("31") is not None:
+                    results[cid] = entry
 
-    def get_recent_trades(self, account_id: str) -> list[dict]:
-        """
-        GET /v1/api/iserver/account/trades
-        Returns fills from roughly the last 24 hours.
+            if len(results) >= len(unique_conids):
+                break
+            time.sleep(retry_delay)
 
-        Key fields per trade:
-          execution_id / orderId  -> unique ID (used for dedup)
-          symbol / ticker         -> instrument
-          side                    -> "BOT" (buy) or "SLD" (sell)
-          size                    -> quantity filled
-          price                   -> fill price
-          commission              -> commissions charged
-          trade_time / tradeTime  -> ISO timestamp
-        """
-        self.get_accounts()  # required warm-up
-        data = self._get("/v1/api/iserver/account/trades")
-        if data is None:
-            return []
-        return data if isinstance(data, list) else []
+        logger.info("IBKR snapshot batch: got prices for %d/%d conids", len(results), len(unique_conids))
+        return results
+
+    def get_conids_batch(self, symbols: list[str]) -> dict[str, int]:
+        """Batch symbol → conid lookup via /trsrv/stocks."""
+        if not symbols:
+            return {}
+        unique = list(dict.fromkeys(s.upper() for s in symbols))
+        result: dict[str, int] = {}
+        # /trsrv/stocks accepts comma-separated list
+        data = self._get("/trsrv/stocks", params={"symbols": ",".join(unique)})
+        if not data:
+            return result
+        for sym in unique:
+            try:
+                contracts = data.get(sym, [])
+                if contracts:
+                    result[sym] = int(contracts[0]["contracts"][0]["conid"])
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+        return result
 
 
 # Singleton — imported by routers and services
