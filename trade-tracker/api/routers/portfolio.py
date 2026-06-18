@@ -10,12 +10,14 @@ Endpoints:
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+import config
 import db
 from models.schemas import (
     AccountSummary,
@@ -35,9 +37,158 @@ def get_pool():
     return db.get_pool()
 
 
+def _dec(v) -> Decimal:
+    """Coerce to Decimal — sum() on empty iterables returns int 0."""
+    return v if isinstance(v, Decimal) else Decimal(str(v))
+
+
+def _extract_summary_amount(summary: dict, field: str) -> Optional[Decimal]:
+    entry = summary.get(field, {})
+    if isinstance(entry, dict) and entry.get("amount") is not None:
+        return Decimal(str(entry["amount"]))
+    return None
+
+
+def _ibkr_positions(account_id: Optional[str] = None) -> list[PositionSummary]:
+    """Live positions from IBKR — prices and P&L included in API response."""
+    from services.ibkr_client import ibkr_client
+
+    acct = account_id or config.IBKR_ACCOUNT_ID
+    if not config.IBKR_ENABLED or not acct or not ibkr_client.is_connected:
+        return []
+
+    positions: list[PositionSummary] = []
+    for p in ibkr_client.live_positions(acct):
+        mkt_val = Decimal(str(p["market_value"]))
+        upnl = Decimal(str(p["unrealized_pnl"]))
+        cost = Decimal(str(p["cost_basis"]))
+        upnl_pct = (upnl / cost * 100).quantize(Decimal("0.0001")) if cost else None
+        positions.append(
+            PositionSummary(
+                symbol=p["symbol"],
+                account_id=acct,
+                quantity=Decimal(str(p["quantity"])),
+                avg_cost=Decimal(str(p["avg_cost"])),
+                current_price=Decimal(str(p["market_price"])),
+                market_value=mkt_val,
+                unrealized_pnl=upnl,
+                unrealized_pnl_pct=upnl_pct,
+                label=None,
+            )
+        )
+    return positions
+
+
+async def _ibkr_portfolio_summary(pool) -> PortfolioSummary:
+    """Build summary from live IBKR when trades table is empty."""
+    from services.ibkr_client import ibkr_client
+
+    acct = config.IBKR_ACCOUNT_ID
+    positions = _ibkr_positions(acct)
+    raw = ibkr_client.get_account_summary(acct) or {}
+
+    equity = _extract_summary_amount(raw, "equitywithloanvalue") or sum(
+        (p.market_value or Decimal(0) for p in positions), Decimal(0)
+    )
+    nav = _extract_summary_amount(raw, "netliquidation") or equity
+    cash = _extract_summary_amount(raw, "totalcashvalue")
+    unrealized = sum((p.unrealized_pnl or Decimal(0) for p in positions), Decimal(0))
+    realized = _ibkr_realized_pnl(acct) or Decimal(0)
+
+    account = AccountSummary(
+        account_id=acct,
+        source="ibkr",
+        total_nav=nav,
+        cash_balance=cash,
+        equity_value=equity,
+        day_pnl=None,
+        day_pnl_pct=None,
+        total_realized_pnl=realized,
+        total_unrealized_pnl=unrealized.quantize(Decimal("0.01")),
+    )
+
+    return PortfolioSummary(
+        accounts=[account],
+        combined_nav=nav,
+        combined_equity_value=equity.quantize(Decimal("0.01")),
+        combined_day_pnl=None,
+        combined_day_pnl_pct=None,
+        total_realized_pnl=realized,
+        total_unrealized_pnl=unrealized.quantize(Decimal("0.01")),
+        positions=positions,
+        as_of=datetime.utcnow(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _ibkr_realized_pnl(account_id: str) -> Optional[Decimal]:
+    """Realized P&L from IBKR account summary or sum of position realizedPnl."""
+    from services.ibkr_client import ibkr_client
+
+    if not config.IBKR_ENABLED or not ibkr_client.is_connected:
+        return None
+
+    summary = ibkr_client.get_account_summary(account_id) or {}
+    for key in ("realizedpnl", "RealizedPnL", "realizedPnl"):
+        entry = summary.get(key)
+        if isinstance(entry, dict) and entry.get("amount") is not None:
+            return Decimal(str(entry["amount"])).quantize(Decimal("0.01"))
+
+    total = sum(float(p.get("realizedPnl") or 0) for p in ibkr_client.get_positions(account_id))
+    return Decimal(str(total)).quantize(Decimal("0.01"))
+
+
+async def _compute_realized_pnl_fifo(pool, account_id: str) -> Decimal:
+    """FIFO realized P&L from closed lots in the trades table."""
+    rows = await pool.fetch(
+        """
+        SELECT symbol, side, quantity, price, commission, trade_date, id
+        FROM trades
+        WHERE account_id = $1
+        ORDER BY trade_date, id
+        """,
+        account_id,
+    )
+    lots: dict[str, list[list[float]]] = defaultdict(list)
+    realized = Decimal(0)
+
+    for row in rows:
+        sym = row["symbol"].upper()
+        qty = float(row["quantity"])
+        price = float(row["price"])
+        commission = float(row["commission"] or 0)
+
+        if row["side"] == "BUY":
+            cost_per_share = (qty * price + commission) / qty if qty else 0
+            lots[sym].append([qty, cost_per_share])
+        else:
+            remaining = qty
+            while remaining > 0.0001 and lots[sym]:
+                lot_qty, lot_cost = lots[sym][0]
+                take = min(remaining, lot_qty)
+                proceeds = take * price - (commission * take / qty if qty else 0)
+                cost = take * lot_cost
+                realized += Decimal(str(proceeds - cost))
+                lot_qty -= take
+                remaining -= take
+                if lot_qty <= 0.0001:
+                    lots[sym].pop(0)
+                else:
+                    lots[sym][0][0] = lot_qty
+
+    return realized.quantize(Decimal("0.01"))
+
+
+async def _resolve_realized_pnl(pool, account_id: str) -> Decimal:
+    """Prefer IBKR realized P&L when live; otherwise FIFO from trades."""
+    ibkr_val = _ibkr_realized_pnl(account_id)
+    if ibkr_val is not None:
+        return ibkr_val
+    return await _compute_realized_pnl_fifo(pool, account_id)
+
 
 async def _compute_positions(pool, account_id: Optional[str] = None) -> list[PositionSummary]:
     """
@@ -65,6 +216,9 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
         """,
         *params,
     )
+
+    if not rows and config.IBKR_ENABLED:
+        return _ibkr_positions(account_id)
 
     positions: list[PositionSummary] = []
     for row in rows:
@@ -102,15 +256,7 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
 
 
 async def _account_summary(pool, account_id: str) -> AccountSummary:
-    # Realized P&L: net of all closed sell amounts minus cost basis
-    realized_row = await pool.fetchrow(
-        """
-        SELECT COALESCE(SUM(CASE WHEN side = 'SELL' THEN net_amount ELSE -net_amount END), 0) AS realized_pnl
-        FROM trades
-        WHERE account_id = $1
-        """,
-        account_id,
-    )
+    realized_pnl = await _resolve_realized_pnl(pool, account_id)
 
     source_row = await pool.fetchrow(
         "SELECT source FROM trades WHERE account_id = $1 LIMIT 1",
@@ -141,7 +287,7 @@ async def _account_summary(pool, account_id: str) -> AccountSummary:
         equity_value=Decimal(str(equity_value)).quantize(Decimal("0.01")),
         day_pnl=Decimal(str(snap_row["daily_pnl"])) if snap_row and snap_row["daily_pnl"] else None,
         day_pnl_pct=Decimal(str(snap_row["daily_pnl_pct"])) if snap_row and snap_row["daily_pnl_pct"] else None,
-        total_realized_pnl=Decimal(str(realized_row["realized_pnl"])).quantize(Decimal("0.01")),
+        total_realized_pnl=realized_pnl,
         total_unrealized_pnl=Decimal(str(unrealized_pnl)).quantize(Decimal("0.01")),
     )
 
@@ -162,16 +308,19 @@ async def get_portfolio_summary(pool=Depends(get_pool)):
         )
         account_ids = [r["account_id"] for r in account_rows]
 
+        if not account_ids and config.IBKR_ENABLED and config.IBKR_ACCOUNT_ID:
+            return await _ibkr_portfolio_summary(pool)
+
         accounts = []
         for acct_id in account_ids:
             accounts.append(await _account_summary(pool, acct_id))
 
         positions = await _compute_positions(pool)
 
-        combined_equity = sum((a.equity_value or Decimal(0)) for a in accounts)
-        combined_unrealized = sum((a.total_unrealized_pnl or Decimal(0)) for a in accounts)
-        combined_realized = sum((a.total_realized_pnl or Decimal(0)) for a in accounts)
-        combined_day_pnl = sum((a.day_pnl or Decimal(0)) for a in accounts)
+        combined_equity = sum((_dec(a.equity_value or 0) for a in accounts), Decimal(0))
+        combined_unrealized = sum((_dec(a.total_unrealized_pnl or 0) for a in accounts), Decimal(0))
+        combined_realized = sum((_dec(a.total_realized_pnl or 0) for a in accounts), Decimal(0))
+        combined_day_pnl = sum((_dec(a.day_pnl or 0) for a in accounts), Decimal(0))
 
         # Latest combined NAV snapshot
         snap_row = await pool.fetchrow(
@@ -191,7 +340,7 @@ async def get_portfolio_summary(pool=Depends(get_pool)):
             accounts=accounts,
             combined_nav=combined_nav,
             combined_equity_value=combined_equity.quantize(Decimal("0.01")),
-            combined_day_pnl=combined_day_pnl.quantize(Decimal("0.01")) if combined_day_pnl else None,
+            combined_day_pnl=combined_day_pnl.quantize(Decimal("0.01")) if combined_day_pnl != 0 else None,
             combined_day_pnl_pct=combined_day_pnl_pct,
             total_realized_pnl=combined_realized.quantize(Decimal("0.01")),
             total_unrealized_pnl=combined_unrealized.quantize(Decimal("0.01")),

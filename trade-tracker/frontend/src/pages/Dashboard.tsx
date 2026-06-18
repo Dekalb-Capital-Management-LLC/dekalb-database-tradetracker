@@ -1,6 +1,9 @@
 import { useState, useEffect } from 'react'
 import type {
   AccountSummary,
+  IBKRAccount,
+  IBKRLivePosition,
+  IBKRStatus,
   PerformancePoint,
   Period,
   PortfolioMetrics,
@@ -51,10 +54,31 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [chartLoading, setChartLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [ibkrStatus, setIbkrStatus] = useState<IBKRStatus | null>(null)
+  const [ibkrAccount, setIbkrAccount] = useState<IBKRAccount | null>(null)
+  const [ibkrPositions, setIbkrPositions] = useState<IBKRLivePosition[]>([])
 
   const accounts: AccountSummary[] = summary?.accounts ?? []
 
-  const visibleAccounts = accounts.filter(
+  // IBKR account chip when summary has no trade-derived accounts
+  const displayAccounts: AccountSummary[] =
+    accounts.length > 0
+      ? accounts
+      : ibkrStatus?.account_id
+        ? [{
+            account_id: ibkrStatus.account_id,
+            source: 'ibkr' as const,
+            total_nav: ibkrAccount?.total_nav ?? null,
+            cash_balance: ibkrAccount?.cash_balance ?? null,
+            equity_value: ibkrAccount?.equity_value ?? null,
+            day_pnl: null,
+            day_pnl_pct: null,
+            total_realized_pnl: null,
+            total_unrealized_pnl: null,
+          }]
+        : []
+
+  const visibleAccounts = displayAccounts.filter(
     (a) => sourceFilter === 'all' || a.source === sourceFilter
   )
 
@@ -66,6 +90,19 @@ export default function Dashboard() {
       .then(setSummary)
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
+  }, [])
+
+  // IBKR live connection status (separate from DB-derived portfolio)
+  useEffect(() => {
+    get<IBKRStatus>('/ibkr/status')
+      .then((status) => {
+        setIbkrStatus(status)
+        if (status.connected && status.authenticated) {
+          get<IBKRAccount>('/ibkr/account').then(setIbkrAccount).catch(() => setIbkrAccount(null))
+          get<IBKRLivePosition[]>('/ibkr/positions').then(setIbkrPositions).catch(() => setIbkrPositions([]))
+        }
+      })
+      .catch(() => setIbkrStatus({ enabled: false, message: 'Could not reach /ibkr/status' }))
   }, [])
 
   // Load metrics + performance when period or account changes
@@ -89,19 +126,40 @@ export default function Dashboard() {
   const activeAccount: AccountSummary | null =
     selectedAccount ? accounts.find((a) => a.account_id === selectedAccount) ?? null : null
 
-  const equityValue = activeAccount?.equity_value ?? summary?.combined_equity_value
+  const equityValue =
+    activeAccount?.equity_value ??
+    summary?.combined_nav ??
+    summary?.combined_equity_value ??
+    ibkrAccount?.total_nav
   const dayPnl = activeAccount?.day_pnl ?? summary?.combined_day_pnl
   const dayPnlPct = activeAccount?.day_pnl_pct ?? summary?.combined_day_pnl_pct
-  const unrealizedPnl = activeAccount?.total_unrealized_pnl ?? summary?.total_unrealized_pnl
+  const unrealizedPnl =
+    activeAccount?.total_unrealized_pnl ??
+    summary?.total_unrealized_pnl ??
+    (ibkrPositions.length
+      ? ibkrPositions.reduce((s, p) => s + (p.unrealized_pnl ?? 0), 0)
+      : null)
   const realizedPnl = activeAccount?.total_realized_pnl ?? summary?.total_realized_pnl
 
-  // Filter positions by source/account
-  const allPositions: PositionSummary[] = summary?.positions ?? []
+  // Positions: summary (IBKR-backed when trades table empty), else live IBKR fetch
+  const allPositions: PositionSummary[] =
+    summary?.positions?.length ? summary.positions : ibkrPositions.map((p) => ({
+      symbol: p.symbol,
+      account_id: ibkrStatus?.account_id ?? '',
+      quantity: p.quantity,
+      avg_cost: p.avg_cost ?? null,
+      current_price: p.market_price ?? null,
+      market_value: p.market_value ?? null,
+      unrealized_pnl: p.unrealized_pnl ?? null,
+      unrealized_pnl_pct: null,
+      label: null,
+    }))
   const filteredPositions = allPositions.filter((p) => {
     if (selectedAccount) return p.account_id === selectedAccount
-    if (sourceFilter !== 'all') {
-      const acct = accounts.find((a) => a.account_id === p.account_id)
-      return acct?.source === sourceFilter
+    if (sourceFilter === 'ibkr') return p.account_id.startsWith('U') || p.account_id === ibkrStatus?.account_id
+    if (sourceFilter === 'fidelity') {
+      const acct = displayAccounts.find((a) => a.account_id === p.account_id)
+      return acct?.source === 'fidelity'
     }
     return true
   })
@@ -136,6 +194,39 @@ export default function Dashboard() {
           ))}
         </div>
       </div>
+
+      {/* IBKR live status */}
+      {ibkrStatus && (
+        <div
+          className={`mb-6 px-4 py-3 rounded-lg border text-sm ${
+            ibkrStatus.connected && ibkrStatus.authenticated
+              ? 'bg-green-950/40 border-green-800/50 text-green-200'
+              : ibkrStatus.enabled
+                ? 'bg-amber-950/40 border-amber-800/50 text-amber-200'
+                : 'bg-gray-900 border-gray-800 text-gray-400'
+          }`}
+        >
+          <span className="font-medium">IBKR</span>
+          {' · '}
+          {ibkrStatus.enabled ? (
+            ibkrStatus.connected && ibkrStatus.authenticated ? (
+              <>
+                Connected ({ibkrStatus.mode}) · {ibkrStatus.account_id}
+                {ibkrAccount?.total_nav != null && (
+                  <> · NAV {fmt$(ibkrAccount.total_nav)}</>
+                )}
+                {ibkrPositions.length > 0 && (
+                  <> · {ibkrPositions.length} live positions</>
+                )}
+              </>
+            ) : (
+              <>Not connected — {ibkrStatus.message ?? 'check API logs'}</>
+            )
+          ) : (
+            <>{ibkrStatus.message ?? 'disabled'}</>
+          )}
+        </div>
+      )}
 
       {/* Source + account toggles */}
       <div className="flex flex-wrap gap-2 mb-6">

@@ -1,13 +1,8 @@
 """
 Market data service.
 
-Current implementation: yfinance (free, no auth required).
-IBKR path is wired in but gated behind IBKR_GATEWAY_ENABLED=true.
-
-When IBKR gateway is ready:
-1. Set IBKR_GATEWAY_ENABLED=true in env
-2. Set IBKR_GATEWAY_URL to your gateway address (default https://localhost:5000)
-3. The gateway must be running and authenticated via 2FA
+Uses IBKR OAuth cloud API when IBKR_ENABLED=true (snapshot + position prices),
+with yfinance as fallback for quotes and historical bars.
 """
 from __future__ import annotations
 
@@ -37,6 +32,33 @@ logger = logging.getLogger(__name__)
 
 # Simple in-process TTL cache to avoid hammering yfinance
 _price_cache: dict[str, tuple[float, PriceQuote]] = {}  # symbol -> (expires_at, quote)
+_hist_cache: dict[tuple, tuple[float, list[HistoricalBar]]] = {}  # cache key -> (expires_at, bars)
+_last_yf_request_at: float = 0.0
+
+
+def _throttle_yfinance() -> None:
+    """ponytail: serialise yfinance calls — Yahoo rate-limits burst traffic."""
+    global _last_yf_request_at
+    delay = config.YFINANCE_REQUEST_DELAY_SECONDS
+    elapsed = time.time() - _last_yf_request_at
+    if elapsed < delay:
+        time.sleep(delay - elapsed)
+    _last_yf_request_at = time.time()
+
+
+def _hist_cache_key(symbol: str, start: date, end: date, interval: str) -> tuple:
+    return (symbol.upper(), start.isoformat(), end.isoformat(), interval)
+
+
+def _cached_bars(key: tuple) -> Optional[list[HistoricalBar]]:
+    entry = _hist_cache.get(key)
+    if entry and entry[0] > time.time():
+        return entry[1]
+    return None
+
+
+def _store_bars(key: tuple, bars: list[HistoricalBar]) -> None:
+    _hist_cache[key] = (time.time() + config.HISTORICAL_CACHE_TTL_SECONDS, bars)
 
 
 def _cached_quote(symbol: str) -> Optional[PriceQuote]:
@@ -57,6 +79,7 @@ def _store_quote(symbol: str, quote: PriceQuote) -> None:
 
 def _fetch_quote_yfinance(symbol: str) -> Optional[PriceQuote]:
     try:
+        _throttle_yfinance()
         ticker = yf.Ticker(symbol, session=_yf_session)
         info = ticker.fast_info  # lighter call than .info
         price = info.last_price
@@ -87,6 +110,46 @@ def _fetch_quote_yfinance(symbol: str) -> Optional[PriceQuote]:
         return None
 
 
+def _fetch_hist_ibkr(
+    symbol: str,
+    start: date,
+    end: date,
+    interval: str = "1d",
+) -> list[HistoricalBar]:
+    """IBKR iserver history — preferred when OAuth session is live."""
+    if interval != "1d" or not config.IBKR_ENABLED:
+        return []
+
+    from services.ibkr_client import ibkr_client
+
+    if not ibkr_client.is_connected:
+        return []
+
+    conid = ibkr_client.get_conid(symbol)
+    if conid is None:
+        return []
+
+    raw = ibkr_client.get_market_history_bars(conid, start, end, bar="1d")
+    bars: list[HistoricalBar] = []
+    for row in raw:
+        close = row.get("close")
+        if close is None:
+            continue
+        bars.append(
+            HistoricalBar(
+                date=row["date"],
+                open=Decimal(str(round(row["open"] or close, 4))),
+                high=Decimal(str(round(row["high"] or close, 4))),
+                low=Decimal(str(round(row["low"] or close, 4))),
+                close=Decimal(str(round(close, 4))),
+                volume=int(row.get("volume") or 0),
+            )
+        )
+    if bars:
+        logger.info("Fetched %d bars for %s via IBKR", len(bars), symbol)
+    return bars
+
+
 def get_historical_bars(
     symbol: str,
     start: date,
@@ -94,10 +157,21 @@ def get_historical_bars(
     interval: str = "1d",
 ) -> list[HistoricalBar]:
     """
-    Fetch OHLCV bars via yfinance.
+    Fetch OHLCV bars via IBKR (when connected) or yfinance.
     interval: '1d', '1wk', '1mo'  (daily is most useful for portfolio metrics)
     """
+    key = _hist_cache_key(symbol, start, end, interval)
+    cached = _cached_bars(key)
+    if cached is not None:
+        return cached
+
+    ibkr_bars = _fetch_hist_ibkr(symbol, start, end, interval)
+    if ibkr_bars:
+        _store_bars(key, ibkr_bars)
+        return ibkr_bars
+
     try:
+        _throttle_yfinance()
         ticker = yf.Ticker(symbol, session=_yf_session)
         df = ticker.history(
             start=start.isoformat(),
@@ -107,6 +181,7 @@ def get_historical_bars(
         )
         if df.empty:
             logger.warning("No historical data for %s %s-%s", symbol, start, end)
+            _store_bars(key, [])
             return []
 
         bars: list[HistoricalBar] = []
@@ -121,54 +196,162 @@ def get_historical_bars(
                     volume=int(row["Volume"]),
                 )
             )
+        _store_bars(key, bars)
         logger.info("Fetched %d bars for %s via yfinance", len(bars), symbol)
         return bars
 
     except Exception as exc:
         logger.error("yfinance historical error for %s: %s", symbol, exc)
+        if "rate limit" in str(exc).lower():
+            time.sleep(config.YFINANCE_REQUEST_DELAY_SECONDS * 3)
         return []
 
 
+def get_historical_bars_batch(
+    symbols: list[str],
+    start: date,
+    end: date,
+    interval: str = "1d",
+) -> dict[str, list[HistoricalBar]]:
+    """One yfinance round-trip for many symbols — avoids per-ticker rate limits."""
+    symbols = sorted({s.upper() for s in symbols if s})
+    if not symbols:
+        return {}
+
+    result: dict[str, list[HistoricalBar]] = {}
+    missing: list[str] = []
+    for sym in symbols:
+        key = _hist_cache_key(sym, start, end, interval)
+        cached = _cached_bars(key)
+        if cached is not None:
+            result[sym] = cached
+        else:
+            missing.append(sym)
+
+    if not missing:
+        return result
+
+    if config.IBKR_ENABLED:
+        still_missing: list[str] = []
+        for sym in missing:
+            ibkr_bars = _fetch_hist_ibkr(sym, start, end, interval)
+            if ibkr_bars:
+                key = _hist_cache_key(sym, start, end, interval)
+                _store_bars(key, ibkr_bars)
+                result[sym] = ibkr_bars
+            else:
+                still_missing.append(sym)
+        missing = still_missing
+
+    if not missing:
+        return result
+
+    chunk_size = 5
+    for i in range(0, len(missing), chunk_size):
+        chunk = missing[i : i + chunk_size]
+        _download_hist_chunk(chunk, start, end, interval, result)
+
+    return result
+
+
+def _download_hist_chunk(
+    symbols: list[str],
+    start: date,
+    end: date,
+    interval: str,
+    result: dict[str, list[HistoricalBar]],
+) -> None:
+    """Download a small symbol chunk with throttle + per-symbol fallback."""
+    for attempt in range(2):
+        try:
+            _throttle_yfinance()
+            df = yf.download(
+                symbols,
+                start=start.isoformat(),
+                end=(end + timedelta(days=1)).isoformat(),
+                interval=interval,
+                auto_adjust=True,
+                group_by="ticker",
+                progress=False,
+                session=_yf_session,
+            )
+            if df.empty:
+                raise ValueError("empty dataframe")
+
+            for sym in symbols:
+                bars: list[HistoricalBar] = []
+                if len(symbols) == 1:
+                    sub = df
+                else:
+                    if sym not in df.columns.get_level_values(0):
+                        continue
+                    sub = df[sym].dropna(how="all")
+                for ts, row in sub.iterrows():
+                    if row.isna().all():
+                        continue
+                    vol = row.get("Volume", 0)
+                    bars.append(
+                        HistoricalBar(
+                            date=ts.date(),
+                            open=Decimal(str(round(row["Open"], 4))),
+                            high=Decimal(str(round(row["High"], 4))),
+                            low=Decimal(str(round(row["Low"], 4))),
+                            close=Decimal(str(round(row["Close"], 4))),
+                            volume=int(vol) if vol == vol else 0,
+                        )
+                    )
+                key = _hist_cache_key(sym, start, end, interval)
+                _store_bars(key, bars)
+                result[sym] = bars
+            logger.info("Batch fetched history for %d symbols via yfinance", len(symbols))
+            return
+        except Exception as exc:
+            logger.warning("yfinance chunk %s attempt %d: %s", symbols, attempt + 1, exc)
+            if "rate limit" in str(exc).lower():
+                time.sleep(config.YFINANCE_REQUEST_DELAY_SECONDS * (attempt + 2))
+
+    # Per-symbol fallback when batch fails
+    for sym in symbols:
+        if sym in result:
+            continue
+        bars = get_historical_bars(sym, start, end, interval)
+        result[sym] = bars
+
+
 # ---------------------------------------------------------------------------
-# IBKR implementation (placeholder - requires gateway running)
+# IBKR quotes (snapshot batch, then position price fallback)
 # ---------------------------------------------------------------------------
 
 def _fetch_quote_ibkr(symbol: str) -> Optional[PriceQuote]:
-    """Fetch a live price quote from IBKR via Pangolin."""
+    """Fetch live price from IBKR; bounded by snapshot poll settings (~4s max)."""
     from services.ibkr_client import ibkr_client
 
-    conid = ibkr_client.get_conid(symbol)
-    if conid is None:
-        logger.warning("IBKR: could not find conid for %s, falling back to yfinance", symbol)
-        return None
+    sym = symbol.upper()
+    price: Optional[float] = None
 
-    snap = ibkr_client.get_market_snapshot(conid)
-    if snap is None:
-        logger.warning("IBKR: no snapshot for %s (conid=%s)", symbol, conid)
-        return None
+    conid = ibkr_client.get_conid(sym)
+    if conid is not None:
+        batch = ibkr_client.get_market_snapshot_batch([conid])
+        price = batch.get(conid)
 
-    # Field 31 = last price
-    raw_price = snap.get("31")
-    if raw_price is None:
-        logger.warning("IBKR: snapshot for %s has no price field", symbol)
-        return None
+    if price is None:
+        price = ibkr_client.get_price_from_positions(sym)
 
-    try:
-        price = Decimal(str(raw_price))
-    except Exception:
+    if price is None:
+        logger.debug("IBKR: no price for %s (conid=%s)", sym, conid)
         return None
 
     quote = PriceQuote(
-        symbol=symbol,
-        price=price,
-        change=None,       # snapshot doesn't include change; would need prev close
+        symbol=sym,
+        price=Decimal(str(round(price, 4))),
+        change=None,
         change_pct=None,
         previous_close=None,
         source="ibkr",
         as_of=datetime.utcnow(),
     )
-    _store_quote(symbol, quote)
-    logger.debug("IBKR price for %s: %s", symbol, price)
+    _store_quote(sym, quote)
+    logger.debug("quote_source=ibkr symbol=%s price=%s", sym, price)
     return quote
 
 
@@ -179,8 +362,7 @@ def _fetch_quote_ibkr(symbol: str) -> Optional[PriceQuote]:
 def get_quote(symbol: str) -> Optional[PriceQuote]:
     """
     Get current price for a symbol.
-    Uses IBKR if gateway is enabled, otherwise falls back to yfinance.
-    Results are cached for PRICE_CACHE_TTL_SECONDS.
+    Uses IBKR when enabled, otherwise yfinance. Results cached briefly.
     """
     cached = _cached_quote(symbol)
     if cached:
@@ -191,9 +373,12 @@ def get_quote(symbol: str) -> Optional[PriceQuote]:
         quote = _fetch_quote_ibkr(symbol)
         if quote:
             return quote
-        logger.warning("IBKR quote failed for %s, falling back to yfinance", symbol)
+        logger.debug("quote_source=yfinance symbol=%s reason=ibkr_miss", symbol.upper())
 
-    return _fetch_quote_yfinance(symbol)
+    quote = _fetch_quote_yfinance(symbol)
+    if quote:
+        logger.debug("quote_source=yfinance symbol=%s", symbol.upper())
+    return quote
 
 
 def get_spy_history(start: date, end: date) -> list[HistoricalBar]:

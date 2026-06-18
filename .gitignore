@@ -13,3 +13,5 @@ questdb-data/
 ibkr-gateway/conf.yaml
 ibkr-gateway/clientportal.gw/
 ibkr-gateway/conf.yaml
+
+.cursor/

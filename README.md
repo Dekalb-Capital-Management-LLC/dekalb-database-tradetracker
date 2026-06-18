@@ -31,7 +31,7 @@ dekalb-database/
 │   │   │   ├── market.py       # /market/*
 │   │   │   └── ibkr.py         # /ibkr/*
 │   │   ├── services/
-│   │   │   ├── ibkr_client.py       # IBKR Client Portal Gateway client
+│   │   │   ├── ibkr_client.py       # IBKR OAuth cloud API client
 │   │   │   ├── market_data.py       # yfinance (IBKR when gateway is on)
 │   │   │   ├── portfolio_metrics.py # beta, std dev, sharpe, alpha
 │   │   │   └── fidelity_parser.py   # Fidelity CSV parser
@@ -90,7 +90,8 @@ open http://localhost:8080
 | QuestDB | 9000 | Time-series DB (quant team only) |
 | Adminer | 8080 | DB GUI |
 | Ingestion Service | 5555 | ZMQ listener (quant team) |
-| IBKR Gateway | 5001 | Client Portal Gateway (runs on host, not in Docker) |
+
+> **IBKR:** Primary integration is OAuth cloud API (`api.ibkr.com`) via `.env` — no desktop gateway required. See [IBKR OAuth Setup](#ibkr-oauth-cloud-api-setup) below. Legacy Client Portal Gateway (port 5001) is optional for local dev only.
 
 ---
 
@@ -108,82 +109,87 @@ open http://localhost:8080
 | `PATCH /trades/{id}/label` | Label a trade |
 | `POST /import/fidelity` | Upload Fidelity CSV |
 | `GET /market/quote/{symbol}` | Current price (yfinance or IBKR) |
-| `GET /ibkr/status` | Gateway connection status |
+| `GET /ibkr/status` | OAuth connection + positions probe |
 | `GET /ibkr/account` | Live NAV + balances from IBKR |
-| `GET /ibkr/positions` | Live open positions from IBKR |
-| `POST /ibkr/sync/trades` | Pull last 24h of IBKR fills into trades table |
+| `GET /ibkr/positions` | Live open positions from IBKR (no DB sync) |
+| `POST /ibkr/sync/trades` | Import IBKR buy/sell history into `trades` table |
+
+**Automation:** `snapshot-cron` calls `POST /portfolio/snapshots/generate` hourly. Trade sync runs once on API startup (OAuth) and via `POST /ibkr/sync/trades` or the Trades page "Sync IBKR" button.
 
 ---
 
-## IBKR Gateway Setup
+## IBKR OAuth Cloud API Setup
 
-The API works without IBKR — it falls back to **yfinance** for market prices. Enabling IBKR gives you live account data, position sync, and real-time prices.
+The trade tracker uses **IBKR's cloud Web API** (`api.ibkr.com`) with RSA key-based OAuth 2.0 — server-to-server, no browser login, no desktop gateway. When disabled, the API falls back to **yfinance** for quotes and historical data.
 
-### How it works
+### What works on OAuth
 
-The **IBKR Client Portal Gateway** is a small Java app you run on your machine. You log into it once via browser (username + password + 2FA), and it keeps a session alive. The API talks to it at `https://localhost:5001`.
+| Capability | Source |
+|---|---|
+| Live positions, NAV, unrealized P&L | `/portfolio/*` endpoints |
+| Trade history import | `/pa/transactions` (Portfolio Analyst) |
+| Quotes for held symbols | Portfolio `mktPrice` (snapshot fallback when iserver unavailable) |
+| Historical charts / SPY benchmark | yfinance |
 
-### Step-by-step
+### 1. Register OAuth app with IBKR
 
-**1. Download the gateway**
+Obtain from your IBKR account manager: `IBKR_CLIENT_ID`, `IBKR_CREDENTIAL`, RSA private key, and register your **public outbound IP** in the OAuth app settings.
 
-Go to: https://www.interactivebrokers.com/en/trading/ib-api.php
-
-Find "Client Portal API" and download the `.zip`. Unzip it into `ibkr-gateway/`:
-
-```
-ibkr-gateway/
-└── clientportal.gw/
-    └── root/
-        └── clientportal.gw.jar
-```
-
-**2. Copy the config**
+### 2. Configure `.env`
 
 ```bash
-cp ibkr-gateway/conf.yaml.example ibkr-gateway/conf.yaml
+cp .env.example .env
 ```
 
-Default settings work as-is (listens on port 5001).
-
-**3. Start the gateway**
-
-```bash
-cd ibkr-gateway/clientportal.gw
-bin/run.sh root/conf.yaml
-```
-
-Leave this terminal open.
-
-**4. Authenticate in your browser**
-
-Open `https://localhost:5001`. Your browser will warn about the self-signed cert — click through it. Log in with your IBKR username/password and complete 2FA.
-
-You'll see a confirmation page when it works. The session lasts ~24 hours. Repeat this step after it expires.
-
-**5. Set env vars in your .env file**
-
-```
+```env
 IBKR_ENABLED=true
-IBKR_ACCOUNT_ID=U1234567
+IBKR_ACCOUNT_ID=U1234567          # client account (U*), not FA master (F*)
+IBKR_CLIENT_ID=your-client-id
+IBKR_CLIENT_KEY_ID=main
+IBKR_CREDENTIAL=your-credential
+IBKR_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+IBKR_SERVER_IP=203.0.113.10       # your machine's public IP (see below)
+IBKR_API_BASE_URL=https://api.ibkr.com
 ```
 
-Your account ID is on the IBKR homepage after login (top right), format: `U` followed by digits.
+### 3. IP pinning (`IBKR_SERVER_IP`)
 
-**6. Restart the API**
+IBKR ties OAuth sessions to your outbound IP. Set `IBKR_SERVER_IP` to the IP registered in the IBKR portal.
+
+| Environment | What to use |
+|---|---|
+| Local dev | Your home public IP (`curl https://api.ipify.org`) |
+| Railway / cloud | Static outbound IP (Railway Pro plan) |
+
+On IP change: update IBKR OAuth app settings, update `.env`, restart `trade-tracker`.
+
+The API logs a warning at startup if detected IP ≠ configured IP.
+
+### 4. Start and verify
 
 ```bash
-docker compose up --build trade-tracker
+docker compose up --build postgres trade-tracker trade-tracker-frontend
 ```
-
-**7. Verify**
 
 ```bash
 curl http://localhost:8000/ibkr/status
-# {"enabled": true, "connected": true, "authenticated": true, ...}
+# oauth_connected: true, positions_count: 16, ...
+
+curl http://localhost:8000/ibkr/positions
+curl http://localhost:8000/ibkr/account
+curl -X POST http://localhost:8000/ibkr/sync/trades
 ```
 
-> **Docker note:** The gateway runs on your host machine. Docker reaches it via `host.docker.internal:5001`, which is already configured in `docker-compose.yml`. No extra steps needed.
+### Production (Railway)
+
+- Set all OAuth env vars in Railway dashboard
+- Use static outbound IP; set `IBKR_SERVER_IP` to match
+- `IBKR_ENABLED=true` is safe when `/ibkr/positions` returns data
+- Quotes for symbols you don't hold still use yfinance until iserver market data is fully available
+
+### Legacy: Client Portal Gateway (optional)
+
+For local development without OAuth credentials, you can still use the desktop Client Portal Gateway on port 5001. Leave `IBKR_CLIENT_ID` unset and set `IBKR_GATEWAY_URL`. This path is deprecated for production.
 
 ---
 
@@ -198,9 +204,13 @@ curl http://localhost:8000/ibkr/status
 
 ### From IBKR (live sync)
 
-Once the gateway is running and authenticated: `POST /ibkr/sync/trades`
+Trades import automatically on API startup when OAuth is enabled. To refresh manually:
 
-This pulls the last ~24h of fills. For older history, use IBKR Flex Queries and import the CSV.
+```bash
+curl -X POST http://localhost:8000/ibkr/sync/trades
+```
+
+Or use **Sync IBKR** on the Trades page. History comes from IBKR Portfolio Analyst (`/pa/transactions`, up to ~2 years per symbol). Positions are live-read via `GET /ibkr/positions` — not stored in the database.
 
 ---
 

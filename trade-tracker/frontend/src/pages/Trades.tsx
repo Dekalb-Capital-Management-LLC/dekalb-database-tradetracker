@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import type { Trade, TradeLabel } from '../types'
-import { get, patch } from '../api/client'
+import { get, patch, post } from '../api/client'
 import LabelBadge from '../components/LabelBadge'
 
 const LABELS: TradeLabel[] = ['event-driven', 'hedge', 'long-term', 'short-term', 'unclassified']
@@ -23,6 +23,7 @@ export default function Trades() {
 
   // Label editor
   const [editingId, setEditingId] = useState<number | null>(null)
+  const [syncing, setSyncing] = useState(false)
   const popoverRef = useRef<HTMLDivElement>(null)
 
   const fetchTrades = useCallback(() => {
@@ -44,6 +45,19 @@ export default function Trades() {
   useEffect(() => {
     fetchTrades()
   }, [fetchTrades])
+
+  async function syncFromIbkr() {
+    setSyncing(true)
+    try {
+      await post('/ibkr/sync/trades')
+      fetchTrades()
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Sync failed'
+      setError(msg)
+    } finally {
+      setSyncing(false)
+    }
+  }
 
   // Close popover when clicking outside
   useEffect(() => {
@@ -70,7 +84,19 @@ export default function Trades() {
     <div className="p-6 max-w-screen-xl mx-auto">
       <div className="flex items-center justify-between mb-6">
         <h2 className="text-xl font-semibold text-white">Trade Log</h2>
-        <span className="text-xs text-gray-500">{trades.length} trades shown</span>
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-gray-500">
+            {syncing ? 'Syncing from IBKR…' : `${trades.length} trades shown`}
+          </span>
+          <button
+            type="button"
+            onClick={syncFromIbkr}
+            disabled={syncing}
+            className="text-xs px-2 py-1 rounded border border-gray-700 text-gray-400 hover:text-white hover:border-gray-500 disabled:opacity-50"
+          >
+            Sync IBKR
+          </button>
+        </div>
       </div>
 
       {/* Filters */}

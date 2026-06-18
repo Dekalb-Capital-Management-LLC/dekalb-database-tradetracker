@@ -100,9 +100,8 @@ services:
       - trade-tracker
 
   # ---------------------------------------------------------------
-  # Snapshot cron - runs POST /portfolio/snapshots/generate every hour
-  # Keeps the performance chart and metrics up to date automatically.
-  # Waits 60s on startup to give trade-tracker time to be ready.
+  # Snapshot cron — POST /portfolio/snapshots/generate every hour (NAV metrics).
+  # Trade sync — runs once on trade-tracker startup via OAuth; manual: POST /ibkr/sync/trades
   # ---------------------------------------------------------------
   snapshot-cron:
     image: alpine/curl
@@ -129,13 +128,15 @@ services:
     build: ./trade-tracker/api
     ports:
       - "8000:8000"
+    env_file:
+      - .env
     environment:
       - DB_HOST=postgres
       - POSTGRES_DB=trade_tracker     # equities team's isolated database
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
-      # IBKR Client Portal Gateway — see README for setup steps.
-      # Values come from your .env file. Defaults to disabled (yfinance fallback).
+  # Trade Tracker API — OAuth creds from .env (IBKR_CLIENT_ID, IBKR_PRIVATE_KEY, etc.)
+  # IBKR_ENABLED=false → yfinance fallback for quotes/history
       - IBKR_ENABLED=${IBKR_ENABLED:-false}
       - IBKR_GATEWAY_URL=https://host.docker.internal:5001
       - IBKR_ACCOUNT_ID=${IBKR_ACCOUNT_ID:-}

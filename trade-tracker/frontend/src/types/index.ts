@@ -92,3 +92,29 @@ export interface FidelityImport {
 export type Period = '1m' | '3m' | '6m' | 'ytd' | '1y'
 
 export type TradeLabel = 'event-driven' | 'hedge' | 'long-term' | 'short-term' | 'unclassified'
+
+export interface IBKRStatus {
+  enabled: boolean
+  mode?: 'disabled' | 'oauth' | 'gateway'
+  connected?: boolean
+  authenticated?: boolean
+  api_url?: string
+  account_id?: string
+  message?: string
+}
+
+export interface IBKRAccount {
+  account_id: string
+  total_nav: number | null
+  cash_balance: number | null
+  equity_value: number | null
+}
+
+export interface IBKRLivePosition {
+  symbol: string
+  quantity: number
+  market_price: number | null
+  market_value: number | null
+  avg_cost: number | null
+  unrealized_pnl: number | null
+}

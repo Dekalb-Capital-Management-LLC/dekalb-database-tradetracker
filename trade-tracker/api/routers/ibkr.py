@@ -5,10 +5,11 @@ Endpoints:
   GET  /ibkr/status         - Pangolin connection + IBKR auth status
   GET  /ibkr/account        - Live NAV, cash, equity from IBKR
   GET  /ibkr/positions      - Live open positions from IBKR
-  POST /ibkr/sync/trades    - Pull last ~24h of IBKR fills and insert new ones into DB
+  POST /ibkr/sync/trades    - Pull IBKR fills (PA history + recent) into DB
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -41,40 +42,277 @@ def _require_ibkr():
         )
 
 
-# ---------------------------------------------------------------------------
-# Status
-# ---------------------------------------------------------------------------
+def _parse_pa_trade(t: dict, sym_by_conid: dict[int, str]) -> Optional[dict]:
+    """Map IBKR Portfolio Analyst transaction to trades-table fields."""
+    tx_type = t.get("type")
+    if tx_type not in ("Buy", "Sell"):
+        return None
 
-@router.get("/status", summary="IBKR gateway connection and auth status")
+    raw_date = t.get("rawDate")
+    if not raw_date:
+        return None
+
+    try:
+        qty = Decimal(str(abs(float(t.get("qty", 0)))))
+        price = Decimal(str(t.get("pr", 0)))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if qty <= 0 or price <= 0:
+        return None
+
+    conid = int(t.get("conid", 0))
+    symbol = sym_by_conid.get(conid) or (t.get("desc") or "UNKNOWN").split()[0]
+    symbol = symbol.upper().strip()
+    side = "BUY" if tx_type == "Buy" else "SELL"
+
+    gross = (qty * price).quantize(Decimal("0.01"))
+    try:
+        amt = abs(Decimal(str(float(t.get("amt", 0)))))
+    except (InvalidOperation, TypeError, ValueError):
+        amt = gross
+    commission = max(Decimal("0"), (amt - gross).quantize(Decimal("0.01")))
+
+    if side == "BUY":
+        net = -(gross + commission)
+    else:
+        net = gross - commission
+
+    trade_date = datetime.strptime(str(raw_date), "%Y%m%d")
+    order_id = f"pa-{conid}-{raw_date}-{tx_type}-{qty}-{price}"
+
+    return {
+        "order_id": order_id,
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "price": price,
+        "commission": commission,
+        "gross": gross,
+        "net": net,
+        "trade_date": trade_date,
+        "raw": t,
+    }
+
+
+def _parse_iserver_trade(t: dict) -> Optional[dict]:
+    order_id = str(t.get("execution_id") or t.get("orderId") or "").strip()
+    if not order_id:
+        return None
+
+    raw_side = str(t.get("side", "")).upper()
+    side = "BUY" if raw_side in ("BOT", "BUY", "B") else "SELL"
+
+    try:
+        qty = Decimal(str(t.get("size") or t.get("quantity") or 0))
+        price = Decimal(str(t.get("price") or 0))
+        commission = Decimal(str(t.get("commission") or 0))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if qty <= 0 or price <= 0:
+        return None
+
+    gross = (qty * price).quantize(Decimal("0.01"))
+    if side == "BUY":
+        net = -(gross + commission)
+    else:
+        net = gross - commission
+
+    raw_time = t.get("trade_time") or t.get("tradeTime") or t.get("time")
+    if raw_time:
+        try:
+            trade_date = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+        except ValueError:
+            trade_date = datetime.utcnow()
+    else:
+        trade_date = datetime.utcnow()
+
+    symbol = (t.get("symbol") or t.get("ticker") or "").upper().strip()
+    if not symbol:
+        return None
+
+    return {
+        "order_id": order_id,
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "price": price,
+        "commission": commission,
+        "gross": gross,
+        "net": net,
+        "trade_date": trade_date,
+        "raw": t,
+    }
+
+
+async def _insert_trade(pool, parsed: dict) -> bool:
+    """Insert one trade; return True if inserted, False if skipped."""
+    order_id = parsed["order_id"]
+    existing = await pool.fetchval(
+        "SELECT id FROM trades WHERE ibkr_order_id = $1", order_id
+    )
+    if existing:
+        return False
+
+    await pool.execute(
+        """
+        INSERT INTO trades
+          (source, account_id, trade_date, symbol, side, quantity, price,
+           commission, gross_amount, net_amount, ibkr_order_id, raw_data)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        """,
+        "ibkr",
+        config.IBKR_ACCOUNT_ID,
+        parsed["trade_date"],
+        parsed["symbol"],
+        parsed["side"],
+        float(parsed["qty"]),
+        float(parsed["price"]),
+        float(parsed["commission"]),
+        float(parsed["gross"]),
+        float(parsed["net"]),
+        order_id,
+        json.dumps(parsed["raw"]) if isinstance(parsed["raw"], dict) else str(parsed["raw"]),
+    )
+    return True
+
+
+async def sync_ibkr_trades(pool) -> dict:
+    """Pull IBKR PA + iserver fills into trades table. Used by endpoint and startup."""
+    sym_by_conid = ibkr_client.position_symbol_map(config.IBKR_ACCOUNT_ID)
+    conids = list(sym_by_conid.keys()) or ibkr_client.position_conids(config.IBKR_ACCOUNT_ID)
+    symbols_synced = len(conids)
+
+    pa_trades = ibkr_client.get_all_pa_transactions(config.IBKR_ACCOUNT_ID, conids)
+    iserver_trades = ibkr_client.get_recent_trades(config.IBKR_ACCOUNT_ID)
+    total_from_ibkr = len(pa_trades) + len(iserver_trades)
+
+    if not pa_trades and not iserver_trades:
+        return {
+            "inserted": 0,
+            "skipped": 0,
+            "total_from_ibkr": 0,
+            "symbols_synced": symbols_synced,
+            "transactions_parsed": 0,
+            "transactions_inserted": 0,
+            "message": "No trades returned by IBKR",
+        }
+
+    inserted = 0
+    skipped = 0
+    parsed_count = 0
+    errors: list[str] = []
+
+    for t in pa_trades:
+        try:
+            parsed = _parse_pa_trade(t, sym_by_conid)
+            if not parsed:
+                skipped += 1
+                continue
+            parsed_count += 1
+            if await _insert_trade(pool, parsed):
+                inserted += 1
+            else:
+                skipped += 1
+        except Exception as exc:
+            msg = f"PA trade parse/insert error — {exc}"
+            logger.warning(msg)
+            errors.append(msg)
+            skipped += 1
+
+    for t in iserver_trades:
+        try:
+            parsed = _parse_iserver_trade(t)
+            if not parsed:
+                skipped += 1
+                continue
+            parsed_count += 1
+            if await _insert_trade(pool, parsed):
+                inserted += 1
+            else:
+                skipped += 1
+        except Exception as exc:
+            order_id = t.get("execution_id") or t.get("orderId") or "?"
+            msg = f"Trade {order_id}: {exc}"
+            logger.warning(msg)
+            errors.append(msg)
+            skipped += 1
+
+    logger.info(
+        "IBKR trade sync complete: inserted=%d skipped=%d errors=%d pa=%d iserver=%d",
+        inserted, skipped, len(errors), len(pa_trades), len(iserver_trades),
+    )
+    return {
+        "inserted": inserted,
+        "skipped": skipped,
+        "total_from_ibkr": total_from_ibkr,
+        "symbols_synced": symbols_synced,
+        "transactions_parsed": parsed_count,
+        "transactions_inserted": inserted,
+        "pa_transactions": len(pa_trades),
+        "iserver_trades": len(iserver_trades),
+        "errors": errors or None,
+    }
+
+
+@router.get("/status", summary="IBKR connection and auth status")
 def get_status():
     """
-    Check whether the IBKR Client Portal Gateway is reachable and the session is authenticated.
-    Safe to call even when IBKR is disabled — returns enabled=false instead of erroring.
+    Check IBKR connectivity. Safe when disabled — returns enabled=false.
+    OAuth mode: IBKR_CLIENT_ID set in env. Gateway mode: local Client Portal Gateway.
     """
     if not config.IBKR_ENABLED:
         return {
             "enabled": False,
-            "gateway_url": config.IBKR_GATEWAY_URL,
+            "mode": "disabled",
             "message": "Set IBKR_ENABLED=true and IBKR_ACCOUNT_ID to activate",
+        }
+
+    mode = "oauth" if config.IBKR_USE_OAUTH else "gateway"
+    api_url = config.IBKR_API_BASE_URL if config.IBKR_USE_OAUTH else config.IBKR_GATEWAY_URL
+
+    if config.IBKR_USE_OAUTH and not ibkr_client.is_connected:
+        return {
+            "enabled": True,
+            "mode": mode,
+            "connected": False,
+            "api_url": api_url,
+            "account_id": config.IBKR_ACCOUNT_ID or "not set",
+            "message": "OAuth session not established — check API startup logs",
         }
 
     auth = ibkr_client.auth_status()
     if auth is None:
         return {
             "enabled": True,
+            "mode": mode,
             "connected": False,
-            "gateway_url": config.IBKR_GATEWAY_URL,
-            "message": "Could not reach the IBKR gateway — is it running and authenticated?",
+            "api_url": api_url,
+            "account_id": config.IBKR_ACCOUNT_ID or "not set",
+            "message": (
+                "Could not reach IBKR OAuth API"
+                if config.IBKR_USE_OAUTH
+                else "Could not reach IBKR gateway — is it running and authenticated?"
+            ),
         }
+
+    oauth_connected = ibkr_client.is_connected if config.IBKR_USE_OAUTH else True
+    iserver_authenticated = auth.get("authenticated", False)
+    positions_count = 0
+    if config.IBKR_ACCOUNT_ID and oauth_connected:
+        positions_count = len(ibkr_client.get_positions(config.IBKR_ACCOUNT_ID))
 
     return {
         "enabled": True,
+        "mode": mode,
         "connected": True,
-        "authenticated": auth.get("authenticated", False),
+        "oauth_connected": oauth_connected,
+        "iserver_authenticated": iserver_authenticated,
+        "authenticated": iserver_authenticated,
         "competing": auth.get("competing", False),
-        "gateway_url": config.IBKR_GATEWAY_URL,
+        "api_url": api_url,
         "account_id": config.IBKR_ACCOUNT_ID or "not set",
-        "raw": auth,
+        "positions_count": positions_count,
+        "account_nav": ibkr_client.last_account_nav,
     }
 
 
@@ -154,112 +392,11 @@ def get_live_positions():
 # Trade sync
 # ---------------------------------------------------------------------------
 
-@router.post("/sync/trades", summary="Pull recent IBKR fills into the trades table")
+@router.post("/sync/trades", summary="Pull IBKR trade history into the trades table")
 async def sync_recent_trades(pool=Depends(get_pool)):
     """
-    Fetches the last ~24 hours of fills from IBKR and inserts any new ones
-    into the trades table. Existing trades are matched by ibkr_order_id and skipped.
-
-    Run this once per day (or after any trading session) to keep the trades table current.
-    For trade history older than 24h, use IBKR Flex Queries and the manual import endpoint.
+    Fetches buy/sell history from IBKR Portfolio Analyst (up to ~2y per holding)
+    plus recent iserver fills, then inserts new rows into trades.
     """
     _require_ibkr()
-
-    raw_trades = ibkr_client.get_recent_trades(config.IBKR_ACCOUNT_ID)
-    if not raw_trades:
-        return {"inserted": 0, "skipped": 0, "total_from_ibkr": 0, "message": "No recent trades returned by IBKR"}
-
-    inserted = 0
-    skipped = 0
-    errors = []
-
-    for t in raw_trades:
-        # IBKR uses 'execution_id' or 'orderId' depending on endpoint version
-        order_id = str(t.get("execution_id") or t.get("orderId") or "").strip()
-        if not order_id:
-            skipped += 1
-            continue
-
-        # Skip if already imported
-        existing = await pool.fetchval(
-            "SELECT id FROM trades WHERE ibkr_order_id = $1", order_id
-        )
-        if existing:
-            skipped += 1
-            continue
-
-        try:
-            # IBKR side: "BOT" = buy, "SLD" = sell
-            raw_side = str(t.get("side", "")).upper()
-            side = "BUY" if raw_side in ("BOT", "BUY", "B") else "SELL"
-
-            qty = Decimal(str(t.get("size") or t.get("quantity") or 0))
-            price = Decimal(str(t.get("price") or 0))
-            commission = Decimal(str(t.get("commission") or 0))
-
-            gross = (qty * price).quantize(Decimal("0.01"))
-            # net_amount: positive = money out (buy), negative = money in (sell)
-            if side == "BUY":
-                net = -(gross + commission)
-            else:
-                net = gross - commission
-
-            # Trade timestamp — try multiple field names IBKR uses
-            raw_time = t.get("trade_time") or t.get("tradeTime") or t.get("time")
-            if raw_time:
-                try:
-                    trade_date = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
-                except ValueError:
-                    trade_date = datetime.utcnow()
-            else:
-                trade_date = datetime.utcnow()
-
-            symbol = (t.get("symbol") or t.get("ticker") or "").upper().strip()
-            if not symbol:
-                errors.append(f"Trade {order_id}: missing symbol, skipped")
-                skipped += 1
-                continue
-
-            await pool.execute(
-                """
-                INSERT INTO trades
-                  (source, account_id, trade_date, symbol, side, quantity, price,
-                   commission, gross_amount, net_amount, ibkr_order_id, raw_data)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                """,
-                "ibkr",
-                config.IBKR_ACCOUNT_ID,
-                trade_date,
-                symbol,
-                side,
-                float(qty),
-                float(price),
-                float(commission),
-                float(gross),
-                float(net),
-                order_id,
-                str(t),  # store raw dict as string for audit trail
-            )
-            inserted += 1
-
-        except (InvalidOperation, ValueError) as exc:
-            msg = f"Trade {order_id}: parse error — {exc}"
-            logger.warning(msg)
-            errors.append(msg)
-            skipped += 1
-        except Exception as exc:
-            msg = f"Trade {order_id}: DB error — {exc}"
-            logger.error(msg)
-            errors.append(msg)
-            skipped += 1
-
-    logger.info(
-        "IBKR trade sync complete: inserted=%d skipped=%d errors=%d",
-        inserted, skipped, len(errors),
-    )
-    return {
-        "inserted": inserted,
-        "skipped": skipped,
-        "total_from_ibkr": len(raw_trades),
-        "errors": errors or None,
-    }
+    return await sync_ibkr_trades(pool)

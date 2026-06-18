@@ -12,14 +12,16 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Optional
 
 import asyncpg
 
+import config
 from models.schemas import PerformancePoint, PortfolioMetrics
-from services.market_data import get_spy_history
+from services.market_data import get_historical_bars, get_historical_bars_batch, get_spy_history
 
 logger = logging.getLogger(__name__)
 
@@ -202,10 +204,119 @@ async def get_performance_series(
     account_id: Optional[str] = None,
 ) -> list[PerformancePoint]:
     rows = await _fetch_snapshots(pool, start, end, account_id)
+    if rows:
+        return _performance_from_snapshots(rows)
+
+    acct = account_id or config.IBKR_ACCOUNT_ID
+
+    if config.IBKR_ENABLED and config.IBKR_ACCOUNT_ID:
+        if not account_id or account_id == config.IBKR_ACCOUNT_ID:
+            ibkr_pts = _ibkr_performance_series(start, end)
+            if ibkr_pts:
+                return ibkr_pts
+
+    if acct:
+        trade_pts = await _trades_performance_series(pool, acct, start, end)
+        if trade_pts:
+            return trade_pts
+
+    return []
+
+
+async def _trades_performance_series(
+    pool: asyncpg.Pool,
+    account_id: str,
+    start: date,
+    end: date,
+) -> list[PerformancePoint]:
+    """
+    Replay synced trades to rebuild daily holdings, then mark-to-market via yfinance.
+    More accurate than applying current share counts across history.
+    """
+    rows = await pool.fetch(
+        """
+        SELECT symbol, side, quantity, price, commission, trade_date
+        FROM trades
+        WHERE account_id = $1 AND trade_date::date <= $2
+        ORDER BY trade_date, id
+        """,
+        account_id,
+        end,
+    )
     if not rows:
         return []
 
-    # Build cumulative returns from first day
+    symbols = sorted({r["symbol"].upper() for r in rows})
+    spy_bars = get_spy_history(start, end)
+    if not spy_bars:
+        logger.warning("No SPY history for performance series")
+        return []
+
+    batch = get_historical_bars_batch(symbols, start, end)
+    closes: dict[str, dict[date, float]] = {
+        sym: {b.date: float(b.close) for b in batch.get(sym, [])}
+        for sym in symbols
+    }
+
+    holdings: dict[str, float] = defaultdict(float)
+    cash = 0.0
+    trade_idx = 0
+    points: list[PerformancePoint] = []
+    spy_base = float(spy_bars[0].close)
+    prev_port: Optional[float] = None
+    base_port: Optional[float] = None
+
+    for bar in spy_bars:
+        d = bar.date
+        while trade_idx < len(rows):
+            t = rows[trade_idx]
+            td = t["trade_date"].date() if hasattr(t["trade_date"], "date") else t["trade_date"]
+            if td > d:
+                break
+            sym = t["symbol"].upper()
+            qty = float(t["quantity"])
+            price = float(t["price"])
+            commission = float(t["commission"] or 0)
+            if t["side"] == "BUY":
+                cash -= qty * price + commission
+                holdings[sym] += qty
+            else:
+                cash += qty * price - commission
+                holdings[sym] -= qty
+            trade_idx += 1
+
+        equity = sum(
+            holdings[sym] * closes[sym][d]
+            for sym in holdings
+            if holdings[sym] > 0 and d in closes.get(sym, {})
+        )
+        port_val = cash + equity
+        if port_val <= 0:
+            continue
+        if base_port is None:
+            base_port = port_val
+        port_cum = (port_val - base_port) / base_port * 100
+        spy_cum = (float(bar.close) - spy_base) / spy_base * 100
+        daily_pct = ((port_val - prev_port) / prev_port * 100) if prev_port else None
+        prev_port = port_val
+
+        points.append(
+            PerformancePoint(
+                date=d,
+                portfolio_nav=Decimal(str(round(port_val, 2))),
+                portfolio_pct_change=Decimal(str(round(daily_pct, 6))) if daily_pct is not None else None,
+                spy_pct_change=None,
+                spy_cumulative_pct=Decimal(str(round(spy_cum, 4))),
+                portfolio_cumulative_pct=Decimal(str(round(port_cum, 4))),
+            )
+        )
+
+    logger.info("Built %d performance points from trade replay for %s", len(points), account_id)
+    return points
+
+
+def _performance_from_snapshots(rows: list) -> list[PerformancePoint]:
+    """Build cumulative returns from stored NAV snapshots."""
     base_nav = float(rows[0]["total_nav"])
     points: list[PerformancePoint] = []
     spy_base: Optional[float] = None
@@ -213,10 +324,8 @@ async def get_performance_series(
     for i, row in enumerate(rows):
         nav = float(row["total_nav"])
         port_cum = ((nav - base_nav) / base_nav * 100) if base_nav else None
-
         spy_daily = float(row["spy_daily_pct"]) if row["spy_daily_pct"] else None
 
-        # Accumulate SPY cumulative return
         if i == 0:
             spy_cum = 0.0
             spy_base = float(row["spy_close"]) if row["spy_close"] else None
@@ -236,6 +345,66 @@ async def get_performance_series(
                 spy_pct_change=Decimal(str(round(spy_daily, 6))) if spy_daily is not None else None,
                 spy_cumulative_pct=Decimal(str(round(spy_cum, 4))) if spy_cum is not None else None,
                 portfolio_cumulative_pct=Decimal(str(round(port_cum, 4))) if port_cum is not None else None,
+            )
+        )
+    return points
+
+
+def _ibkr_performance_series(start: date, end: date) -> list[PerformancePoint]:
+    """
+    ponytail: backfill chart from IBKR holdings + yfinance daily closes.
+    Uses current share counts across the period (approximation until trades sync fills history).
+    """
+    from services.ibkr_client import ibkr_client
+
+    if not ibkr_client.is_connected:
+        return []
+
+    positions = ibkr_client.live_positions(config.IBKR_ACCOUNT_ID)
+    if not positions:
+        return []
+
+    symbols = [p["symbol"].upper().split()[0] for p in positions]
+    batch = get_historical_bars_batch(symbols + [config.BENCHMARK_SYMBOL], start, end)
+    spy_bars = batch.get(config.BENCHMARK_SYMBOL.upper(), []) or get_spy_history(start, end)
+    if not spy_bars:
+        return []
+
+    closes: dict[str, dict[date, float]] = {
+        sym.upper(): {b.date: float(b.close) for b in batch.get(sym.upper(), [])}
+        for sym in symbols
+    }
+    qty_by_sym = {p["symbol"].upper(): float(p["quantity"]) for p in positions}
+
+    points: list[PerformancePoint] = []
+    base_port: Optional[float] = None
+    spy_base = float(spy_bars[0].close)
+    prev_port: Optional[float] = None
+
+    for bar in spy_bars:
+        d = bar.date
+        port_val = sum(
+            closes[sym][d] * qty
+            for sym, qty in qty_by_sym.items()
+            if d in closes.get(sym, {})
+        )
+        if port_val <= 0:
+            continue
+        if base_port is None:
+            base_port = port_val
+        port_cum = (port_val - base_port) / base_port * 100
+        spy_cum = (float(bar.close) - spy_base) / spy_base * 100
+        daily_pct = ((port_val - prev_port) / prev_port * 100) if prev_port else None
+        prev_port = port_val
+
+        points.append(
+            PerformancePoint(
+                date=d,
+                portfolio_nav=Decimal(str(round(port_val, 2))),
+                portfolio_pct_change=Decimal(str(round(daily_pct, 6))) if daily_pct is not None else None,
+                spy_pct_change=None,
+                spy_cumulative_pct=Decimal(str(round(spy_cum, 4))),
+                portfolio_cumulative_pct=Decimal(str(round(port_cum, 4))),
             )
         )
     return points
@@ -262,6 +431,70 @@ def _period_bounds(period: str) -> tuple[date, date]:
     return start, today
 
 
+def _ibkr_period_metrics(period: str) -> PortfolioMetrics:
+    """
+    ponytail: no snapshots yet — estimate period return from IBKR live prices
+    vs yfinance price at period start. SPY benchmark from same window.
+    """
+    from services.ibkr_client import ibkr_client
+
+    acct = config.IBKR_ACCOUNT_ID
+    if not ibkr_client.is_connected:
+        return PortfolioMetrics(
+            period=period, beta=None, std_dev_annualized=None, sharpe_ratio=None,
+            total_return_pct=None, spy_return_pct=None, alpha=None,
+            max_drawdown_pct=None, win_rate=None, as_of=datetime.utcnow(),
+        )
+
+    start, end = _period_bounds(period)
+    positions = ibkr_client.live_positions(acct)
+    if not positions:
+        return PortfolioMetrics(
+            period=period, beta=None, std_dev_annualized=None, sharpe_ratio=None,
+            total_return_pct=None, spy_return_pct=None, alpha=None,
+            max_drawdown_pct=None, win_rate=None, as_of=datetime.utcnow(),
+        )
+
+    value_now = sum(p["market_value"] for p in positions)
+    symbols = [p["symbol"] for p in positions]
+    history = get_historical_bars_batch(
+        symbols + [config.BENCHMARK_SYMBOL], start, end
+    )
+
+    value_then = 0.0
+    for p in positions:
+        bars = history.get(p["symbol"].upper(), [])
+        if bars:
+            value_then += float(bars[0].close) * p["quantity"]
+        else:
+            value_then += p["cost_basis"]  # fallback: flat if no history
+
+    total_return = ((value_now - value_then) / value_then * 100) if value_then > 0 else None
+
+    spy_bars = history.get(config.BENCHMARK_SYMBOL.upper(), [])
+    spy_return = None
+    if len(spy_bars) >= 2:
+        first, last = float(spy_bars[0].close), float(spy_bars[-1].close)
+        if first > 0:
+            spy_return = (last - first) / first * 100
+
+    def _dec(v: Optional[float]) -> Optional[Decimal]:
+        return Decimal(str(round(v, 4))) if v is not None else None
+
+    return PortfolioMetrics(
+        period=period,
+        beta=None,
+        std_dev_annualized=None,
+        sharpe_ratio=None,
+        total_return_pct=_dec(total_return),
+        spy_return_pct=_dec(spy_return),
+        alpha=None,
+        max_drawdown_pct=None,
+        win_rate=None,
+        as_of=datetime.utcnow(),
+    )
+
+
 async def calculate_metrics(
     pool: asyncpg.Pool,
     period: str = "ytd",
@@ -271,6 +504,8 @@ async def calculate_metrics(
     rows = await _fetch_snapshots(pool, start, end, account_id)
 
     if len(rows) < 2:
+        if config.IBKR_ENABLED and config.IBKR_ACCOUNT_ID and not account_id:
+            return _ibkr_period_metrics(period)
         return PortfolioMetrics(
             period=period,
             beta=None,
