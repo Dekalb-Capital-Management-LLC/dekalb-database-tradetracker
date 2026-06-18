@@ -359,9 +359,9 @@ def _fetch_quote_ibkr(symbol: str) -> Optional[PriceQuote]:
 # Public interface
 # ---------------------------------------------------------------------------
 
-def get_quote(symbol: str) -> Optional[PriceQuote]:
+def _fetch_quote(symbol: str) -> Optional[PriceQuote]:
     """
-    Get current price for a symbol.
+    Get current price for a symbol (sync).
     Uses IBKR when enabled, otherwise yfinance. Results cached briefly.
     """
     cached = _cached_quote(symbol)
@@ -379,6 +379,19 @@ def get_quote(symbol: str) -> Optional[PriceQuote]:
     if quote:
         logger.debug("quote_source=yfinance symbol=%s", symbol.upper())
     return quote
+
+
+# Async API used by routers (main branch compatibility)
+async def warm_quote_cache(pool, symbols: list[str]) -> None:
+    """Pre-fetch quotes for many symbols (sequential; uses IBKR/yfinance cache)."""
+    uncached = [s.upper() for s in symbols if s and not _cached_quote(s.upper())]
+    for sym in uncached:
+        _fetch_quote(sym)
+
+
+async def get_quote(pool, symbol: str) -> Optional[PriceQuote]:
+    """Async wrapper for routers — pool unused but kept for API compatibility."""
+    return _fetch_quote(symbol.upper())
 
 
 def get_spy_history(start: date, end: date) -> list[HistoricalBar]:

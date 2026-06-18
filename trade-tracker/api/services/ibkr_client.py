@@ -965,8 +965,26 @@ class IBKRClient:
 
         return out
 
+    def get_ledger(self, account_id: str) -> Optional[dict]:
+        """Per-currency balances from /portfolio/{id}/ledger."""
+        return self._get(f"/v1/api/portfolio/{account_id}/ledger")
 
-
+    def get_conids_batch(self, symbols: list[str]) -> dict[str, int]:
+        """Batch symbol → conid via /trsrv/stocks."""
+        if not symbols:
+            return {}
+        data = self._get("/v1/api/trsrv/stocks", params={"symbols": ",".join(symbols)})
+        if not data or not isinstance(data, dict):
+            return {}
+        out: dict[str, int] = {}
+        for sym in symbols:
+            try:
+                contracts = data.get(sym.upper(), [])
+                if contracts:
+                    out[sym.upper()] = int(contracts[0]["contracts"][0]["conid"])
+            except (KeyError, IndexError, TypeError, ValueError):
+                continue
+        return out
 
 
 ibkr_client = IBKRClient()

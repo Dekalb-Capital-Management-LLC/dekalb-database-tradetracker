@@ -2,24 +2,52 @@ interface MetricCardProps {
   label: string
   value: string | null
   subValue?: string | null
-  /** true = green, false = red, null/undefined = white (neutral) */
+  /** true = green, false = red, null/undefined = default dark */
   positive?: boolean | null
 }
 
 export default function MetricCard({ label, value, subValue, positive }: MetricCardProps) {
   const valueColor =
     positive == null
-      ? 'text-white'
+      ? '#1a2744'
       : positive
-      ? 'text-emerald-400'
-      : 'text-red-400'
+      ? '#16a34a'
+      : '#dc2626'
 
   return (
-    <div className="bg-gray-900 rounded-lg border border-gray-800 p-4">
-      <p className="text-xs text-gray-500 uppercase tracking-wider mb-1.5">{label}</p>
-      <p className={`text-xl font-semibold tabular-nums ${valueColor}`}>{value ?? '—'}</p>
+    <div
+      style={{
+        backgroundColor: '#ffffff',
+        border: '1px solid #d0dce8',
+        borderRadius: 10,
+        padding: '16px 18px',
+      }}
+    >
+      <p
+        style={{
+          fontSize: 11,
+          letterSpacing: '0.06em',
+          textTransform: 'uppercase',
+          color: '#6b7a99',
+          marginBottom: 6,
+          fontWeight: 500,
+        }}
+      >
+        {label}
+      </p>
+      <p
+        style={{
+          fontSize: 22,
+          fontWeight: 700,
+          color: valueColor,
+          fontVariantNumeric: 'tabular-nums',
+          lineHeight: 1.2,
+        }}
+      >
+        {value ?? '—'}
+      </p>
       {subValue != null && (
-        <p className="text-xs text-gray-500 mt-1">{subValue}</p>
+        <p style={{ fontSize: 11, color: '#9ca3af', marginTop: 4 }}>{subValue}</p>
       )}
     </div>
   )

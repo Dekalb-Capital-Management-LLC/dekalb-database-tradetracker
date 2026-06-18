@@ -1,6 +1,12 @@
+node_modules/
+trade-tracker/frontend/dist/
+.venv/
 __pycache__/
 *.pyc
 venv/
+# Node / frontend build artifacts — keep node_modules out of git & PR reviews
+node_modules/
+dist/
 postgres-data/
 questdb-data/
 .env

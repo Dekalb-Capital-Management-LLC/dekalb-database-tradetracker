@@ -1,0 +1,28 @@
+# FastAPI + server
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9
+
+# Database
+asyncpg==0.31.0
+
+# Spreadsheet parsing (CSV, XLSX, XLSM, XLS)
+pandas==3.0.1
+openpyxl==3.1.5
+xlrd==2.0.1
+
+# Data validation
+pydantic==2.13.3
+
+# Utilities
+python-dateutil==2.9.0
+requests==2.31.0
+yfinance>=0.2.40
+
+# IBKR OAuth (ibauth)
+ibauth>=0.1.0
+
+# Ingestion service
+pyzmq>=25.1.0
+questdb>=4.1.0
+python-dotenv>=1.0.0

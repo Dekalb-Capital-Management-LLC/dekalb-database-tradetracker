@@ -5,6 +5,7 @@ Endpoints:
   GET  /trades                  - paginated trade list with filters
   GET  /trades/{id}             - single trade detail
   PATCH /trades/{id}/label      - assign label + hedge flag
+  DELETE /trades/reset          - wipe all trades + snapshots (use before switching accounts)
 """
 from __future__ import annotations
 
@@ -25,6 +26,24 @@ logger = logging.getLogger(__name__)
 
 def get_pool():
     return db.get_pool()
+
+
+@router.delete("/reset", summary="Wipe all trades and portfolio snapshots")
+async def reset_all_data(pool=Depends(get_pool)):
+    """
+    Deletes all rows from trades and portfolio_snapshots.
+    Use this when switching from a paper/test account to live.
+    """
+    try:
+        await pool.execute("DELETE FROM trades")
+        await pool.execute("DELETE FROM portfolio_snapshots")
+        await pool.execute("DELETE FROM imported_positions")
+        await pool.execute("DELETE FROM fidelity_imports")
+        logger.info("Data reset: all trades and snapshots cleared")
+        return {"message": "All trades and snapshots deleted.", "trades_remaining": trade_count}
+    except Exception as exc:
+        logger.error("reset error: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Reset failed: {exc}")
 
 
 @router.get("", response_model=list[TradeResponse])

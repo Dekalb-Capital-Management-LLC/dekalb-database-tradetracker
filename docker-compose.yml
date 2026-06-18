@@ -100,8 +100,11 @@ services:
       - trade-tracker
 
   # ---------------------------------------------------------------
-  # Snapshot cron — POST /portfolio/snapshots/generate every hour (NAV metrics).
-  # Trade sync — runs once on trade-tracker startup via OAuth; manual: POST /ibkr/sync/trades
+  # Cron - runs every hour:
+  #   1. POST /portfolio/snapshots/generate  — keeps NAV history up to date
+  #   2. POST /ibkr/sync/trades              — pulls new IBKR fills automatically
+  #      (no-ops gracefully if IBKR is not connected)
+  # Waits 60s on startup to give trade-tracker time to be ready.
   # ---------------------------------------------------------------
   snapshot-cron:
     image: alpine/curl
@@ -109,11 +112,14 @@ services:
       - trade-tracker
     restart: unless-stopped
     entrypoint: >
-      sh -c "echo 'Snapshot cron starting, waiting 60s for API...' &&
+      sh -c "echo 'Cron starting, waiting 60s for API...' &&
              sleep 60 &&
              while true; do
-               echo \"[snapshot-cron] $$(date) — generating snapshot...\";
+               echo \"[cron] $$(date) — generating portfolio snapshot...\";
                curl -s -X POST http://trade-tracker:8000/portfolio/snapshots/generate | head -c 200;
+               echo '';
+               echo \"[cron] $$(date) — syncing IBKR trades...\";
+               curl -s -X POST http://trade-tracker:8000/ibkr/sync/trades | head -c 200;
                echo '';
                sleep 3600;
              done"
@@ -125,21 +131,31 @@ services:
   # Health check: http://localhost:8000/health
   # ---------------------------------------------------------------
   trade-tracker:
-    build: ./trade-tracker/api
+    build:
+      context: .
+      dockerfile: trade-tracker/api/Dockerfile
     ports:
       - "8000:8000"
     env_file:
       - .env
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     environment:
       - DB_HOST=postgres
       - POSTGRES_DB=trade_tracker     # equities team's isolated database
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
-  # Trade Tracker API — OAuth creds from .env (IBKR_CLIENT_ID, IBKR_PRIVATE_KEY, etc.)
-  # IBKR_ENABLED=false → yfinance fallback for quotes/history
+      # IBKR Web API (RSA key-based, server-to-server — no login page)
+      # Values come from your .env file. Defaults to disabled (yfinance fallback).
       - IBKR_ENABLED=${IBKR_ENABLED:-false}
-      - IBKR_GATEWAY_URL=https://host.docker.internal:5001
+      - IBKR_CLIENT_ID=${IBKR_CLIENT_ID:-}
+      - IBKR_CLIENT_KEY_ID=${IBKR_CLIENT_KEY_ID:-}
+      - IBKR_CREDENTIAL=${IBKR_CREDENTIAL:-}
       - IBKR_ACCOUNT_ID=${IBKR_ACCOUNT_ID:-}
+      - IBKR_SERVER_IP=${IBKR_SERVER_IP:-}
+      - IBKR_PRIVATE_KEY=${IBKR_PRIVATE_KEY:-}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
       # Tune as needed
       - PRICE_CACHE_TTL_SECONDS=60
       - DEBUG=false
@@ -149,7 +165,8 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      # python:3.11-slim has no curl — use urllib instead
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

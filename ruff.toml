@@ -1,0 +1,12 @@
+# Ruff config for the Python halves (trade-tracker/api + ingestion-service).
+# Lint runs in CI (.github/workflows/ci.yml). Currently non-blocking while the
+# existing lint debt is worked down — see docs/REPO_AUDIT.md.
+target-version = "py311"
+line-length = 100
+
+exclude = [
+    ".venv",
+    "postgres-data",
+    "questdb-data",
+    "**/node_modules",
+]
