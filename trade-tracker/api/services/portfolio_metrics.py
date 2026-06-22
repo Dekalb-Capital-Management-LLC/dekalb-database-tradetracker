@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import statistics
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -48,19 +49,42 @@ def _std_dev(values: list[float]) -> float:
     return math.sqrt(_variance(values))
 
 
-def _covariance(x: list[float], y: list[float]) -> float:
-    if len(x) != len(y) or len(x) < 2:
-        return 0.0
-    mx, my = _mean(x), _mean(y)
-    return sum((xi - mx) * (yi - my) for xi, yi in zip(x, y)) / (len(x) - 1)
-
-
 def _beta(portfolio_returns: list[float], benchmark_returns: list[float]) -> Optional[float]:
-    var_bm = _variance(benchmark_returns)
-    if var_bm == 0:
+    """
+    Beta is the regression slope of portfolio returns on benchmark returns.
+
+    This is equivalent to Excel SLOPE(portfolio_returns, benchmark_returns)
+    and to covariance(portfolio, benchmark) / variance(benchmark), but using
+    the standard-library regression helper makes the intended calculation
+    explicit.
+    """
+    if len(portfolio_returns) != len(benchmark_returns) or len(portfolio_returns) < 2:
         return None
-    cov = _covariance(portfolio_returns, benchmark_returns)
-    return cov / var_bm
+    try:
+        regression = statistics.linear_regression(benchmark_returns, portfolio_returns)
+    except statistics.StatisticsError:
+        return None
+    return regression.slope
+
+
+def _paired_beta_returns(
+    points: list[PerformancePoint],
+) -> tuple[list[float], list[float]]:
+    """
+    Return date-aligned portfolio/benchmark daily returns for beta.
+
+    Missing benchmark values are common around market holidays or data outages.
+    Pairing values from the same performance point prevents returns from
+    different dates from being regressed against one another.
+    """
+    portfolio_returns: list[float] = []
+    benchmark_returns: list[float] = []
+    for point in points:
+        if point.portfolio_pct_change is None or point.spy_pct_change is None:
+            continue
+        portfolio_returns.append(float(point.portfolio_pct_change) / 100)
+        benchmark_returns.append(float(point.spy_pct_change) / 100)
+    return portfolio_returns, benchmark_returns
 
 
 def _max_drawdown(nav_series: list[float]) -> float:
@@ -916,12 +940,15 @@ async def _metrics_from_points(
         return _blank_metrics(period)
 
     start, end = _period_bounds(period)
-    port_daily = [float(p.portfolio_pct_change) / 100 for p in points if p.portfolio_pct_change is not None]
-    spy_daily = [float(p.spy_pct_change) / 100 for p in points if p.spy_pct_change is not None]
+    port_daily = [
+        float(point.portfolio_pct_change) / 100
+        for point in points
+        if point.portfolio_pct_change is not None
+    ]
     nav_series = [float(p.portfolio_nav) for p in points]
 
-    min_len = min(len(port_daily), len(spy_daily))
-    beta_val = _beta(port_daily[:min_len], spy_daily[:min_len])
+    paired_portfolio_returns, paired_benchmark_returns = _paired_beta_returns(points)
+    beta_val = _beta(paired_portfolio_returns, paired_benchmark_returns)
 
     std_dev_daily = _std_dev(port_daily)
     std_dev_annual = std_dev_daily * math.sqrt(252) * 100 if std_dev_daily else None
@@ -973,6 +1000,7 @@ async def calculate_metrics(
     if points:
         return await _metrics_from_points(pool, account_id, period, points)
     return _blank_metrics(period)
+
 
 
 async def _calculate_win_rate(
