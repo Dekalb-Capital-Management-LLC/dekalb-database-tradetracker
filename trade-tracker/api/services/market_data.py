@@ -19,6 +19,7 @@ import yfinance as yf
 
 import config
 from models.schemas import HistoricalBar, PriceQuote
+from services import first_rate_data
 
 # Spoof a browser User-Agent — Yahoo Finance blocks plain script/Docker requests
 _yf_session = requests.Session()
@@ -42,10 +43,40 @@ _last_yf_request_at: float = 0.0
 # common layer every quote path (get_quote, warm_quote_cache) funnels through,
 # so any caller is covered even if it forgets its own cash-symbol filter.
 CASH_SYMBOLS = {"XXCASH", "CASH", "SPAXX", "FDRXX", "FCASH"}
+FIRST_RATE_PROVIDER_NAMES = {"auto", "firstrate", "first_rate", "first-rate"}
 
 
 def is_cash_symbol(symbol: str) -> bool:
     return symbol.strip().upper().rstrip("*") in CASH_SYMBOLS
+
+
+def _use_first_rate_data() -> bool:
+    return config.MARKET_DATA_PROVIDER in FIRST_RATE_PROVIDER_NAMES
+
+
+def _first_rate_provider() -> first_rate_data.FirstRateDataProvider:
+    return first_rate_data.get_provider()
+
+
+def provider_status() -> dict:
+    provider = _first_rate_provider()
+    first_rate_configured = _use_first_rate_data() and provider.is_configured
+    provider_order = []
+    if first_rate_configured:
+        provider_order.append("firstrate")
+    if config.IBKR_ENABLED:
+        provider_order.append("ibkr")
+    provider_order.append("yfinance")
+    return {
+        "mode": config.MARKET_DATA_PROVIDER,
+        "active_provider": provider_order[0],
+        "provider_order": provider_order,
+        "firstrate_configured": first_rate_configured,
+        "firstrate_path": str(provider.data_path) if provider.data_path else None,
+        "ibkr_enabled": config.IBKR_ENABLED,
+        "cache_ttl_seconds": config.PRICE_CACHE_TTL_SECONDS,
+        "historical_cache_ttl_seconds": config.HISTORICAL_CACHE_TTL_SECONDS,
+    }
 
 
 def _cash_quote(symbol: str) -> PriceQuote:
@@ -189,6 +220,15 @@ def get_historical_bars(
     if cached is not None:
         return cached
 
+    if _use_first_rate_data():
+        provider = _first_rate_provider()
+        if provider.is_configured:
+            bars = provider.get_historical_bars(symbol, start, end, interval)
+            if bars:
+                _store_bars(key, bars)
+                logger.info("Fetched %d bars for %s via FirstRateData", len(bars), symbol)
+                return bars
+
     ibkr_bars = _fetch_hist_ibkr(symbol, start, end, interval)
     if ibkr_bars:
         _store_bars(key, ibkr_bars)
@@ -251,6 +291,22 @@ def get_historical_bars_batch(
             result[sym] = cached
         else:
             missing.append(sym)
+
+    if not missing:
+        return result
+
+    if _use_first_rate_data():
+        provider = _first_rate_provider()
+        if provider.is_configured:
+            still_missing: list[str] = []
+            for sym in missing:
+                key = _hist_cache_key(sym, start, end, interval)
+                bars = provider.get_historical_bars(sym, start, end, interval)
+                _store_bars(key, bars)
+                result[sym] = bars
+                if not bars:
+                    still_missing.append(sym)
+            missing = still_missing
 
     if not missing:
         return result
@@ -409,6 +465,15 @@ def _fetch_quote(symbol: str) -> Optional[PriceQuote]:
         logger.debug("Cache hit for %s", symbol)
         return cached
 
+    if _use_first_rate_data():
+        provider = _first_rate_provider()
+        if provider.is_configured:
+            quote = provider.get_latest_quote(symbol)
+            if quote:
+                _store_quote(symbol.upper(), quote)
+                logger.debug("quote_source=firstrate symbol=%s", symbol.upper())
+                return quote
+
     if config.IBKR_ENABLED:
         quote = _fetch_quote_ibkr(symbol)
         if quote:
@@ -447,6 +512,24 @@ async def get_quote(pool, symbol: str) -> Optional[PriceQuote]:
     if cached:
         return cached
     return await asyncio.to_thread(_fetch_quote, symbol.upper())
+
+
+async def get_latest_prices(pool, symbols: list[str]) -> tuple[dict[str, float], list[str]]:
+    """Return latest prices through the shared provider stack."""
+    prices: dict[str, float] = {}
+    errors: list[str] = []
+    unique_symbols = sorted({symbol.upper() for symbol in symbols if symbol})
+    if not unique_symbols:
+        return prices, errors
+
+    await warm_quote_cache(pool, unique_symbols)
+    for symbol in unique_symbols:
+        quote = await get_quote(pool, symbol)
+        if quote and quote.price > 0:
+            prices[symbol] = float(quote.price)
+        else:
+            errors.append(f"{symbol}: no market price")
+    return prices, errors
 
 
 def get_spy_history(start: date, end: date) -> list[HistoricalBar]:

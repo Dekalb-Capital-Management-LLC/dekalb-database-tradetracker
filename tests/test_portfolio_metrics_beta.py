@@ -22,7 +22,7 @@ if find_spec("pydantic") is None:
     sys.modules["models"] = models_stub
     sys.modules["models.schemas"] = schemas_stub
 
-from services import portfolio_metrics
+from services import portfolio_metrics  # noqa: E402
 
 
 class PortfolioBetaTests(unittest.TestCase):
