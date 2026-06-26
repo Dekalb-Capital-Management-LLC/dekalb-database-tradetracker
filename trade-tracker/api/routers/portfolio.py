@@ -1,4 +1,4 @@
-"""
+﻿"""
 Portfolio router.
 
   GET  /portfolio/summary       - combined + per-account P&L
@@ -11,6 +11,7 @@ Portfolio router.
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Optional
@@ -37,6 +38,120 @@ def get_pool():
     return db.get_pool()
 
 
+def _extract_summary_amount(summary: dict, field: str) -> Optional[Decimal]:
+    entry = summary.get(field, {})
+    if isinstance(entry, dict) and entry.get("amount") is not None:
+        return Decimal(str(entry["amount"]))
+    return None
+
+
+def _ibkr_realized_pnl(account_id: str) -> Optional[Decimal]:
+    """Realized P&L from IBKR account summary or sum of position realizedPnl."""
+    from services.ibkr_client import ibkr_client
+
+    if not config.IBKR_ENABLED or not ibkr_client.is_connected:
+        return None
+
+    summary = ibkr_client.get_account_summary(account_id) or {}
+    for key in ("realizedpnl", "RealizedPnL", "realizedPnl"):
+        entry = summary.get(key)
+        if isinstance(entry, dict) and entry.get("amount") is not None:
+            return Decimal(str(entry["amount"])).quantize(Decimal("0.01"))
+
+    total = sum(float(p.get("realizedPnl") or 0) for p in ibkr_client.get_positions(account_id))
+    return Decimal(str(total)).quantize(Decimal("0.01"))
+
+
+async def _compute_realized_pnl_fifo(pool, account_id: str) -> Decimal:
+    """FIFO realized P&L from closed lots in the trades table."""
+    rows = await pool.fetch(
+        """
+        SELECT symbol, side, quantity, price, commission, trade_date, id
+        FROM trades
+        WHERE account_id = $1
+        ORDER BY trade_date, id
+        """,
+        account_id,
+    )
+    lots: dict[str, list[list[float]]] = defaultdict(list)
+    realized = Decimal(0)
+
+    for row in rows:
+        sym = row["symbol"].upper()
+        qty = float(row["quantity"])
+        price = float(row["price"])
+        commission = float(row["commission"] or 0)
+
+        if row["side"] == "BUY":
+            cost_per_share = (qty * price + commission) / qty if qty else 0
+            lots[sym].append([qty, cost_per_share])
+        else:
+            remaining = qty
+            while remaining > 0.0001 and lots[sym]:
+                lot_qty, lot_cost = lots[sym][0]
+                take = min(remaining, lot_qty)
+                proceeds = take * price - (commission * take / qty if qty else 0)
+                cost = take * lot_cost
+                realized += Decimal(str(proceeds - cost))
+                lot_qty -= take
+                remaining -= take
+                if lot_qty <= 0.0001:
+                    lots[sym].pop(0)
+                else:
+                    lots[sym][0][0] = lot_qty
+
+    return realized.quantize(Decimal("0.01"))
+
+
+async def _resolve_realized_pnl(pool, account_id: str) -> Decimal:
+    """Prefer IBKR realized P&L when live; otherwise FIFO from trades."""
+    ibkr_val = _ibkr_realized_pnl(account_id)
+    if ibkr_val is not None:
+        return ibkr_val
+    return await _compute_realized_pnl_fifo(pool, account_id)
+
+
+async def _ibkr_portfolio_summary(pool) -> PortfolioSummary:
+    """Build summary from live IBKR when trades table is empty."""
+    from services.ibkr_client import ibkr_client
+
+    acct = config.IBKR_ACCOUNT_ID
+    positions = await _compute_positions(pool, acct)
+    raw = ibkr_client.get_account_summary(acct) or {}
+
+    equity = _extract_summary_amount(raw, "equitywithloanvalue") or sum(
+        (p.market_value or Decimal(0) for p in positions), Decimal(0)
+    )
+    nav = _extract_summary_amount(raw, "netliquidation") or equity
+    cash = _extract_summary_amount(raw, "totalcashvalue")
+    unrealized = sum((p.unrealized_pnl or Decimal(0) for p in positions), Decimal(0))
+    realized = await _resolve_realized_pnl(pool, acct)
+
+    account = AccountSummary(
+        account_id=acct,
+        source="ibkr",
+        total_nav=nav,
+        cash_balance=cash,
+        equity_value=equity,
+        day_pnl=None,
+        day_pnl_pct=None,
+        total_realized_pnl=realized,
+        total_unrealized_pnl=unrealized.quantize(Decimal("0.01")),
+    )
+
+    return PortfolioSummary(
+        accounts=[account],
+        combined_nav=nav,
+        combined_equity_value=equity.quantize(Decimal("0.01")),
+        combined_day_pnl=None,
+        combined_day_pnl_pct=None,
+        total_realized_pnl=realized,
+        total_unrealized_pnl=unrealized.quantize(Decimal("0.01")),
+        positions=positions,
+        as_of=datetime.utcnow(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -46,7 +161,7 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
     Derive current positions.
     When IBKR is connected and account_id matches the IBKR account, uses live
     IBKR position data (accurate prices, cost basis from IB).
-    Otherwise falls back to computing from trades × IBKR snapshot prices.
+    Otherwise falls back to computing from trades ├ù IBKR snapshot prices.
     """
     # --- IBKR live path ---
     if (
@@ -55,7 +170,7 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
         and account_id == config.IBKR_ACCOUNT_ID
     ):
         from services.ibkr_client import ibkr_client
-        if ibkr_client.is_connected():
+        if ibkr_client.is_connected:
             try:
                 raw = ibkr_client.get_positions(account_id)
                 positions: list[PositionSummary] = []
@@ -104,8 +219,8 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
 
     # --- Imported position snapshot path (Fidelity positions file) ---
     # When a Fidelity positions CSV was imported, use the numbers straight from
-    # the file — last_price, current_value, total_gain_loss — instead of
-    # recomputing from trades × live prices (which needs IBKR market data).
+    # the file ΓÇö last_price, current_value, total_gain_loss ΓÇö instead of
+    # recomputing from trades ├ù live prices (which needs IBKR market data).
     snap_params = [account_id] if account_id else []
     snap_rows = await pool.fetch(
         f"""
@@ -208,7 +323,7 @@ async def _account_summary(pool, account_id: str) -> AccountSummary:
         and account_id == config.IBKR_ACCOUNT_ID
     ):
         from services.ibkr_client import ibkr_client
-        if ibkr_client.is_connected():
+        if ibkr_client.is_connected:
             try:
                 # Use /ledger for accurate cash, NAV, unrealized P&L
                 ledger = ibkr_client.get_ledger(account_id)
@@ -228,24 +343,7 @@ async def _account_summary(pool, account_id: str) -> AccountSummary:
                     (p.unrealized_pnl or Decimal(0)) for p in positions
                 )
 
-                # Realized P&L from trade history (IB's realizedpnl resets each day)
-                realized_row = await pool.fetchrow(
-                    """
-                    WITH by_symbol AS (
-                        SELECT symbol,
-                            SUM(CASE WHEN side='SELL' THEN net_amount  ELSE 0 END) AS sell_proceeds,
-                            SUM(CASE WHEN side='SELL' THEN quantity     ELSE 0 END) AS sold_qty,
-                            NULLIF(SUM(CASE WHEN side='BUY' THEN quantity ELSE 0 END),0) AS total_buy_qty,
-                            SUM(CASE WHEN side='BUY' THEN gross_amount+commission ELSE 0 END) AS total_buy_cost
-                        FROM trades WHERE account_id=$1 GROUP BY symbol
-                        HAVING SUM(CASE WHEN side='SELL' THEN quantity ELSE 0 END) > 0
-                    )
-                    SELECT COALESCE(SUM(sell_proceeds - sold_qty*(total_buy_cost/total_buy_qty)),0) AS realized_pnl
-                    FROM by_symbol WHERE total_buy_qty IS NOT NULL
-                    """,
-                    account_id,
-                )
-                realized = Decimal(str(realized_row["realized_pnl"])).quantize(Decimal("0.01"))
+                realized = await _resolve_realized_pnl(pool, account_id)
 
                 snap_row = await pool.fetchrow(
                     "SELECT daily_pnl, daily_pnl_pct FROM portfolio_snapshots "
@@ -295,31 +393,7 @@ async def _account_summary(pool, account_id: str) -> AccountSummary:
         equity_value = sum((p.market_value or Decimal(0)) for p in positions)
         unrealized_pnl = sum((p.unrealized_pnl or Decimal(0)) for p in positions)
 
-    # Realized P&L from trade history
-    realized_row = await pool.fetchrow(
-        """
-        WITH by_symbol AS (
-            SELECT
-                symbol,
-                SUM(CASE WHEN side = 'SELL' THEN net_amount  ELSE 0 END) AS sell_proceeds,
-                SUM(CASE WHEN side = 'SELL' THEN quantity     ELSE 0 END) AS sold_qty,
-                NULLIF(SUM(CASE WHEN side = 'BUY' THEN quantity ELSE 0 END), 0) AS total_buy_qty,
-                SUM(CASE WHEN side = 'BUY' THEN gross_amount + commission ELSE 0 END) AS total_buy_cost
-            FROM trades
-            WHERE account_id = $1
-            GROUP BY symbol
-            HAVING SUM(CASE WHEN side = 'SELL' THEN quantity ELSE 0 END) > 0
-        )
-        SELECT COALESCE(
-            SUM(sell_proceeds - sold_qty * (total_buy_cost / total_buy_qty)),
-            0
-        ) AS realized_pnl
-        FROM by_symbol
-        WHERE total_buy_qty IS NOT NULL
-        """,
-        account_id,
-    )
-    realized = Decimal(str(realized_row["realized_pnl"])).quantize(Decimal("0.01"))
+    realized = await _resolve_realized_pnl(pool, account_id)
 
     # Latest snapshot for today's P&L
     snap_row = await pool.fetchrow(
@@ -354,6 +428,9 @@ async def get_portfolio_summary(pool=Depends(get_pool)):
             "SELECT DISTINCT account_id FROM trades ORDER BY account_id"
         )
         account_ids = [r["account_id"] for r in account_rows]
+
+        if not account_ids and config.IBKR_ENABLED and config.IBKR_ACCOUNT_ID:
+            return await _ibkr_portfolio_summary(pool)
 
         # Pre-warm price cache for ALL symbols across all accounts in one batch call.
         # Without this, _compute_positions fetches each symbol individually (~1s each).
@@ -418,17 +495,17 @@ async def update_all(pool=Depends(get_pool)):
     """
     One-shot update: sync IBKR positions (if connected), then price everything
     via yfinance, then write today's snapshot. Both Fidelity and IBKR accounts
-    show up as separate entries — the existing account tab system handles it.
+    show up as separate entries ΓÇö the existing account tab system handles it.
     """
     import asyncio
     import yfinance as yf
     from services.portfolio_metrics import upsert_snapshot
 
-    # ── Step 1: sync IBKR holdings (symbols + qty + avg_cost) ──────────────
+    # ΓöÇΓöÇ Step 1: sync IBKR holdings (symbols + qty + avg_cost) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     ibkr_synced = 0
     if config.IBKR_ENABLED and config.IBKR_ACCOUNT_ID:
         from services.ibkr_client import ibkr_client
-        if ibkr_client.is_connected():
+        if ibkr_client.is_connected:
             try:
                 raw = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: ibkr_client.get_positions(config.IBKR_ACCOUNT_ID)
@@ -468,7 +545,7 @@ async def update_all(pool=Depends(get_pool)):
             except Exception as exc:
                 logger.warning("IBKR position sync failed (yfinance will still run): %s", exc)
 
-    # ── Step 2: price ALL positions in imported_positions via yfinance ──────
+    # ΓöÇΓöÇ Step 2: price ALL positions in imported_positions via yfinance ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     rows = await pool.fetch(
         "SELECT account_id, symbol, quantity, avg_cost, cost_basis_total FROM imported_positions"
     )
@@ -479,7 +556,7 @@ async def update_all(pool=Depends(get_pool)):
             "yfinance_total": 0,
             "snapshot_written": False,
             "portfolio_nav": None,
-            "message": "No positions found — import a Fidelity file or connect IBKR",
+            "message": "No positions found ΓÇö import a Fidelity file or connect IBKR",
         }
 
     symbols = list({r["symbol"] for r in rows})
@@ -542,7 +619,7 @@ async def update_all(pool=Depends(get_pool)):
         )
         yf_updated += 1
 
-    # ── Step 3: write today's snapshot ─────────────────────────────────────
+    # ΓöÇΓöÇ Step 3: write today's snapshot ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     snapshot_written = False
     snapshot_nav = None
     if yf_updated > 0 or ibkr_synced > 0:
@@ -656,7 +733,7 @@ async def backfill_snapshots_endpoint(
 ):
     """
     Rebuild historical NAV snapshots from trade history + IBKR historical bars.
-    Returns immediately — runs in background (~30s for 2 years of history).
+    Returns immediately ΓÇö runs in background (~30s for 2 years of history).
     Safe to re-run: ON CONFLICT DO UPDATE.
     """
     background_tasks.add_task(portfolio_metrics.backfill_snapshots, pool, start_date, end_date)
@@ -692,7 +769,7 @@ async def generate_snapshot(
         account_ids = [r["account_id"] for r in account_rows]
 
         if not account_ids:
-            raise HTTPException(status_code=422, detail="No trades found — import trades first before generating snapshots")
+            raise HTTPException(status_code=422, detail="No trades found ΓÇö import trades first before generating snapshots")
 
         generated = []
         combined_equity = Decimal(0)
@@ -720,7 +797,7 @@ async def generate_snapshot(
             # If IBKR connected, pull live NAV instead of equity-only
             if config.IBKR_ENABLED and acct_id == config.IBKR_ACCOUNT_ID:
                 from services.ibkr_client import ibkr_client as _ibkr
-                if _ibkr.is_connected():
+                if _ibkr.is_connected:
                     try:
                         acct_data = _ibkr.get_account_summary(acct_id)
                         if acct_data:

@@ -1,3 +1,4 @@
+import base64 as _b64
 import os
 from urllib.parse import urlparse
 
@@ -23,53 +24,22 @@ DB_MIN_CONNECTIONS = int(os.getenv("DB_MIN_CONNECTIONS", "2"))
 DB_MAX_CONNECTIONS = int(os.getenv("DB_MAX_CONNECTIONS", "10"))
 
 # ---------------------------------------------------------------------------
-# IBKR Web API — RSA key-based OAuth 2.0 (server-to-server, no browser login)
-#
-# How it works:
-#   Your RSA private key signs a JWT → IBKR returns a bearer token → you
-#   create an SSO session with your IBKR username → make API calls.
-#   Fully automated. No user action needed. Reconnects on its own.
-#
-# Paper account:
-#   IBKR_CLIENT_ID      = DekalbCapital-Paper
-#   IBKR_CLIENT_KEY_ID  = main
-#   IBKR_CREDENTIAL     = dekalbcapitalpaper   (the IBKR paper username)
-#   IBKR_ACCOUNT_ID     = DFP321877
-#
-# Live / Production account (F account):
-#   IBKR_CLIENT_ID      = DekalbCapital-Prod
-#   IBKR_CLIENT_KEY_ID  = main
-#   IBKR_CREDENTIAL     = dekalbcapital3
-#   IBKR_ACCOUNT_ID     = F16173704
-#   (private key from Ryan's zip — same key pair registered for this account)
-#
-# IBKR_PRIVATE_KEY: paste the full contents of your privatekey.pem file.
-#   In .env, escape newlines as \n  OR  use a literal multiline value.
-#   e.g.  IBKR_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----"
-#
-# IBKR_SERVER_IP: the outbound IP of this server as seen by IBKR.
-#   Local dev: your public IP (google "what is my ip")
-#   Railway:   check Settings → Networking for your static outbound IP
+# IBKR OAuth Cloud API (api.ibkr.com) — primary integration
 # ---------------------------------------------------------------------------
+IBKR_GATEWAY_URL = os.getenv("IBKR_GATEWAY_URL", "https://localhost:5001")
+IBKR_API_BASE_URL = os.getenv("IBKR_API_BASE_URL", "https://api.ibkr.com")
 IBKR_ENABLED = os.getenv("IBKR_ENABLED", "false").lower() == "true"
+IBKR_ACCOUNT_ID = os.getenv("IBKR_ACCOUNT_ID", "")
+IBKR_CLIENT_ID = os.getenv("IBKR_CLIENT_ID", "")
+IBKR_CLIENT_KEY_ID = os.getenv("IBKR_CLIENT_KEY_ID", "main")
+IBKR_CREDENTIAL = os.getenv("IBKR_CREDENTIAL", "")
+IBKR_SERVER_IP = os.getenv("IBKR_SERVER_IP", "")
 
-IBKR_CLIENT_ID     = os.getenv("IBKR_CLIENT_ID", "")       # e.g. DekalbCapital-Paper
-IBKR_CLIENT_KEY_ID = os.getenv("IBKR_CLIENT_KEY_ID", "")   # e.g. main
-IBKR_CREDENTIAL    = os.getenv("IBKR_CREDENTIAL", "")       # IBKR username
-IBKR_ACCOUNT_ID    = os.getenv("IBKR_ACCOUNT_ID", "")       # e.g. DFP321877
-IBKR_SERVER_IP     = os.getenv("IBKR_SERVER_IP", "")        # outbound IP of this server
-
-# RSA private key — accepts three formats:
-#   1. Base64-encoded PEM (ends with ==)  → just paste the whole thing as-is, no quotes
-#   2. Raw PEM with \n escapes            → -----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END...
-#   3. Raw PEM with actual newlines       → only works with quoted multiline in .env
-import base64 as _b64
+# RSA private key — PEM, base64-encoded PEM, or \n-escaped PEM
 _raw_key = os.getenv("IBKR_PRIVATE_KEY", "").strip()
 if _raw_key and not _raw_key.startswith("-----"):
-    # Looks like base64-encoded — decode it to get the PEM string
     try:
         _decoded = _b64.b64decode(_raw_key).decode("utf-8").strip()
-        # If the decoded result is missing PEM headers, add them
         if not _decoded.startswith("-----"):
             _decoded = f"-----BEGIN RSA PRIVATE KEY-----\n{_decoded}\n-----END RSA PRIVATE KEY-----"
         IBKR_PRIVATE_KEY = _decoded
@@ -78,15 +48,19 @@ if _raw_key and not _raw_key.startswith("-----"):
 else:
     IBKR_PRIVATE_KEY = _raw_key.replace("\\n", "\n")
 
-# IBKR API base URLs — don't change these unless IBKR updates them
-IBKR_TOKEN_URL       = "https://api.ibkr.com/oauth2/api/v1/token"
-IBKR_SSO_URL         = "https://api.ibkr.com/gw/api/v1/sso-sessions"
-IBKR_BASE_URL        = "https://api.ibkr.com/v1/api"
+IBKR_USE_OAUTH = bool(IBKR_CLIENT_ID and IBKR_PRIVATE_KEY and IBKR_CREDENTIAL)
 
-# IBKR snapshot cache TTL
-PRICE_CACHE_TTL_SECONDS = int(os.getenv("PRICE_CACHE_TTL_SECONDS", "300"))
+# Market data / IBKR tuning
+PRICE_CACHE_TTL_SECONDS = int(os.getenv("PRICE_CACHE_TTL_SECONDS", "60"))
+HISTORICAL_CACHE_TTL_SECONDS = int(os.getenv("HISTORICAL_CACHE_TTL_SECONDS", "3600"))
+YFINANCE_REQUEST_DELAY_SECONDS = float(os.getenv("YFINANCE_REQUEST_DELAY_SECONDS", "1.5"))
+IBKR_REQUEST_DELAY_SECONDS = float(os.getenv("IBKR_REQUEST_DELAY_SECONDS", "0.35"))
+IBKR_TX_DAYS = int(os.getenv("IBKR_TX_DAYS", "730"))
+IBKR_POSITIONS_RETRY_COUNT = int(os.getenv("IBKR_POSITIONS_RETRY_COUNT", "3"))
+IBKR_POSITIONS_RETRY_DELAY = float(os.getenv("IBKR_POSITIONS_RETRY_DELAY", "1.5"))
+IBKR_SNAPSHOT_MAX_ATTEMPTS = int(os.getenv("IBKR_SNAPSHOT_MAX_ATTEMPTS", "8"))
+IBKR_SNAPSHOT_POLL_DELAY = float(os.getenv("IBKR_SNAPSHOT_POLL_DELAY", "0.5"))
 
-# SPY symbol for benchmark overlay
 BENCHMARK_SYMBOL = os.getenv("BENCHMARK_SYMBOL", "SPY")
 
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
@@ -96,7 +70,34 @@ DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 AUTH_ENABLED = os.getenv("AUTH_ENABLED", "false").lower() == "true"
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 ALLOWED_EMAIL_DOMAIN = os.getenv("ALLOWED_EMAIL_DOMAIN", "dekalbcapitalmanagement.com")
-
-# Deployed frontend origin (e.g. https://dekalb-trade-tracker.vercel.app), used for CORS.
-# Comma-separated if there's more than one (e.g. production + preview deploys).
 FRONTEND_URL = os.getenv("FRONTEND_URL", "")
+
+
+def validate_ibkr_oauth_config(log) -> None:
+    """Startup checks for OAuth — log only, never crash the API."""
+    if not IBKR_ENABLED or not IBKR_USE_OAUTH:
+        return
+    if not IBKR_SERVER_IP:
+        log.error(
+            "IBKR_SERVER_IP is not set. IBKR ties OAuth sessions to your outbound IP. "
+            "Register your public IP in the IBKR OAuth app, set IBKR_SERVER_IP in .env, "
+            "and restart the API."
+        )
+        return
+    try:
+        import requests as _req
+
+        resp = _req.get("https://api.ipify.org", timeout=5)
+        if resp.ok:
+            detected = resp.text.strip()
+            if detected and detected != IBKR_SERVER_IP:
+                log.warning(
+                    "IBKR_SERVER_IP=%s but detected outbound IP=%s — update IBKR portal "
+                    "and .env if sessions fail",
+                    IBKR_SERVER_IP,
+                    detected,
+                )
+            else:
+                log.info("IBKR_SERVER_IP matches detected outbound IP (%s)", IBKR_SERVER_IP)
+    except Exception as exc:
+        log.debug("Could not detect outbound IP for IBKR check: %s", exc)

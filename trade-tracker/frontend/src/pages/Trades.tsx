@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Search } from 'lucide-react'
 import type { Trade, TradeLabel } from '../types'
-import { get, patch } from '../api/client'
+import { get, patch, post } from '../api/client'
 import LabelBadge from '../components/LabelBadge'
 
 const LABELS: TradeLabel[] = ['event-driven', 'hedge', 'long-term', 'short-term', 'unclassified']
@@ -22,6 +22,7 @@ export default function Trades() {
   const [labelFilter, setLabelFilter] = useState('')
 
   const [editingId, setEditingId] = useState<number | null>(null)
+  const [syncing, setSyncing] = useState(false)
   const popoverRef = useRef<HTMLDivElement>(null)
 
   const fetchTrades = useCallback(() => {
@@ -41,6 +42,18 @@ export default function Trades() {
   }, [source, symbol, side, labelFilter])
 
   useEffect(() => { fetchTrades() }, [fetchTrades])
+
+  async function syncFromIbkr() {
+    setSyncing(true)
+    try {
+      await post('/ibkr/sync/trades')
+      fetchTrades()
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'IBKR sync failed')
+    } finally {
+      setSyncing(false)
+    }
+  }
 
   useEffect(() => {
     function handler(e: MouseEvent) {
@@ -101,7 +114,20 @@ export default function Trades() {
     <div className="p-8">
       <div className="flex items-center justify-between mb-6">
         <h2 className="text-2xl font-bold" style={{ color: '#1a2744' }}>Trade Log</h2>
-        <span className="text-sm" style={{ color: '#9ca3af' }}>{trades.length} trades</span>
+        <div className="flex items-center gap-3">
+          <span className="text-sm" style={{ color: '#9ca3af' }}>
+            {syncing ? 'Syncing from IBKR…' : `${trades.length} trades`}
+          </span>
+          <button
+            type="button"
+            onClick={syncFromIbkr}
+            disabled={syncing}
+            className="text-xs px-2 py-1 rounded border disabled:opacity-50"
+            style={{ borderColor: '#d0dce8', color: '#6b7a99' }}
+          >
+            Sync IBKR
+          </button>
+        </div>
       </div>
 
       {/* Filters */}

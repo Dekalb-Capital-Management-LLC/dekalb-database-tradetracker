@@ -13,15 +13,16 @@ from datetime import date
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
 import config, db
-from routers import ibkr, imports, market, portfolio, trades
 from routers import auth as auth_router
-from services.auth import AuthError, verify_google_id_token
+from routers import ibkr, imports, market, portfolio, trades
+from routers.ibkr import sync_ibkr_trades
+from services.ibkr_client import ibkr_client
 
-logging.basicConfig(level=logging.DEBUG if config.DEBUG else logging.INFO,
-                    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
+logging.basicConfig(
+    level=logging.DEBUG if config.DEBUG else logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -36,8 +37,11 @@ _allowed_origins = [
     "http://localhost:80",
     "http://localhost",
 ]
-if config.FRONTEND_URL and config.FRONTEND_URL not in _allowed_origins:
-    _allowed_origins.append(config.FRONTEND_URL)
+if config.FRONTEND_URL:
+    for origin in config.FRONTEND_URL.split(","):
+        origin = origin.strip()
+        if origin and origin not in _allowed_origins:
+            _allowed_origins.append(origin)
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,6 +51,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router.router)
 app.include_router(portfolio.router)
 app.include_router(trades.router)
 app.include_router(imports.router)
@@ -55,14 +60,13 @@ app.include_router(ibkr.router)
 
 
 async def _auto_refresh_loop():
-    """Refresh yfinance prices + write snapshot every 5 minutes."""
+    """Refresh yfinance prices + write snapshot every 5 minutes for imported positions."""
     import yfinance as yf
-    from datetime import date
     from decimal import Decimal
     from services.portfolio_metrics import upsert_snapshot
 
-    INTERVAL = 300  # seconds
-    await asyncio.sleep(30)  # wait for DB pool to be ready
+    INTERVAL = 300
+    await asyncio.sleep(30)
 
     while True:
         try:
@@ -88,13 +92,17 @@ async def _auto_refresh_loop():
                                 auto_adjust=True,
                                 progress=False,
                                 threads=True,
-                            )
+                            ),
                         )
                         if not df.empty:
                             close = df["Close"] if "Close" in df.columns else df.xs("Close", axis=1, level=0)
                             for sym in market_syms:
                                 try:
-                                    val = float(close.dropna().iloc[-1]) if len(market_syms) == 1 else float(close[sym].dropna().iloc[-1])
+                                    val = (
+                                        float(close.dropna().iloc[-1])
+                                        if len(market_syms) == 1
+                                        else float(close[sym].dropna().iloc[-1])
+                                    )
                                     if val > 0:
                                         prices[sym] = val
                                 except Exception:
@@ -119,8 +127,12 @@ async def _auto_refresh_loop():
                             total_gl_pct=$4, snapshot_date=CURRENT_DATE, updated_at=NOW()
                         WHERE account_id=$5 AND symbol=$6
                         """,
-                        price, current_value, total_gl, total_gl_pct,
-                        r["account_id"], r["symbol"],
+                        price,
+                        current_value,
+                        total_gl,
+                        total_gl_pct,
+                        r["account_id"],
+                        r["symbol"],
                     )
                     updated += 1
 
@@ -143,10 +155,17 @@ async def _auto_refresh_loop():
                             WHERE account_id=$1 AND snapshot_date < $2
                             ORDER BY snapshot_date DESC LIMIT 1
                             """,
-                            acct_id, today,
+                            acct_id,
+                            today,
                         )
-                        await upsert_snapshot(pool, today, nav, acct_id, nav,
-                                              Decimal(str(prev["total_nav"])) if prev else None)
+                        await upsert_snapshot(
+                            pool,
+                            today,
+                            nav,
+                            acct_id,
+                            nav,
+                            Decimal(str(prev["total_nav"])) if prev else None,
+                        )
                         combined_nav += nav
                     prev_comb = await pool.fetchrow(
                         """
@@ -156,8 +175,14 @@ async def _auto_refresh_loop():
                         """,
                         today,
                     )
-                    await upsert_snapshot(pool, today, combined_nav, None, combined_nav,
-                                         Decimal(str(prev_comb["total_nav"])) if prev_comb else None)
+                    await upsert_snapshot(
+                        pool,
+                        today,
+                        combined_nav,
+                        None,
+                        combined_nav,
+                        Decimal(str(prev_comb["total_nav"])) if prev_comb else None,
+                    )
                     logger.info("Auto-refresh: updated %d positions, snapshot written", updated)
         except Exception as exc:
             logger.warning("Auto-refresh error: %s", exc)
@@ -170,24 +195,48 @@ async def startup():
     await db.init_pool()
     asyncio.create_task(_auto_refresh_loop())
     logger.info("Trade Tracker API started. Docs at /docs")
+    config.validate_ibkr_oauth_config(logger)
     if config.IBKR_ENABLED:
-        import threading
-        from services.ibkr_client import ibkr_client
-        t = threading.Thread(target=ibkr_client.connect, daemon=True)
-        t.start()
-        logger.info("IBKR connection starting (client_id=%s)", config.IBKR_CLIENT_ID)
+        if config.IBKR_USE_OAUTH:
+            ok = await ibkr_client.connect_oauth()
+            mode = "oauth" if ok else "oauth (failed — check logs)"
+            logger.info(
+                "IBKR ENABLED — %s at %s (account: %s)",
+                mode,
+                config.IBKR_API_BASE_URL,
+                config.IBKR_ACCOUNT_ID,
+            )
+            if ok:
+                asyncio.create_task(_startup_ibkr_trade_sync())
+        else:
+            logger.info(
+                "IBKR ENABLED — gateway at %s (account: %s)",
+                config.IBKR_GATEWAY_URL,
+                config.IBKR_ACCOUNT_ID,
+            )
     else:
-        logger.warning("IBKR disabled — no market data available. Set IBKR_ENABLED=true to activate.")
+        logger.warning("IBKR disabled — yfinance fallback for market data.")
 
 
+async def _startup_ibkr_trade_sync() -> None:
+    """One-shot PA trade import after OAuth connects (non-blocking)."""
+    try:
+        pool = db.get_pool()
+        result = await sync_ibkr_trades(pool)
+        logger.info(
+            "IBKR startup trade sync: inserted=%s parsed=%s symbols=%s",
+            result.get("transactions_inserted"),
+            result.get("transactions_parsed"),
+            result.get("symbols_synced"),
+        )
+    except Exception as exc:
+        logger.warning("IBKR startup trade sync failed: %s", exc)
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    if config.IBKR_ENABLED:
-        from services.ibkr_client import ibkr_client
-        ibkr_client.disconnect()
     await db.close_pool()
+
 
 @app.get("/health", tags=["health"])
 async def health():
@@ -212,7 +261,7 @@ async def health():
     return {
         "status": "ok" if db_ok else "degraded",
         "database": "connected" if db_ok else "unreachable",
-        "ibkr": "enabled" if config.IBKR_ENABLED else "disabled (no market data)",
+        "ibkr": "enabled" if config.IBKR_ENABLED else "disabled (yfinance fallback)",
         "trades": trade_count,
         "latest_snapshot": str(snap_date) if snap_date else "none",
         "version": "0.1.0",

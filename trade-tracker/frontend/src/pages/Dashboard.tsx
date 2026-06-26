@@ -2,6 +2,8 @@ import { useState, useEffect } from 'react'
 import { Search } from 'lucide-react'
 import type {
   AccountSummary,
+  IBKRAccount,
+  IBKRStatus,
   PerformancePoint,
   Period,
   PortfolioMetrics,
@@ -80,6 +82,8 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null)
   const [updating, setUpdating] = useState(false)
   const [updateMsg, setUpdateMsg] = useState<string | null>(null)
+  const [ibkrStatus, setIbkrStatus] = useState<IBKRStatus | null>(null)
+  const [ibkrAccount, setIbkrAccount] = useState<IBKRAccount | null>(null)
 
   const accounts: AccountSummary[] = summary?.accounts ?? []
 
@@ -126,6 +130,17 @@ export default function Dashboard() {
   }, [])
 
   useEffect(() => {
+    get<IBKRStatus>('/ibkr/status')
+      .then((status) => {
+        setIbkrStatus(status)
+        if (status.connected && status.authenticated) {
+          get<IBKRAccount>('/ibkr/account').then(setIbkrAccount).catch(() => setIbkrAccount(null))
+        }
+      })
+      .catch(() => setIbkrStatus(null))
+  }, [])
+
+  useEffect(() => {
     setChartLoading(true)
     Promise.allSettled([
       get<PortfolioMetrics>(`/portfolio/metrics?period=${period}${accountParam}`),
@@ -143,7 +158,11 @@ export default function Dashboard() {
   const activeAccount: AccountSummary | null =
     selectedAccount ? accounts.find((a) => a.account_id === selectedAccount) ?? null : null
 
-  const equityValue = activeAccount?.equity_value ?? summary?.combined_equity_value
+  const equityValue =
+    activeAccount?.equity_value ??
+    summary?.combined_equity_value ??
+    summary?.combined_nav ??
+    ibkrAccount?.total_nav
   const dayPnl = activeAccount?.day_pnl ?? summary?.combined_day_pnl
   const dayPnlPct = activeAccount?.day_pnl_pct ?? summary?.combined_day_pnl_pct
   const unrealizedPnl = activeAccount?.total_unrealized_pnl ?? summary?.total_unrealized_pnl
@@ -221,6 +240,35 @@ export default function Dashboard() {
           />
         </div>
       </div>
+
+      {ibkrStatus && (
+        <div
+          className="mx-8 mt-3 px-4 py-2.5 rounded-lg text-sm"
+          style={{
+            backgroundColor: ibkrStatus.connected && ibkrStatus.authenticated ? '#ecfdf5' : '#fffbeb',
+            border: `1px solid ${ibkrStatus.connected && ibkrStatus.authenticated ? '#a7f3d0' : '#fde68a'}`,
+            color: ibkrStatus.connected && ibkrStatus.authenticated ? '#065f46' : '#92400e',
+          }}
+        >
+          <span className="font-medium">IBKR</span>
+          {' · '}
+          {ibkrStatus.enabled ? (
+            ibkrStatus.connected && ibkrStatus.authenticated ? (
+              <>
+                Connected ({ibkrStatus.mode}) · {ibkrStatus.account_id}
+                {ibkrAccount?.total_nav != null && <> · NAV {fmt$(ibkrAccount.total_nav)}</>}
+                {ibkrStatus.positions_count != null && ibkrStatus.positions_count > 0 && (
+                  <> · {ibkrStatus.positions_count} positions</>
+                )}
+              </>
+            ) : (
+              <>Not connected — {ibkrStatus.message ?? 'check API logs'}</>
+            )
+          ) : (
+            <>{ibkrStatus.message ?? 'disabled'}</>
+          )}
+        </div>
+      )}
 
       {/* Error bar */}
       {error && (

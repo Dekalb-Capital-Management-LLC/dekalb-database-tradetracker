@@ -1,26 +1,21 @@
 """
 IBKR router.
 
-Authentication is fully automatic (RSA key-based, server-side).
-No login page, no redirect, no user action needed.
-
 Endpoints:
-  GET  /ibkr/status           - is IBKR connected?
-  POST /ibkr/connect          - manually trigger a reconnect (useful after config change)
-  GET  /ibkr/account          - live NAV, cash, equity
-  GET  /ibkr/positions        - live open positions
-  POST /ibkr/sync/trades      - pull recent fills into trades table
-                                (also runs automatically every hour via cron)
+  GET  /ibkr/status         - Pangolin connection + IBKR auth status
+  GET  /ibkr/account        - Live NAV, cash, equity from IBKR
+  GET  /ibkr/positions      - Live open positions from IBKR
+  POST /ibkr/sync/trades    - Pull IBKR fills (PA history + recent) into DB
 """
 from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 import config
 import db
@@ -38,98 +33,309 @@ def _require_ibkr():
     if not config.IBKR_ENABLED:
         raise HTTPException(
             status_code=503,
-            detail="IBKR not enabled. Set IBKR_ENABLED=true and configure credentials in .env.",
-        )
-    if not ibkr_client.is_connected():
-        raise HTTPException(
-            status_code=503,
-            detail="IBKR not connected. Check credentials and server logs. Try POST /ibkr/connect.",
+            detail="IBKR not enabled. Set IBKR_ENABLED=true and IBKR_ACCOUNT_ID in your environment.",
         )
     if not config.IBKR_ACCOUNT_ID:
-        raise HTTPException(status_code=503, detail="IBKR_ACCOUNT_ID not set.")
+        raise HTTPException(
+            status_code=503,
+            detail="IBKR_ACCOUNT_ID not set. Ask your manager for your account ID (format: U1234567).",
+        )
 
 
-# ---------------------------------------------------------------------------
-# Status + manual reconnect
-# ---------------------------------------------------------------------------
+def _parse_pa_trade(t: dict, sym_by_conid: dict[int, str]) -> Optional[dict]:
+    """Map IBKR Portfolio Analyst transaction to trades-table fields."""
+    tx_type = t.get("type")
+    if tx_type not in ("Buy", "Sell"):
+        return None
 
-@router.get("/status", summary="IBKR connection status")
+    raw_date = t.get("rawDate")
+    if not raw_date:
+        return None
+
+    try:
+        qty = Decimal(str(abs(float(t.get("qty", 0)))))
+        price = Decimal(str(t.get("pr", 0)))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if qty <= 0 or price <= 0:
+        return None
+
+    conid = int(t.get("conid", 0))
+    symbol = sym_by_conid.get(conid) or (t.get("desc") or "UNKNOWN").split()[0]
+    symbol = symbol.upper().strip()
+    side = "BUY" if tx_type == "Buy" else "SELL"
+
+    gross = (qty * price).quantize(Decimal("0.01"))
+    try:
+        amt = abs(Decimal(str(float(t.get("amt", 0)))))
+    except (InvalidOperation, TypeError, ValueError):
+        amt = gross
+    commission = max(Decimal("0"), (amt - gross).quantize(Decimal("0.01")))
+
+    if side == "BUY":
+        net = -(gross + commission)
+    else:
+        net = gross - commission
+
+    trade_date = datetime.strptime(str(raw_date), "%Y%m%d")
+    order_id = f"pa-{conid}-{raw_date}-{tx_type}-{qty}-{price}"
+
+    return {
+        "order_id": order_id,
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "price": price,
+        "commission": commission,
+        "gross": gross,
+        "net": net,
+        "trade_date": trade_date,
+        "raw": t,
+    }
+
+
+def _parse_iserver_trade(t: dict) -> Optional[dict]:
+    order_id = str(t.get("execution_id") or t.get("orderId") or "").strip()
+    if not order_id:
+        return None
+
+    raw_side = str(t.get("side", "")).upper()
+    side = "BUY" if raw_side in ("BOT", "BUY", "B") else "SELL"
+
+    try:
+        qty = Decimal(str(t.get("size") or t.get("quantity") or 0))
+        price = Decimal(str(t.get("price") or 0))
+        commission = Decimal(str(t.get("commission") or 0))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if qty <= 0 or price <= 0:
+        return None
+
+    gross = (qty * price).quantize(Decimal("0.01"))
+    if side == "BUY":
+        net = -(gross + commission)
+    else:
+        net = gross - commission
+
+    raw_time = t.get("trade_time") or t.get("tradeTime") or t.get("time")
+    if raw_time:
+        try:
+            trade_date = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
+        except ValueError:
+            trade_date = datetime.utcnow()
+    else:
+        trade_date = datetime.utcnow()
+
+    symbol = (t.get("symbol") or t.get("ticker") or "").upper().strip()
+    if not symbol:
+        return None
+
+    return {
+        "order_id": order_id,
+        "symbol": symbol,
+        "side": side,
+        "qty": qty,
+        "price": price,
+        "commission": commission,
+        "gross": gross,
+        "net": net,
+        "trade_date": trade_date,
+        "raw": t,
+    }
+
+
+async def _insert_trade(pool, parsed: dict) -> bool:
+    """Insert one trade; return True if inserted, False if skipped."""
+    order_id = parsed["order_id"]
+    existing = await pool.fetchval(
+        "SELECT id FROM trades WHERE ibkr_order_id = $1", order_id
+    )
+    if existing:
+        return False
+
+    await pool.execute(
+        """
+        INSERT INTO trades
+          (source, account_id, trade_date, symbol, side, quantity, price,
+           commission, gross_amount, net_amount, ibkr_order_id, raw_data)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        """,
+        "ibkr",
+        config.IBKR_ACCOUNT_ID,
+        parsed["trade_date"],
+        parsed["symbol"],
+        parsed["side"],
+        float(parsed["qty"]),
+        float(parsed["price"]),
+        float(parsed["commission"]),
+        float(parsed["gross"]),
+        float(parsed["net"]),
+        order_id,
+        json.dumps(parsed["raw"]) if isinstance(parsed["raw"], dict) else str(parsed["raw"]),
+    )
+    return True
+
+
+async def sync_ibkr_trades(pool) -> dict:
+    """Pull IBKR PA + iserver fills into trades table. Used by endpoint and startup."""
+    sym_by_conid = ibkr_client.position_symbol_map(config.IBKR_ACCOUNT_ID)
+    conids = list(sym_by_conid.keys()) or ibkr_client.position_conids(config.IBKR_ACCOUNT_ID)
+    symbols_synced = len(conids)
+
+    pa_trades = ibkr_client.get_all_pa_transactions(config.IBKR_ACCOUNT_ID, conids)
+    iserver_trades = ibkr_client.get_recent_trades(config.IBKR_ACCOUNT_ID)
+    total_from_ibkr = len(pa_trades) + len(iserver_trades)
+
+    if not pa_trades and not iserver_trades:
+        return {
+            "inserted": 0,
+            "skipped": 0,
+            "total_from_ibkr": 0,
+            "symbols_synced": symbols_synced,
+            "transactions_parsed": 0,
+            "transactions_inserted": 0,
+            "message": "No trades returned by IBKR",
+        }
+
+    inserted = 0
+    skipped = 0
+    parsed_count = 0
+    errors: list[str] = []
+
+    for t in pa_trades:
+        try:
+            parsed = _parse_pa_trade(t, sym_by_conid)
+            if not parsed:
+                skipped += 1
+                continue
+            parsed_count += 1
+            if await _insert_trade(pool, parsed):
+                inserted += 1
+            else:
+                skipped += 1
+        except Exception as exc:
+            msg = f"PA trade parse/insert error — {exc}"
+            logger.warning(msg)
+            errors.append(msg)
+            skipped += 1
+
+    for t in iserver_trades:
+        try:
+            parsed = _parse_iserver_trade(t)
+            if not parsed:
+                skipped += 1
+                continue
+            parsed_count += 1
+            if await _insert_trade(pool, parsed):
+                inserted += 1
+            else:
+                skipped += 1
+        except Exception as exc:
+            order_id = t.get("execution_id") or t.get("orderId") or "?"
+            msg = f"Trade {order_id}: {exc}"
+            logger.warning(msg)
+            errors.append(msg)
+            skipped += 1
+
+    logger.info(
+        "IBKR trade sync complete: inserted=%d skipped=%d errors=%d pa=%d iserver=%d",
+        inserted, skipped, len(errors), len(pa_trades), len(iserver_trades),
+    )
+    return {
+        "inserted": inserted,
+        "skipped": skipped,
+        "total_from_ibkr": total_from_ibkr,
+        "symbols_synced": symbols_synced,
+        "transactions_parsed": parsed_count,
+        "transactions_inserted": inserted,
+        "pa_transactions": len(pa_trades),
+        "iserver_trades": len(iserver_trades),
+        "errors": errors or None,
+    }
+
+
+@router.get("/status", summary="IBKR connection and auth status")
 def get_status():
     """
-    Returns whether IBKR is connected and ready.
-    The frontend uses this to show the connection indicator in the sidebar.
+    Check IBKR connectivity. Safe when disabled — returns enabled=false.
+    OAuth mode: IBKR_CLIENT_ID set in env. Gateway mode: local Client Portal Gateway.
     """
     if not config.IBKR_ENABLED:
         return {
             "enabled": False,
-            "connected": False,
-            "message": "Set IBKR_ENABLED=true and configure RSA credentials in .env.",
+            "mode": "disabled",
+            "message": "Set IBKR_ENABLED=true and IBKR_ACCOUNT_ID to activate",
         }
 
-    connected = ibkr_client.is_connected()
+    mode = "oauth" if config.IBKR_USE_OAUTH else "gateway"
+    api_url = config.IBKR_API_BASE_URL if config.IBKR_USE_OAUTH else config.IBKR_GATEWAY_URL
+
+    if config.IBKR_USE_OAUTH and not ibkr_client.is_connected:
+        return {
+            "enabled": True,
+            "mode": mode,
+            "connected": False,
+            "api_url": api_url,
+            "account_id": config.IBKR_ACCOUNT_ID or "not set",
+            "message": "OAuth session not established — check API startup logs",
+        }
+
+    auth = ibkr_client.auth_status()
+    if auth is None:
+        return {
+            "enabled": True,
+            "mode": mode,
+            "connected": False,
+            "api_url": api_url,
+            "account_id": config.IBKR_ACCOUNT_ID or "not set",
+            "message": (
+                "Could not reach IBKR OAuth API"
+                if config.IBKR_USE_OAUTH
+                else "Could not reach IBKR gateway — is it running and authenticated?"
+            ),
+        }
+
+    oauth_connected = ibkr_client.is_connected if config.IBKR_USE_OAUTH else True
+    iserver_authenticated = auth.get("authenticated", False)
+    positions_count = 0
+    if config.IBKR_ACCOUNT_ID and oauth_connected:
+        positions_count = len(ibkr_client.get_positions(config.IBKR_ACCOUNT_ID))
+
     return {
         "enabled": True,
-        "connected": connected,
+        "mode": mode,
+        "connected": True,
+        "oauth_connected": oauth_connected,
+        "iserver_authenticated": iserver_authenticated,
+        "authenticated": iserver_authenticated,
+        "competing": auth.get("competing", False),
+        "api_url": api_url,
         "account_id": config.IBKR_ACCOUNT_ID or "not set",
-        "message": "Connected" if connected else "Not connected — check logs or POST /ibkr/connect",
+        "positions_count": positions_count,
+        "account_nav": ibkr_client.last_account_nav,
     }
-
-
-@router.get("/debug/positions", summary="Raw IBKR positions API response for diagnostics")
-def debug_positions():
-    """
-    Returns the raw JSON from /portfolio/accounts and /portfolio/{id}/positions/0.
-    Use this to diagnose why positions are returning empty.
-    """
-    if not config.IBKR_ENABLED:
-        return {"error": "IBKR_ENABLED is false"}
-    if not ibkr_client.is_connected():
-        return {"error": "not connected"}
-
-    accounts_raw = ibkr_client._get("/portfolio/accounts")
-    positions_raw = ibkr_client._get(f"/portfolio/{config.IBKR_ACCOUNT_ID}/positions/0")
-
-    return {
-        "account_id_from_config": config.IBKR_ACCOUNT_ID,
-        "portfolio_accounts": accounts_raw,
-        "positions_page0_type": type(positions_raw).__name__,
-        "positions_page0_length": len(positions_raw) if isinstance(positions_raw, list) else "N/A",
-        "positions_page0_raw": positions_raw,
-    }
-
-
-@router.post("/connect", summary="Manually trigger IBKR reconnection")
-def reconnect():
-    """
-    Re-run the RSA auth flow and reconnect to IBKR.
-    Useful after updating credentials or if the session dropped unexpectedly.
-    """
-    if not config.IBKR_ENABLED:
-        raise HTTPException(status_code=503, detail="IBKR_ENABLED is false.")
-
-    ibkr_client.disconnect()
-    success = ibkr_client.connect()
-    if success:
-        return {"connected": True, "message": "Reconnected successfully."}
-    raise HTTPException(
-        status_code=502,
-        detail="Reconnection failed. Check IBKR credentials and IBKR_SERVER_IP in logs.",
-    )
 
 
 # ---------------------------------------------------------------------------
 # Account summary
 # ---------------------------------------------------------------------------
 
-@router.get("/account", summary="Live account NAV and balances")
+@router.get("/account", summary="Live account NAV and balances from IBKR")
 def get_account_summary():
+    """
+    Fetches live NAV, cash balance, and equity value directly from IBKR via the gateway.
+    Much more accurate than the derived values from trade history alone.
+    """
     _require_ibkr()
 
     summary = ibkr_client.get_account_summary(config.IBKR_ACCOUNT_ID)
     if summary is None:
-        raise HTTPException(status_code=502, detail="Could not fetch account summary from IBKR.")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not fetch account summary from IBKR. Check /ibkr/status.",
+        )
 
-    def extract(field: str) -> Optional[float]:
+    def extract_amount(field: str) -> Optional[float]:
         entry = summary.get(field, {})
         if isinstance(entry, dict):
             return entry.get("amount")
@@ -137,12 +343,12 @@ def get_account_summary():
 
     return {
         "account_id": config.IBKR_ACCOUNT_ID,
-        "total_nav": extract("netliquidation"),
-        "cash_balance": extract("totalcashvalue"),
-        "equity_value": extract("equitywithloanvalue"),
-        "gross_position_value": extract("grosspositionvalue"),
-        "buying_power": extract("buyingpower"),
-        "as_of": datetime.now(timezone.utc).isoformat(),
+        "total_nav": extract_amount("netliquidation"),
+        "cash_balance": extract_amount("totalcashvalue"),
+        "equity_value": extract_amount("equitywithloanvalue"),
+        "gross_position_value": extract_amount("grosspositionvalue"),
+        "buying_power": extract_amount("buyingpower"),
+        "as_of": datetime.utcnow().isoformat() + "Z",
     }
 
 
@@ -150,16 +356,23 @@ def get_account_summary():
 # Live positions
 # ---------------------------------------------------------------------------
 
-@router.get("/positions", summary="Live open positions")
+@router.get("/positions", summary="Live open positions from IBKR")
 def get_live_positions():
+    """
+    Returns current open positions pulled directly from IBKR (not derived from trade history).
+    Use this to reconcile against /portfolio/positions which is computed from the trades table.
+    """
     _require_ibkr()
 
     raw = ibkr_client.get_positions(config.IBKR_ACCOUNT_ID)
+    if not raw:
+        return []
+
     positions = []
     for p in raw:
         qty = p.get("position", 0)
         if qty == 0:
-            continue
+            continue  # skip flat positions
         positions.append({
             "symbol": p.get("ticker") or p.get("contractDesc", "UNKNOWN"),
             "conid": p.get("conid"),
@@ -171,178 +384,19 @@ def get_live_positions():
             "realized_pnl": p.get("realizedPnl"),
             "currency": p.get("currency", "USD"),
         })
+
     return positions
-
-
-# ---------------------------------------------------------------------------
-# Position sync — pull live holdings into imported_positions
-# ---------------------------------------------------------------------------
-
-@router.post("/sync/positions", summary="Pull live IBKR positions into imported_positions")
-async def sync_positions(pool=Depends(get_pool)):
-    """
-    Fetches the current open positions from IBKR and upserts them into
-    imported_positions (source='ibkr'). After this, hitting Update Portfolio
-    will price them via yfinance and write a snapshot.
-
-    Old IBKR positions not returned by this call (i.e. closed trades) are
-    removed so the dashboard never shows stale holdings.
-    """
-    if not config.IBKR_ENABLED or not config.IBKR_ACCOUNT_ID:
-        return {"synced": 0, "message": "IBKR not configured — set IBKR_ENABLED=true and IBKR_ACCOUNT_ID"}
-    if not ibkr_client.is_connected():
-        return {"synced": 0, "message": "IBKR not connected — check /ibkr/status"}
-
-    import asyncio
-    try:
-        raw = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: ibkr_client.get_positions(config.IBKR_ACCOUNT_ID)
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"IBKR positions fetch failed: {exc}")
-
-    # Replace all IBKR positions atomically (handles closed positions)
-    await pool.execute(
-        "DELETE FROM imported_positions WHERE account_id=$1 AND source='ibkr'",
-        config.IBKR_ACCOUNT_ID,
-    )
-
-    synced = 0
-    for p in raw:
-        qty = float(p.get("position", 0))
-        if abs(qty) < 0.00001:
-            continue
-        symbol = (p.get("ticker") or p.get("contractDesc") or "").upper().strip()
-        if not symbol:
-            continue
-        avg_cost = float(p.get("avgCost") or 0) or None
-        cost_basis_total = (avg_cost * abs(qty)) if avg_cost else None
-        await pool.execute(
-            """
-            INSERT INTO imported_positions
-                (account_id, symbol, quantity, avg_cost, cost_basis_total,
-                 source, snapshot_date, updated_at)
-            VALUES ($1,$2,$3,$4,$5,'ibkr',CURRENT_DATE,NOW())
-            ON CONFLICT (account_id, symbol) DO UPDATE SET
-                quantity=EXCLUDED.quantity,
-                avg_cost=EXCLUDED.avg_cost,
-                cost_basis_total=EXCLUDED.cost_basis_total,
-                source='ibkr',
-                snapshot_date=CURRENT_DATE,
-                updated_at=NOW()
-            """,
-            config.IBKR_ACCOUNT_ID, symbol, qty, avg_cost, cost_basis_total,
-        )
-        synced += 1
-
-    logger.info("IBKR sync/positions: %d positions for %s", synced, config.IBKR_ACCOUNT_ID)
-    return {"synced": synced, "account_id": config.IBKR_ACCOUNT_ID,
-            "message": f"{synced} positions synced — hit Update Portfolio to price them"}
 
 
 # ---------------------------------------------------------------------------
 # Trade sync
 # ---------------------------------------------------------------------------
 
-async def _sync_ibkr_trades(pool) -> dict:
+@router.post("/sync/trades", summary="Pull IBKR trade history into the trades table")
+async def sync_recent_trades(pool=Depends(get_pool)):
     """
-    Fetches the last ~24 hours of fills from IBKR and inserts any new ones
-    into the trades table. Existing trades are matched by ibkr_order_id and skipped.
+    Fetches buy/sell history from IBKR Portfolio Analyst (up to ~2y per holding)
+    plus recent iserver fills, then inserts new rows into trades.
     """
-    if not config.IBKR_ENABLED or not config.IBKR_ACCOUNT_ID:
-        return {"inserted": 0, "skipped": 0, "total_from_ibkr": 0,
-                "message": "IBKR not configured. Set IBKR_ENABLED=true and IBKR_ACCOUNT_ID."}
-    if not ibkr_client.is_connected():
-        return {"inserted": 0, "skipped": 0, "total_from_ibkr": 0,
-                "message": "IBKR gateway not connected. Check /ibkr/status for details."}
-
-    raw_trades = ibkr_client.get_recent_trades(config.IBKR_ACCOUNT_ID)
-    if not raw_trades:
-        return {"inserted": 0, "skipped": 0, "total_from_ibkr": 0, "message": "No recent trades returned by IBKR"}
-
-    inserted = 0
-    skipped = 0
-    errors = []
-
-    for t in raw_trades:
-        order_id = str(t.get("execution_id") or t.get("orderId") or "").strip()
-        if not order_id:
-            skipped += 1
-            continue
-
-        existing = await pool.fetchval("SELECT id FROM trades WHERE ibkr_order_id = $1", order_id)
-        if existing:
-            skipped += 1
-            continue
-
-        try:
-            raw_side = str(t.get("side", "")).upper()
-            side = "BUY" if raw_side in ("BOT", "BUY", "B") else "SELL"
-
-            qty = Decimal(str(t.get("size") or t.get("quantity") or 0))
-            price = Decimal(str(t.get("price") or 0))
-            commission = Decimal(str(t.get("commission") or 0))
-
-            gross = (qty * price).quantize(Decimal("0.01"))
-            net = -(gross + commission) if side == "BUY" else gross - commission
-
-            raw_time = t.get("trade_time") or t.get("tradeTime") or t.get("time")
-            if raw_time:
-                try:
-                    trade_date = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
-                except ValueError:
-                    trade_date = datetime.utcnow()
-            else:
-                trade_date = datetime.utcnow()
-
-            symbol = (t.get("symbol") or t.get("ticker") or "").upper().strip()
-            if not symbol:
-                errors.append(f"Trade {order_id}: missing symbol, skipped")
-                skipped += 1
-                continue
-
-            await pool.execute(
-                """
-                INSERT INTO trades
-                  (source, account_id, trade_date, symbol, side, quantity, price,
-                   commission, gross_amount, net_amount, ibkr_order_id, raw_data)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                """,
-                "ibkr", config.IBKR_ACCOUNT_ID, trade_date, symbol, side,
-                float(qty), float(price), float(commission),
-                float(gross), float(net), order_id, json.dumps(t),
-            )
-            inserted += 1
-
-        except (InvalidOperation, ValueError) as exc:
-            msg = f"Trade {order_id}: parse error — {exc}"
-            logger.warning(msg)
-            errors.append(msg)
-            skipped += 1
-        except Exception as exc:
-            msg = f"Trade {order_id}: DB error — {exc}"
-            logger.error(msg)
-            errors.append(msg)
-            skipped += 1
-
-    logger.info("IBKR sync: inserted=%d skipped=%d errors=%d", inserted, skipped, len(errors))
-    return {
-        "inserted": inserted,
-        "skipped": skipped,
-        "total_from_ibkr": len(raw_trades),
-        "errors": errors or None,
-    }
-
-
-@router.post("/sync/trades", summary="Pull recent IBKR fills into trades table (also runs automatically every hour)")
-async def sync_recent_trades(background_tasks: BackgroundTasks, pool=Depends(get_pool)):
-    if not config.IBKR_ENABLED or not config.IBKR_ACCOUNT_ID:
-        return {"inserted": 0, "skipped": 0, "total_from_ibkr": 0, "message": "IBKR not configured"}
-    if not ibkr_client.is_connected():
-        return {"inserted": 0, "skipped": 0, "total_from_ibkr": 0, "message": "IBKR gateway not connected"}
-    result = await _sync_ibkr_trades(pool)
-    # Refresh today's snapshot after sync so dashboard numbers update
-    if result.get("inserted", 0) > 0:
-        from services.portfolio_metrics import backfill_snapshots
-        background_tasks.add_task(backfill_snapshots, pool)
-    return result
+    _require_ibkr()
+    return await sync_ibkr_trades(pool)

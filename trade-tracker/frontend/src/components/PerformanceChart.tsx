@@ -25,7 +25,7 @@ export default function PerformanceChart({ data }: Props) {
       <div className="flex flex-col items-center justify-center h-64 gap-2" style={{ color: '#9ca3af' }}>
         <p className="text-sm">No performance data yet.</p>
         <p className="text-xs" style={{ color: '#c0ccd8' }}>
-          Call <code>POST /portfolio/snapshots/generate</code> to generate a snapshot.
+          Loading historical prices — this may take a moment on first load.
         </p>
       </div>
     )
