@@ -1,9 +1,11 @@
 import { useState, useEffect, useCallback, type ReactNode } from 'react'
-import { Search, Construction, RefreshCw, Settings, Bell, LogOut, User, Wallet } from 'lucide-react'
+import { Search, Construction, Database, RefreshCw, Settings, Bell, LogOut, User, Wallet } from 'lucide-react'
+
 import type {
   AccountSummary,
   IBKRAccount,
   IBKRStatus,
+  MarketDataStatus,
   PerformancePoint,
   Period,
   PortfolioMetrics,
@@ -64,6 +66,19 @@ function fmtNum(n: number | null | undefined, decimals = 2, suffix = '') {
   return `${Number(n).toFixed(decimals)}${suffix}`
 }
 
+function marketProviderLabel(provider: string | null | undefined) {
+  switch ((provider ?? '').toLowerCase()) {
+    case 'firstrate':
+      return 'FirstRateData'
+    case 'ibkr':
+      return 'IBKR'
+    case 'yfinance':
+      return 'yfinance'
+    default:
+      return provider || 'market data'
+  }
+}
+
 /* ── card shell ── */
 function Card({
   title,
@@ -121,6 +136,7 @@ export default function Dashboard() {
   const [updateMsg, setUpdateMsg] = useState<string | null>(null)
   const [ibkrStatus, setIbkrStatus] = useState<IBKRStatus | null>(null)
   const [ibkrAccount, setIbkrAccount] = useState<IBKRAccount | null>(null)
+  const [marketDataStatus, setMarketDataStatus] = useState<MarketDataStatus | null>(null)
   const [showFidelityWizard, setShowFidelityWizard] = useState(false)
   const [showCashFlowModal, setShowCashFlowModal] = useState(false)
 
@@ -163,15 +179,19 @@ export default function Dashboard() {
       const res = await post<{
         ibkr_positions: number
         ibkr_trades_synced: number
-        yfinance_updated: number
-        yfinance_total: number
+        market_data_updated?: number
+        market_data_total?: number
+        yfinance_updated?: number
+        yfinance_total?: number
         snapshot_written: boolean
         portfolio_nav: number | null
       }>('/portfolio/update-all')
+      const marketUpdated = res.market_data_updated ?? res.yfinance_updated ?? 0
+      const marketTotal = res.market_data_total ?? res.yfinance_total ?? 0
       const parts: string[] = []
       if (res.ibkr_positions > 0) parts.push(`IBKR: ${res.ibkr_positions} pos`)
       if (res.ibkr_trades_synced > 0) parts.push(`${res.ibkr_trades_synced} new trades`)
-      parts.push(`yf: ${res.yfinance_updated}/${res.yfinance_total}`)
+      parts.push(`market: ${marketUpdated}/${marketTotal}`)
       parts.push(`snapshot ${res.snapshot_written ? '✓' : '✗'}`)
       if (res.portfolio_nav != null)
         parts.push(`NAV $${res.portfolio_nav.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`)
@@ -186,7 +206,7 @@ export default function Dashboard() {
 
   // The single "Update Portfolio" action is contextual: on Fidelity it opens
   // the upload wizard (there's no live feed to refresh), everywhere else it
-  // triggers the real IBKR/yfinance update.
+  // triggers the real IBKR/market-data update.
   function handleUpdateClick() {
     if (selectedTab === 'fidelity') {
       setShowFidelityWizard(true)
@@ -226,6 +246,12 @@ export default function Dashboard() {
       .catch(() => setIbkrStatus(null))
   }, [])
 
+  useEffect(() => {
+    get<MarketDataStatus>('/market/provider/status')
+      .then(setMarketDataStatus)
+      .catch(() => setMarketDataStatus(null))
+  }, [])
+
   // Wait for summary before analytics on broker tabs so account_id is known.
   useEffect(() => {
     if (selectedTab === 'trades') return
@@ -237,6 +263,7 @@ export default function Dashboard() {
       setChartLoading(false)
       return
     }
+
     loadAnalytics()
   }, [period, selectedTab, brokerAccountId, loading, loadAnalytics])
 
@@ -311,6 +338,16 @@ export default function Dashboard() {
 
         <div className="flex items-center gap-3 shrink-0">
           {updateMsg && <span className="text-xs hidden lg:inline" style={{ color: '#9ca3af' }}>{updateMsg}</span>}
+          {marketDataStatus && (
+            <span
+              className="hidden md:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium"
+              style={{ borderColor: '#d0dce8', color: '#374151', backgroundColor: '#f8fafc' }}
+              title={`Market data provider: ${marketProviderLabel(marketDataStatus.active_provider)}`}
+            >
+              <Database size={14} color="#6b7a99" strokeWidth={1.8} />
+              {marketProviderLabel(marketDataStatus.active_provider)}
+            </span>
+          )}
           {ibkrStatus?.enabled && (
             <span
               title={ibkrStatus.connected && ibkrStatus.authenticated ? 'IBKR connected' : 'IBKR connecting'}

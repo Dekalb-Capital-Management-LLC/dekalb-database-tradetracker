@@ -211,8 +211,6 @@ async def upsert_snapshot(
     Upsert a portfolio NAV snapshot.
     Also fetches SPY close for the date and stores it for overlay calculations.
     """
-    from services.market_data import get_historical_bars
-
     # Get SPY data for this date
     spy_bars = get_historical_bars("SPY", snapshot_date, snapshot_date)
     spy_close = Decimal(str(spy_bars[0].close)) if spy_bars else None
@@ -949,6 +947,7 @@ async def _metrics_from_points(
 
     paired_portfolio_returns, paired_benchmark_returns = _paired_beta_returns(points)
     beta_val = _beta(paired_portfolio_returns, paired_benchmark_returns)
+
 
     std_dev_daily = _std_dev(port_daily)
     std_dev_annual = std_dev_daily * math.sqrt(252) * 100 if std_dev_daily else None

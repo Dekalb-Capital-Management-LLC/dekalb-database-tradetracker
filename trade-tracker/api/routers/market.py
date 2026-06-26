@@ -2,10 +2,11 @@
 Market data router.
 
 Endpoints:
-  GET /market/quote/{symbol}          - current price quote (IBKR)
-  GET /market/quotes                  - batch price quotes (IBKR)
-  GET /market/history/{symbol}        - historical OHLCV bars (IBKR)
-  GET /market/spy                     - SPY benchmark data (IBKR)
+  GET /market/quote/{symbol}          - current price quote
+  GET /market/quotes                  - batch price quotes
+  GET /market/history/{symbol}        - historical OHLCV bars
+  GET /market/spy                     - SPY benchmark data
+  GET /market/provider/status         - active market-data provider status
 """
 from __future__ import annotations
 
@@ -27,13 +28,18 @@ def get_pool():
     return db.get_pool()
 
 
+@router.get("/provider/status")
+async def get_provider_status():
+    return market_data.provider_status()
+
+
 @router.get("/quote/{symbol}", response_model=PriceQuote)
 async def get_quote(symbol: str, pool=Depends(get_pool)):
     quote = await market_data.get_quote(pool, symbol.upper())
     if not quote:
         raise HTTPException(
             status_code=503,
-            detail=f"Could not fetch price for {symbol.upper()}. IBKR may be disconnected or symbol invalid.",
+            detail=f"Could not fetch price for {symbol.upper()} from any configured provider.",
         )
     return quote
 
@@ -77,6 +83,7 @@ async def get_history(
         raise HTTPException(status_code=400, detail="start must be before end")
 
     bars = await asyncio.to_thread(market_data.get_historical_bars, symbol.upper(), start, end)
+
     if not bars:
         raise HTTPException(
             status_code=503,
@@ -95,6 +102,7 @@ async def get_spy(
     start = start or (today - timedelta(days=365))
     end = end or today
     bars = await asyncio.to_thread(market_data.get_spy_history, start, end)
+
     if not bars:
         raise HTTPException(status_code=503, detail="No SPY data available")
     return bars

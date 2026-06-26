@@ -89,6 +89,7 @@ dekalb-database/
 │   │   │   ├── fidelity_parser.py  # Fidelity CSV parser — live, wired to /import/preview+commit
 │   │   │   ├── ibkr_parser.py      # IBKR Activity CSV parser (unreferenced — superseded by ibkr_client.py)
 │   │   │   ├── market_data.py      # IBKR-first, yfinance fallback, with cache
+
 │   │   │   └── portfolio_metrics.py
 │   │   ├── requirements.txt
 │   │   ├── Dockerfile
@@ -195,8 +196,9 @@ Services that start:
 | PostgreSQL | localhost:5432 | Direct DB access |
 | Ingestion Service | port 5555 | ZMQ PULL for quant events |
 
-IBKR credentials are optional — the dashboard works with yfinance for prices and
-the XLSX import for holdings.
+IBKR credentials are optional. For local market-data proxy testing, download the
+FirstRateData sample ZIP and set `FIRST_RATE_DATA_PATH` to that file; the XLSX
+import still supplies holdings.
 
 ### Option B — Without Docker
 
@@ -280,6 +282,7 @@ A web dashboard for tracking positions, P&L, and portfolio metrics vs SPY.
   kept as a secondary path.
 - **Prices**: IBKR-first when `IBKR_ENABLED=true`, yfinance fallback
   otherwise, refreshed automatically in the background.
+
 
 > **Known gaps (tracked in `docs/REPO_AUDIT.md`):** schema drift (three tables
 > only exist as runtime migrations, not in the schema file), no automated
@@ -450,7 +453,8 @@ Full interactive docs at `/docs` (Swagger UI). Endpoints have no path prefix.
 | `POST /import/trades` | Legacy portfolio `.xlsx` upload (hardcoded to `account_id='PORTFOLIO'`) |
 | `GET /import/history` | List past imports |
 | **Market** | |
-| `GET /market/quote/{symbol}` | Current price (IBKR when working, else yfinance) |
+| `GET /market/provider/status` | Active market-data provider order/config |
+| `GET /market/quote/{symbol}` | Current price (FirstRateData when configured, else IBKR/yfinance) |
 | `GET /market/quotes?symbols=AAPL,MSFT` | Batch quotes |
 | `GET /market/history/{symbol}` | Historical bars |
 | `GET /market/spy` | SPY benchmark data |
