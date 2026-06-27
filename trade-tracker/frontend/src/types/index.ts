@@ -100,6 +100,7 @@ export interface IBKRStatus {
   authenticated?: boolean
   api_url?: string
   account_id?: string
+  positions_count?: number
   message?: string
 }
 
