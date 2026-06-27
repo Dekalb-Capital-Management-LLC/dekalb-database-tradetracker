@@ -9,8 +9,10 @@ Endpoints:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Optional
@@ -176,14 +178,47 @@ async def _insert_trade(pool, parsed: dict) -> bool:
     return True
 
 
-async def sync_ibkr_trades(pool) -> dict:
-    """Pull IBKR PA + iserver fills into trades table. Used by endpoint and startup."""
-    sym_by_conid = ibkr_client.position_symbol_map(config.IBKR_ACCOUNT_ID)
-    conids = list(sym_by_conid.keys()) or ibkr_client.position_conids(config.IBKR_ACCOUNT_ID)
-    symbols_synced = len(conids)
+# Startup, the snapshot-cron container (every 5 min), and any number of
+# concurrent "Update Portfolio" clicks can all call sync_ibkr_trades around the
+# same time. Each call fans out into ~1 sequential, throttled IBKR HTTP request
+# per position (get_all_pa_transactions can't batch conids — IBKR truncates
+# history when it does) — that's the single biggest blocking sequence in this
+# API. Multiple overlapping callers used to mean multiple overlapping 18+-call
+# sequences hitting IBKR at once, which is exactly what trips IBKR's own
+# 503/429 rate limiting. The lock + short debounce window collapse all of that
+# into a single in-flight sync that every caller shares the result of.
+_sync_lock = asyncio.Lock()
+_last_sync_result: Optional[dict] = None
+_last_sync_at: float = 0.0
+SYNC_MIN_INTERVAL_SECONDS = 30
 
-    pa_trades = ibkr_client.get_all_pa_transactions(config.IBKR_ACCOUNT_ID, conids)
-    iserver_trades = ibkr_client.get_recent_trades(config.IBKR_ACCOUNT_ID)
+
+async def sync_ibkr_trades(pool) -> dict:
+    """Pull IBKR PA + iserver fills into trades table. Used by endpoint, startup, and cron."""
+    global _last_sync_result, _last_sync_at
+    async with _sync_lock:
+        if _last_sync_result is not None and (time.monotonic() - _last_sync_at) < SYNC_MIN_INTERVAL_SECONDS:
+            return {**_last_sync_result, "deduplicated": True}
+        result = await _sync_ibkr_trades_once(pool)
+        _last_sync_result = result
+        _last_sync_at = time.monotonic()
+        return result
+
+
+async def _sync_ibkr_trades_once(pool) -> dict:
+    # The actual IBKR fetches are synchronous and throttled with time.sleep
+    # between calls — run them on a worker thread so they don't block the
+    # single asyncio event loop (and therefore every other concurrent
+    # request) for the several seconds to a minute-plus this can take.
+    def _fetch_from_ibkr():
+        sym_by_conid = ibkr_client.position_symbol_map(config.IBKR_ACCOUNT_ID)
+        conids = list(sym_by_conid.keys()) or ibkr_client.position_conids(config.IBKR_ACCOUNT_ID)
+        pa_trades = ibkr_client.get_all_pa_transactions(config.IBKR_ACCOUNT_ID, conids)
+        iserver_trades = ibkr_client.get_recent_trades(config.IBKR_ACCOUNT_ID)
+        return sym_by_conid, conids, pa_trades, iserver_trades
+
+    sym_by_conid, conids, pa_trades, iserver_trades = await asyncio.to_thread(_fetch_from_ibkr)
+    symbols_synced = len(conids)
     total_from_ibkr = len(pa_trades) + len(iserver_trades)
 
     if not pa_trades and not iserver_trades:

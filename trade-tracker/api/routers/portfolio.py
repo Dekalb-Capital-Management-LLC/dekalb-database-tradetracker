@@ -10,6 +10,7 @@ Portfolio router.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import defaultdict
 from datetime import date, datetime
@@ -113,7 +114,9 @@ async def _compute_realized_pnl_fifo(pool, account_id: str) -> Decimal:
 
 async def _resolve_realized_pnl(pool, account_id: str) -> Decimal:
     """Prefer IBKR realized P&L when live; otherwise FIFO from trades."""
-    ibkr_val = _ibkr_realized_pnl(account_id)
+    # _ibkr_realized_pnl is a blocking IBKR HTTP call (throttled with time.sleep) —
+    # run off the event loop so it doesn't stall every other concurrent request.
+    ibkr_val = await asyncio.to_thread(_ibkr_realized_pnl, account_id)
     if ibkr_val is not None:
         return ibkr_val
     return await _compute_realized_pnl_fifo(pool, account_id)
@@ -125,7 +128,7 @@ async def _ibkr_portfolio_summary(pool) -> PortfolioSummary:
 
     acct = config.IBKR_ACCOUNT_ID
     positions = await _compute_positions(pool, acct)
-    raw = ibkr_client.get_account_summary(acct) or {}
+    raw = await asyncio.to_thread(ibkr_client.get_account_summary, acct) or {}
 
     equity = _extract_summary_amount(raw, "equitywithloanvalue") or sum(
         (p.market_value or Decimal(0) for p in positions), Decimal(0)
@@ -200,7 +203,10 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
         from services.ibkr_client import ibkr_client
         if ibkr_client.is_connected:
             try:
-                raw = ibkr_client.get_positions(account_id)
+                # Blocking IBKR HTTP call (throttled with time.sleep) — offload
+                # so it doesn't stall every other concurrent request on this
+                # single-process event loop.
+                raw = await asyncio.to_thread(ibkr_client.get_positions, account_id)
                 positions: list[PositionSummary] = []
                 for p in raw:
                     qty = p.get("position", 0)
@@ -247,7 +253,7 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
                 # overview should show — add it as a synthetic $1-NAV row, same
                 # visual treatment as Fidelity money-market cash.
                 try:
-                    ledger = ibkr_client.get_ledger(account_id) or {}
+                    ledger = await asyncio.to_thread(ibkr_client.get_ledger, account_id) or {}
                     base = ledger.get("BASE") or ledger.get("USD") or {}
                     raw_cash = base.get("cashbalance")
                     cash_balance = (
@@ -381,8 +387,9 @@ async def _account_summary(pool, account_id: str) -> AccountSummary:
         from services.ibkr_client import ibkr_client
         if ibkr_client.is_connected:
             try:
-                # Use /ledger for accurate cash, NAV, unrealized P&L
-                ledger = ibkr_client.get_ledger(account_id)
+                # Use /ledger for accurate cash, NAV, unrealized P&L (blocking IBKR
+                # call — offload so it doesn't stall every other request)
+                ledger = await asyncio.to_thread(ibkr_client.get_ledger, account_id)
                 base = (ledger or {}).get("BASE") or (ledger or {}).get("USD") or {}
 
                 def _f(key: str) -> Optional[Decimal]:
@@ -556,7 +563,6 @@ async def update_all(pool=Depends(get_pool)):
     via yfinance, then write today's snapshot. Both Fidelity and IBKR accounts
     show up as separate entries ΓÇö the existing account tab system handles it.
     """
-    import asyncio
     from services.portfolio_metrics import upsert_snapshot
 
     # ΓöÇΓöÇ Step 1: sync IBKR holdings (symbols + qty + avg_cost) + trade history ΓöÇΓöÇ
