@@ -40,7 +40,7 @@ async def reset_all_data(pool=Depends(get_pool)):
         await pool.execute("DELETE FROM imported_positions")
         await pool.execute("DELETE FROM fidelity_imports")
         logger.info("Data reset: all trades and snapshots cleared")
-        return {"message": "All trades and snapshots deleted.", "trades_remaining": trade_count}
+        return {"message": "All trades and snapshots deleted.", "trades_remaining": 0}
     except Exception as exc:
         logger.error("reset error: %s", exc)
         raise HTTPException(status_code=500, detail=f"Reset failed: {exc}")
@@ -76,8 +76,15 @@ async def list_trades(
         params.append(symbol.upper())
         idx += 1
     if source:
-        conditions.append(f"source = ${idx}")
-        params.append(source.lower())
+        # 'portfolio' is a legacy mislabel for custom-sheet uploads that
+        # should really be 'fidelity' — match both so old rows aren't
+        # invisible to the Fidelity filter until they're re-synced.
+        if source.lower() == "fidelity":
+            conditions.append(f"source = ANY(${idx})")
+            params.append(["fidelity", "portfolio"])
+        else:
+            conditions.append(f"source = ${idx}")
+            params.append(source.lower())
         idx += 1
     if label:
         conditions.append(f"label = ${idx}")

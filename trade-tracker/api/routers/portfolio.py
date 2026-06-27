@@ -22,6 +22,8 @@ import config
 import db
 from models.schemas import (
     AccountSummary,
+    CashFlowCreate,
+    CashFlowResponse,
     PerformancePoint,
     PortfolioMetrics,
     PortfolioSnapshotResponse,
@@ -47,6 +49,12 @@ def _extract_summary_amount(summary: dict, field: str) -> Optional[Decimal]:
 
 def _ibkr_realized_pnl(account_id: str) -> Optional[Decimal]:
     """Realized P&L from IBKR account summary or sum of position realizedPnl."""
+    if account_id != config.IBKR_ACCOUNT_ID:
+        # Don't hit IBKR's API for non-IBKR accounts (e.g. the Fidelity/PORTFOLIO
+        # account) — there's no such account on IBKR's side, so every call here
+        # was a guaranteed-failing real HTTP round trip.
+        return None
+
     from services.ibkr_client import ibkr_client
 
     if not config.IBKR_ENABLED or not ibkr_client.is_connected:
@@ -162,7 +170,27 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
     When IBKR is connected and account_id matches the IBKR account, uses live
     IBKR position data (accurate prices, cost basis from IB).
     Otherwise falls back to computing from trades ├ù IBKR snapshot prices.
+
+    For the combined/overview view (account_id=None), live IBKR positions are
+    merged in directly instead of falling through to the (separately-priced)
+    imported_positions snapshot for the IBKR account too — that snapshot is
+    only ever a fallback for when the live IBKR session is unavailable.
     """
+    if account_id is None and config.IBKR_ENABLED and config.IBKR_ACCOUNT_ID:
+        ibkr_positions = await _compute_positions(pool, config.IBKR_ACCOUNT_ID)
+        other_rows = await pool.fetch(
+            """
+            SELECT DISTINCT account_id FROM imported_positions WHERE account_id != $1
+            UNION
+            SELECT DISTINCT account_id FROM trades WHERE account_id != $1
+            """,
+            config.IBKR_ACCOUNT_ID,
+        )
+        other_positions: list[PositionSummary] = []
+        for r in other_rows:
+            other_positions.extend(await _compute_positions(pool, r["account_id"]))
+        return ibkr_positions + other_positions
+
     # --- IBKR live path ---
     if (
         config.IBKR_ENABLED
@@ -213,6 +241,34 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
                         unrealized_pnl_pct=unreal_pct,
                         label=label_row["label"] if label_row else None,
                     ))
+
+                # Cash isn't a "position" from IBKR's perspective (it comes from the
+                # ledger, not get_positions), but it's real account value the
+                # overview should show — add it as a synthetic $1-NAV row, same
+                # visual treatment as Fidelity money-market cash.
+                try:
+                    ledger = ibkr_client.get_ledger(account_id) or {}
+                    base = ledger.get("BASE") or ledger.get("USD") or {}
+                    raw_cash = base.get("cashbalance")
+                    cash_balance = (
+                        Decimal(str(round(float(raw_cash), 2))) if raw_cash is not None else None
+                    )
+                except Exception as exc:
+                    logger.warning("IBKR ledger fetch failed for cash row: %s", exc)
+                    cash_balance = None
+                if cash_balance and cash_balance > 0:
+                    positions.append(PositionSummary(
+                        symbol="CASH",
+                        account_id=account_id,
+                        quantity=cash_balance,
+                        avg_cost=Decimal("1"),
+                        current_price=Decimal("1"),
+                        market_value=cash_balance,
+                        unrealized_pnl=Decimal("0"),
+                        unrealized_pnl_pct=Decimal("0"),
+                        label=None,
+                    ))
+
                 return positions
             except Exception as exc:
                 logger.warning("IBKR live positions failed, falling back to trades: %s", exc)
@@ -404,9 +460,12 @@ async def _account_summary(pool, account_id: str) -> AccountSummary:
         account_id,
     )
 
+    # 'portfolio' is a stray legacy value from before custom-sheet uploads were
+    # correctly labelled 'fidelity' — normalize so old rows still match the tab.
+    raw_source = source_row["source"] if source_row else "fidelity"
     return AccountSummary(
         account_id=account_id,
-        source=source_row["source"] if source_row else "portfolio",
+        source="fidelity" if raw_source == "portfolio" else raw_source,
         total_nav=Decimal(str(snap_row["total_nav"])) if snap_row else None,
         cash_balance=None,
         equity_value=Decimal(str(equity_value)).quantize(Decimal("0.01")),
@@ -498,11 +557,11 @@ async def update_all(pool=Depends(get_pool)):
     show up as separate entries ΓÇö the existing account tab system handles it.
     """
     import asyncio
-    import yfinance as yf
     from services.portfolio_metrics import upsert_snapshot
 
-    # ΓöÇΓöÇ Step 1: sync IBKR holdings (symbols + qty + avg_cost) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    # ΓöÇΓöÇ Step 1: sync IBKR holdings (symbols + qty + avg_cost) + trade history ΓöÇΓöÇ
     ibkr_synced = 0
+    ibkr_trades_synced = 0
     if config.IBKR_ENABLED and config.IBKR_ACCOUNT_ID:
         from services.ibkr_client import ibkr_client
         if ibkr_client.is_connected:
@@ -545,56 +604,67 @@ async def update_all(pool=Depends(get_pool)):
             except Exception as exc:
                 logger.warning("IBKR position sync failed (yfinance will still run): %s", exc)
 
-    # ΓöÇΓöÇ Step 2: price ALL positions in imported_positions via yfinance ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+            # Pull trade/fill history too, so this one button covers what the
+            # separate "Sync IBKR" action used to do.
+            try:
+                from routers.ibkr import sync_ibkr_trades
+                trade_sync_result = await sync_ibkr_trades(pool)
+                ibkr_trades_synced = trade_sync_result.get("inserted", 0)
+            except Exception as exc:
+                logger.warning("IBKR trade history sync failed: %s", exc)
+
+    # ΓöÇΓöÇ Step 2: price non-IBKR positions via yfinance ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    # IBKR-sourced rows already have a correct live price from Step 1 / the
+    # live IBKR branch in _compute_positions — re-pricing them here via
+    # yfinance is what caused real positions to show $0.01-type garbage.
     rows = await pool.fetch(
-        "SELECT account_id, symbol, quantity, avg_cost, cost_basis_total FROM imported_positions"
+        "SELECT account_id, symbol, quantity, avg_cost, cost_basis_total, source "
+        "FROM imported_positions WHERE source != 'ibkr'"
     )
     if not rows:
         return {
             "ibkr_positions": ibkr_synced,
+            "ibkr_trades_synced": ibkr_trades_synced,
             "yfinance_updated": 0,
             "yfinance_total": 0,
             "snapshot_written": False,
             "portfolio_nav": None,
-            "message": "No positions found ΓÇö import a Fidelity file or connect IBKR",
+            "message": "No non-IBKR positions to price ΓÇö import a Fidelity file or connect IBKR",
         }
 
     symbols = list({r["symbol"] for r in rows})
     prices: dict[str, float] = {}
     price_errors: list[str] = []
 
+    # Explicit allowlist, not broad pattern matching ΓÇö some real tickers can
+    # look cash-like (e.g. "$CASH" is an actual traded symbol), so we only
+    # special-case well-known money-market/cash-sweep symbols.
     CASH_SYMBOLS = {"XXCASH", "CASH", "SPAXX", "FDRXX", "FCASH"}
-    cash_syms = {s for s in symbols if s.upper() in CASH_SYMBOLS or s.upper().startswith("XX")}
+    def _clean_sym(s: str) -> str:
+        return s.strip().upper().rstrip("*")
+    cash_syms = {s for s in symbols if _clean_sym(s) in CASH_SYMBOLS}
     market_syms = [s for s in symbols if s not in cash_syms]
 
     for s in cash_syms:
         prices[s] = 1.0
 
+    # Use the same live-quote primitive as everywhere else (real last-trade
+    # price via market_data.get_quote) instead of a separate yf.download with
+    # auto_adjust=True, which returns dividend/split-adjusted closes that
+    # drift from the actual quoted price, plus only ever the last completed
+    # daily bar rather than the live price.
+    MIN_SANE_PRICE = 0.05  # reject obviously-bad quotes (halted/unresolved tickers) instead of trusting any price > 0
     if market_syms:
-        try:
-            df = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: yf.download(
-                    " ".join(market_syms),
-                    period="5d",
-                    auto_adjust=True,
-                    progress=False,
-                    threads=True,
-                )
-            )
-            if not df.empty:
-                close = df["Close"] if "Close" in df.columns else df.xs("Close", axis=1, level=0)
-                for sym in market_syms:
-                    try:
-                        val = float(close.dropna().iloc[-1]) if len(market_syms) == 1 else float(close[sym].dropna().iloc[-1])
-                        if val > 0:
-                            prices[sym] = val
-                        else:
-                            price_errors.append(f"{sym}: zero price")
-                    except Exception as exc:
-                        price_errors.append(f"{sym}: {exc}")
-        except Exception as exc:
-            price_errors.append(f"batch fetch failed: {exc}")
+        await market_data.warm_quote_cache(pool, market_syms)
+        for sym in market_syms:
+            quote = await market_data.get_quote(pool, sym)
+            if quote is None:
+                price_errors.append(f"{sym}: no quote available")
+                continue
+            if quote.price >= Decimal(str(MIN_SANE_PRICE)):
+                prices[sym] = float(quote.price)
+            else:
+                price_errors.append(f"{sym}: suspiciously low price {quote.price}, rejected")
 
     yf_updated = 0
     for r in rows:
@@ -619,53 +689,23 @@ async def update_all(pool=Depends(get_pool)):
         )
         yf_updated += 1
 
-    # ΓöÇΓöÇ Step 3: write today's snapshot ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    # ΓöÇΓöÇ Step 3: write today's snapshot for every account (IBKR uses live NAV) ΓöÇΓöÇ
     snapshot_written = False
     snapshot_nav = None
     if yf_updated > 0 or ibkr_synced > 0:
         try:
-            today = date.today()
-            account_rows = await pool.fetch("SELECT DISTINCT account_id FROM imported_positions")
-            combined_nav = Decimal(0)
-            for ar in account_rows:
-                acct_id = ar["account_id"]
-                snap_total = await pool.fetchrow(
-                    "SELECT SUM(current_value) AS nav FROM imported_positions WHERE account_id=$1",
-                    acct_id,
-                )
-                nav = Decimal(str(snap_total["nav"] or 0))
-                prev = await pool.fetchrow(
-                    """
-                    SELECT total_nav FROM portfolio_snapshots
-                    WHERE account_id=$1 AND snapshot_date < $2
-                    ORDER BY snapshot_date DESC LIMIT 1
-                    """,
-                    acct_id, today,
-                )
-                await upsert_snapshot(pool, today, nav, acct_id, nav,
-                                      Decimal(str(prev["total_nav"])) if prev else None)
-                combined_nav += nav
-
-            prev_comb = await pool.fetchrow(
-                """
-                SELECT total_nav FROM portfolio_snapshots
-                WHERE account_id IS NULL AND snapshot_date < $1
-                ORDER BY snapshot_date DESC LIMIT 1
-                """,
-                today,
-            )
-            await upsert_snapshot(pool, today, combined_nav, None, combined_nav,
-                                  Decimal(str(prev_comb["total_nav"])) if prev_comb else None)
+            result = await portfolio_metrics.backfill_snapshots(pool)
             snapshot_written = True
-            snapshot_nav = float(combined_nav)
-            logger.info("update-all: snapshot written nav=%s", combined_nav)
+            snapshot_nav = result["combined_nav"]
+            logger.info("update-all: snapshot written nav=%s", snapshot_nav)
         except Exception as exc:
             logger.error("update-all: snapshot write failed: %s", exc)
 
-    logger.info("update-all: ibkr=%d yfinance=%d/%d errors=%d",
-                ibkr_synced, yf_updated, len(symbols), len(price_errors))
+    logger.info("update-all: ibkr=%d ibkr_trades=%d yfinance=%d/%d errors=%d",
+                ibkr_synced, ibkr_trades_synced, yf_updated, len(symbols), len(price_errors))
     return {
         "ibkr_positions": ibkr_synced,
+        "ibkr_trades_synced": ibkr_trades_synced,
         "yfinance_updated": yf_updated,
         "yfinance_total": len(symbols),
         "snapshot_written": snapshot_written,
@@ -724,20 +764,66 @@ async def get_snapshots(
         raise HTTPException(status_code=500, detail="Error fetching snapshots")
 
 
+@router.post("/cash-flows", response_model=CashFlowResponse)
+async def create_cash_flow(body: CashFlowCreate, pool=Depends(get_pool)):
+    """
+    Log a deposit/withdrawal (or dividend/interest) so performance math can
+    exclude external funding from "return". No automatic detection exists for
+    either IBKR or Fidelity right now — this is the only way flows get
+    recorded today.
+    """
+    row = await pool.fetchrow(
+        """
+        INSERT INTO cash_flows (account_id, flow_date, flow_type, amount, source, notes)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, account_id, flow_date, flow_type, amount, source, notes, created_at
+        """,
+        body.account_id, body.flow_date, body.flow_type, body.amount, body.source, body.notes,
+    )
+    return dict(row)
+
+
+@router.get("/cash-flows", response_model=list[CashFlowResponse])
+async def list_cash_flows(
+    account_id: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=2000),
+    pool=Depends(get_pool),
+):
+    if account_id:
+        rows = await pool.fetch(
+            "SELECT id, account_id, flow_date, flow_type, amount, source, notes, created_at "
+            "FROM cash_flows WHERE account_id=$1 ORDER BY flow_date DESC LIMIT $2",
+            account_id, limit,
+        )
+    else:
+        rows = await pool.fetch(
+            "SELECT id, account_id, flow_date, flow_type, amount, source, notes, created_at "
+            "FROM cash_flows ORDER BY flow_date DESC LIMIT $1",
+            limit,
+        )
+    return [dict(r) for r in rows]
+
+
+@router.delete("/cash-flows/{flow_id}")
+async def delete_cash_flow(flow_id: int, pool=Depends(get_pool)):
+    result = await pool.execute("DELETE FROM cash_flows WHERE id=$1", flow_id)
+    if result == "DELETE 0":
+        raise HTTPException(status_code=404, detail=f"Cash flow {flow_id} not found")
+    return {"deleted": flow_id}
+
+
 @router.post("/snapshots/backfill", tags=["portfolio"])
 async def backfill_snapshots_endpoint(
     background_tasks: BackgroundTasks,
-    start_date: Optional[date] = Query(None),
-    end_date: Optional[date] = Query(None),
     pool=Depends(get_pool),
 ):
     """
-    Rebuild historical NAV snapshots from trade history + IBKR historical bars.
-    Returns immediately ΓÇö runs in background (~30s for 2 years of history).
-    Safe to re-run: ON CONFLICT DO UPDATE.
+    Ensure today's NAV snapshot exists for every account. Not a full
+    historical rebuild (see portfolio_metrics.backfill_snapshots docstring).
+    Returns immediately — runs in background. Safe to re-run.
     """
-    background_tasks.add_task(portfolio_metrics.backfill_snapshots, pool, start_date, end_date)
-    return {"status": "started", "message": "Backfill running in background. Performance graph updates in ~30s."}
+    background_tasks.add_task(portfolio_metrics.backfill_snapshots, pool)
+    return {"status": "started", "message": "Snapshot refresh running in background."}
 
 
 @router.post("/snapshots/generate", tags=["portfolio"])

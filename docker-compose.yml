@@ -100,8 +100,10 @@ services:
       - trade-tracker
 
   # ---------------------------------------------------------------
-  # Cron - runs every hour:
-  #   1. POST /portfolio/snapshots/generate  — keeps NAV history up to date
+  # Cron - runs every 5 minutes (autonomous IBKR refresh, on a fixed/throttled
+  # cadence rather than ad hoc manual clicks, so we don't trip IBKR rate limits):
+  #   1. POST /portfolio/snapshots/generate  — keeps NAV history up to date,
+  #      using live IBKR pricing for the IBKR account (see _compute_positions)
   #   2. POST /ibkr/sync/trades              — pulls new IBKR fills automatically
   #      (no-ops gracefully if IBKR is not connected)
   # Waits 60s on startup to give trade-tracker time to be ready.
@@ -121,7 +123,7 @@ services:
                echo \"[cron] $$(date) — syncing IBKR trades...\";
                curl -s -X POST http://trade-tracker:8000/ibkr/sync/trades | head -c 200;
                echo '';
-               sleep 3600;
+               sleep 300;
              done"
 
   # ---------------------------------------------------------------

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Search } from 'lucide-react'
+import { Search, Construction, RefreshCw, Settings, Bell, LogOut, User, Wallet } from 'lucide-react'
 import type {
   AccountSummary,
   IBKRAccount,
@@ -11,9 +11,15 @@ import type {
   PositionSummary,
 } from '../types'
 import { get, post } from '../api/client'
+import { useAuth } from '../auth/AuthContext'
 import MetricCard from '../components/MetricCard'
 import PerformanceChart from '../components/PerformanceChart'
 import PositionsTable from '../components/PositionsTable'
+import FidelityUpdateWizard from '../components/FidelityUpdateWizard'
+import CashFlowModal from '../components/CashFlowModal'
+import Trades from './Trades'
+
+const FIDELITY_WIZARD_SESSION_KEY = 'fidelity_wizard_prompted'
 
 const PERIODS: { value: Period; label: string }[] = [
   { value: '1m', label: '1M' },
@@ -22,6 +28,21 @@ const PERIODS: { value: Period; label: string }[] = [
   { value: 'ytd', label: 'YTD' },
   { value: '1y', label: '1Y' },
 ]
+
+type TabKey = 'ibkr' | 'fidelity' | 'ironbeam' | 'trades'
+
+const TABS: { key: TabKey; label: string; disabled?: boolean }[] = [
+  { key: 'ibkr', label: 'IBKR' },
+  { key: 'fidelity', label: 'Fidelity' },
+  { key: 'ironbeam', label: 'IronBeam', disabled: true },
+  { key: 'trades', label: 'Trades' },
+]
+
+function sumOrNull(values: (number | null | undefined)[]) {
+  const nums = values.filter((v) => v != null).map(Number)
+  if (!nums.length) return null
+  return nums.reduce((a, b) => a + b, 0)
+}
 
 function fmt$(n: number | null | undefined) {
   if (n == null) return null
@@ -44,15 +65,29 @@ function fmtNum(n: number | null | undefined, decimals = 2, suffix = '') {
 }
 
 /* ── card shell ── */
-function Card({ title, children, action }: { title: string; children: React.ReactNode; action?: React.ReactNode }) {
+function Card({
+  title,
+  children,
+  action,
+  delay = 0,
+  className = '',
+}: {
+  title: string
+  children: React.ReactNode
+  action?: React.ReactNode
+  delay?: number
+  className?: string
+}) {
   return (
     <div
-      className="flex flex-col"
+      className={`flex flex-col animate-fade-in-up transition-all duration-200 hover:shadow-lg hover:-translate-y-0.5 ${className}`}
       style={{
         backgroundColor: '#ffffff',
         border: '1px solid #d0dce8',
         borderRadius: 12,
         overflow: 'hidden',
+        animationDelay: `${delay}ms`,
+        boxShadow: '0 1px 2px rgba(16,24,40,0.04)',
       }}
     >
       <div
@@ -70,9 +105,11 @@ function Card({ title, children, action }: { title: string; children: React.Reac
 }
 
 export default function Dashboard() {
+  const { signOut } = useAuth()
   const [period, setPeriod] = useState<Period>('ytd')
-  const [selectedAccount, setSelectedAccount] = useState<string | null>(null)
+  const [selectedTab, setSelectedTab] = useState<TabKey>('ibkr')
   const [symbolSearch, setSymbolSearch] = useState('')
+  const [logoError, setLogoError] = useState(false)
 
   const [summary, setSummary] = useState<PortfolioSummary | null>(null)
   const [metrics, setMetrics] = useState<PortfolioMetrics | null>(null)
@@ -84,10 +121,17 @@ export default function Dashboard() {
   const [updateMsg, setUpdateMsg] = useState<string | null>(null)
   const [ibkrStatus, setIbkrStatus] = useState<IBKRStatus | null>(null)
   const [ibkrAccount, setIbkrAccount] = useState<IBKRAccount | null>(null)
+  const [showFidelityWizard, setShowFidelityWizard] = useState(false)
+  const [showCashFlowModal, setShowCashFlowModal] = useState(false)
 
   const accounts: AccountSummary[] = summary?.accounts ?? []
 
-  const accountParam = selectedAccount ? `&account_id=${encodeURIComponent(selectedAccount)}` : ''
+  // Accounts belonging to the active tab (IronBeam/Trades never match — no source yet)
+  const brokerAccounts = accounts.filter((a) => a.source === selectedTab)
+  // Metrics/performance endpoints only take a single account_id, so we use the
+  // first matching account for the active broker (today there's at most one per broker)
+  const brokerAccountId = brokerAccounts[0]?.account_id ?? null
+  const accountParam = brokerAccountId ? `&account_id=${encodeURIComponent(brokerAccountId)}` : ''
 
   function loadSummary() {
     return get<PortfolioSummary>('/portfolio/summary')
@@ -96,12 +140,29 @@ export default function Dashboard() {
       .finally(() => setLoading(false))
   }
 
+  function loadAnalytics() {
+    if (selectedTab === 'trades') return Promise.resolve()
+    setChartLoading(true)
+    return Promise.allSettled([
+      get<PortfolioMetrics>(`/portfolio/metrics?period=${period}${accountParam}`),
+      get<PerformancePoint[]>(`/portfolio/performance?period=${period}${accountParam}`),
+    ])
+      .then(([metricsResult, perfResult]) => {
+        if (metricsResult.status === 'fulfilled') setMetrics(metricsResult.value)
+        else setMetrics(null)
+        if (perfResult.status === 'fulfilled') setPerformance(perfResult.value)
+        else setPerformance([])
+      })
+      .finally(() => setChartLoading(false))
+  }
+
   async function updatePortfolio() {
     setUpdating(true)
     setUpdateMsg(null)
     try {
       const res = await post<{
         ibkr_positions: number
+        ibkr_trades_synced: number
         yfinance_updated: number
         yfinance_total: number
         snapshot_written: boolean
@@ -109,12 +170,13 @@ export default function Dashboard() {
       }>('/portfolio/update-all')
       const parts: string[] = []
       if (res.ibkr_positions > 0) parts.push(`IBKR: ${res.ibkr_positions} pos`)
+      if (res.ibkr_trades_synced > 0) parts.push(`${res.ibkr_trades_synced} new trades`)
       parts.push(`yf: ${res.yfinance_updated}/${res.yfinance_total}`)
       parts.push(`snapshot ${res.snapshot_written ? '✓' : '✗'}`)
       if (res.portfolio_nav != null)
         parts.push(`NAV $${res.portfolio_nav.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`)
       setUpdateMsg(parts.join(' · '))
-      await loadSummary()
+      await Promise.all([loadSummary(), loadAnalytics()])
     } catch (e: any) {
       setUpdateMsg(`Error: ${e.message}`)
     } finally {
@@ -122,12 +184,34 @@ export default function Dashboard() {
     }
   }
 
-  // Load summary once on mount, auto-refresh every 5 min
+  // The single "Update Portfolio" action is contextual: on Fidelity it opens
+  // the upload wizard (there's no live feed to refresh), everywhere else it
+  // triggers the real IBKR/yfinance update.
+  function handleUpdateClick() {
+    if (selectedTab === 'fidelity') {
+      setShowFidelityWizard(true)
+    } else {
+      updatePortfolio()
+    }
+  }
+
+  // Load summary once on mount, auto-refresh every 5 min — matches the
+  // backend cron that now refreshes IBKR prices/snapshots on the same cadence.
   useEffect(() => {
     loadSummary()
-    const id = setInterval(loadSummary, 300_000)
+    const id = setInterval(() => {
+      loadSummary()
+      loadAnalytics()
+    }, 300_000)
     return () => clearInterval(id)
   }, [])
+
+  useEffect(() => {
+    if (selectedTab === 'fidelity' && !sessionStorage.getItem(FIDELITY_WIZARD_SESSION_KEY)) {
+      sessionStorage.setItem(FIDELITY_WIZARD_SESSION_KEY, '1')
+      setShowFidelityWizard(true)
+    }
+  }, [selectedTab])
 
   useEffect(() => {
     get<IBKRStatus>('/ibkr/status')
@@ -141,269 +225,367 @@ export default function Dashboard() {
   }, [])
 
   useEffect(() => {
-    setChartLoading(true)
-    Promise.allSettled([
-      get<PortfolioMetrics>(`/portfolio/metrics?period=${period}${accountParam}`),
-      get<PerformancePoint[]>(`/portfolio/performance?period=${period}${accountParam}`),
-    ])
-      .then(([metricsResult, perfResult]) => {
-        if (metricsResult.status === 'fulfilled') setMetrics(metricsResult.value)
-        else setMetrics(null)
-        if (perfResult.status === 'fulfilled') setPerformance(perfResult.value)
-        else setPerformance([])
-      })
-      .finally(() => setChartLoading(false))
-  }, [period, selectedAccount])
+    loadAnalytics()
+  }, [period, selectedTab])
 
-  const activeAccount: AccountSummary | null =
-    selectedAccount ? accounts.find((a) => a.account_id === selectedAccount) ?? null : null
+  const hasBrokerData = brokerAccounts.length > 0
 
-  const equityValue =
-    activeAccount?.equity_value ??
-    summary?.combined_equity_value ??
-    summary?.combined_nav ??
-    ibkrAccount?.total_nav
-  const dayPnl = activeAccount?.day_pnl ?? summary?.combined_day_pnl
-  const dayPnlPct = activeAccount?.day_pnl_pct ?? summary?.combined_day_pnl_pct
-  const unrealizedPnl = activeAccount?.total_unrealized_pnl ?? summary?.total_unrealized_pnl
-  const realizedPnl = activeAccount?.total_realized_pnl ?? summary?.total_realized_pnl
+  const equityValue = hasBrokerData
+    ? sumOrNull(brokerAccounts.map((a) => a.equity_value)) ?? ibkrAccount?.total_nav
+    : null
+  const dayPnl = hasBrokerData ? sumOrNull(brokerAccounts.map((a) => a.day_pnl)) : null
+  const dayPnlPct = brokerAccounts.length === 1 ? brokerAccounts[0].day_pnl_pct : null
+  const unrealizedPnl = hasBrokerData ? sumOrNull(brokerAccounts.map((a) => a.total_unrealized_pnl)) : null
+  const realizedPnl = hasBrokerData ? sumOrNull(brokerAccounts.map((a) => a.total_realized_pnl)) : null
 
+  const brokerAccountIds = new Set(brokerAccounts.map((a) => a.account_id))
   const allPositions: PositionSummary[] = summary?.positions ?? []
   const filteredPositions = allPositions.filter((p) => {
-    const matchAccount = selectedAccount ? p.account_id === selectedAccount : true
+    const matchAccount = brokerAccountIds.has(p.account_id)
     const matchSymbol = symbolSearch.trim()
       ? p.symbol.toUpperCase().includes(symbolSearch.trim().toUpperCase())
       : true
     return matchAccount && matchSymbol
   })
 
-  /* ── Tab bar: Overview + per-account ── */
-  const tabs = [
-    { key: null, label: 'Overview' },
-    ...accounts.map((a) => ({ key: a.account_id, label: a.account_id })),
-  ]
+  const ibkrDotColor = !ibkrStatus?.enabled
+    ? '#c0ccd8'
+    : ibkrStatus.connected && ibkrStatus.authenticated
+    ? '#16a34a'
+    : '#d97706'
 
   return (
-    <div className="flex flex-col h-full">
-      {/* Page header */}
-      <div className="flex items-start justify-between mb-6">
-        <div>
-          <h2 className="text-xl font-semibold text-white">Portfolio Overview</h2>
-          {summary && (
-            <p className="text-xs text-gray-500 mt-0.5">
-              As of {new Date(summary.as_of).toLocaleString()}
-            </p>
-          )}
-        </div>
-
-        <div className="flex items-center gap-3">
-          {updateMsg && <span className="text-xs text-gray-400">{updateMsg}</span>}
-          <button
-            onClick={updatePortfolio}
-            disabled={updating}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white transition-colors"
-          >
-            {updating ? '⏳ Updating...' : '↻ Update Portfolio'}
-          </button>
-        </div>
-
-        {/* Period selector */}
-        <div className="flex bg-gray-900 border border-gray-800 rounded-lg p-1 gap-0.5">
-          {PERIODS.map((p) => (
-            <button
-              key={p.value}
-              onClick={() => setPeriod(p.value)}
-              className={`px-3 py-1.5 rounded text-sm font-medium transition-colors ${
-                period === p.value
-                  ? 'bg-blue-600 text-white'
-                  : 'text-gray-400 hover:text-white'
-              }`}
+    <div className="flex flex-col min-h-screen" style={{ backgroundColor: '#e8edf5' }}>
+      {/* Top white bar — logo, title/timestamp, IBKR dot, update action, account, settings */}
+      <header
+        className="flex items-center justify-between px-6 shrink-0 gap-4"
+        style={{ backgroundColor: '#ffffff', borderBottom: '1px solid #e2e8f0', height: 64, zIndex: 10 }}
+      >
+        <div className="flex items-center gap-4 min-w-0">
+          {!logoError ? (
+            <img
+              src="/logo.png"
+              alt="DeKalb Capital"
+              style={{ height: 36, maxWidth: 160, objectFit: 'contain' }}
+              onError={() => setLogoError(true)}
+            />
+          ) : (
+            <div
+              className="flex items-center justify-center rounded font-bold text-sm shrink-0"
+              style={{ width: 36, height: 36, backgroundColor: '#1a2744', color: '#ffffff' }}
             >
-              {p.label}
-            </button>
-          ))}
-        </div>
-
-        {/* Search */}
-        <div
-          className="flex items-center gap-2 px-3 py-1.5 rounded-lg"
-          style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8', minWidth: 180 }}
-        >
-          <Search size={13} color="#9ca3af" />
-          <input
-            type="text"
-            placeholder="Search..."
-            value={symbolSearch}
-            onChange={(e) => setSymbolSearch(e.target.value)}
-            className="text-sm bg-transparent outline-none w-full"
-            style={{ color: '#1a2744' }}
-          />
-        </div>
-      </div>
-
-      {ibkrStatus && (
-        <div
-          className="mx-8 mt-3 px-4 py-2.5 rounded-lg text-sm"
-          style={{
-            backgroundColor: ibkrStatus.connected && ibkrStatus.authenticated ? '#ecfdf5' : '#fffbeb',
-            border: `1px solid ${ibkrStatus.connected && ibkrStatus.authenticated ? '#a7f3d0' : '#fde68a'}`,
-            color: ibkrStatus.connected && ibkrStatus.authenticated ? '#065f46' : '#92400e',
-          }}
-        >
-          <span className="font-medium">IBKR</span>
-          {' · '}
-          {ibkrStatus.enabled ? (
-            ibkrStatus.connected && ibkrStatus.authenticated ? (
-              <>
-                Connected ({ibkrStatus.mode}) · {ibkrStatus.account_id}
-                {ibkrAccount?.total_nav != null && <> · NAV {fmt$(ibkrAccount.total_nav)}</>}
-                {ibkrStatus.positions_count != null && ibkrStatus.positions_count > 0 && (
-                  <> · {ibkrStatus.positions_count} positions</>
-                )}
-              </>
-            ) : (
-              <>Not connected — {ibkrStatus.message ?? 'check API logs'}</>
-            )
-          ) : (
-            <>{ibkrStatus.message ?? 'disabled'}</>
-          )}
-        </div>
-      )}
-
-      {/* Error bar */}
-      {error && (
-        <div
-          className="mx-8 mt-3 px-4 py-2.5 rounded-lg text-sm"
-          style={{ backgroundColor: '#fef2f2', border: '1px solid #fecaca', color: '#dc2626' }}
-        >
-          {error}
-        </div>
-      )}
-
-      {/* 2×2 grid */}
-      <div className="flex-1 grid grid-cols-2 grid-rows-2 gap-4 p-6 pt-4 min-h-0">
-        {/* Top-left: Performance Graph */}
-        <Card
-          title="Performance Graph"
-          action={
-            <span className="text-xs" style={{ color: '#9ca3af' }}>
-              Cumulative % vs SPY
-            </span>
-          }
-        >
-          {chartLoading ? (
-            <div className="h-full flex items-center justify-center text-sm" style={{ color: '#9ca3af' }}>
-              Loading...
+              DC
             </div>
-          ) : (
-            <PerformanceChart data={performance} />
           )}
-        </Card>
-
-        {/* Top-right: Portfolio Metrics */}
-        <Card title="Portfolio Metrics">
-          <div className="grid grid-cols-2 gap-3">
-            <MetricCard
-              label="Portfolio Value"
-              value={loading ? '...' : (fmt$(equityValue != null ? Number(equityValue) : null) ?? '—')}
-            />
-            <MetricCard
-              label="Today's P&L"
-              value={loading ? '...' : (fmt$(dayPnl != null ? Number(dayPnl) : null) ?? '—')}
-              subValue={fmtPct(dayPnlPct != null ? Number(dayPnlPct) : null)}
-              positive={dayPnl == null ? null : Number(dayPnl) >= 0}
-            />
-            <MetricCard
-              label="Unrealized P&L"
-              value={loading ? '...' : (fmt$(unrealizedPnl != null ? Number(unrealizedPnl) : null) ?? '—')}
-              positive={unrealizedPnl == null ? null : Number(unrealizedPnl) >= 0}
-            />
-            <MetricCard
-              label="Realized P&L"
-              value={loading ? '...' : (fmt$(realizedPnl != null ? Number(realizedPnl) : null) ?? '—')}
-              positive={realizedPnl == null ? null : Number(realizedPnl) >= 0}
-            />
-            <MetricCard
-              label={`Return (${period.toUpperCase()})`}
-              value={
-                chartLoading
-                  ? '...'
-                  : fmtPct(metrics?.total_return_pct != null ? Number(metrics.total_return_pct) : null) ?? '—'
-              }
-              subValue={
-                metrics?.spy_return_pct != null
-                  ? `SPY: ${fmtPct(Number(metrics.spy_return_pct))}`
-                  : undefined
-              }
-              positive={metrics?.total_return_pct == null ? null : Number(metrics.total_return_pct) >= 0}
-            />
-            <MetricCard
-              label="Max Drawdown"
-              value={
-                chartLoading
-                  ? '...'
-                  : fmtNum(metrics?.max_drawdown_pct != null ? Number(metrics.max_drawdown_pct) : null, 2, '%') ?? '—'
-              }
-              positive={false}
-            />
+          <div className="hidden sm:block min-w-0" style={{ borderLeft: '1px solid #e2e8f0', paddingLeft: 16 }}>
+            <h2 className="text-base font-semibold truncate" style={{ color: '#1a2744' }}>Portfolio Overview</h2>
+            <p className="text-xs truncate" style={{ color: '#9ca3af' }}>
+              {summary ? `As of ${new Date(summary.as_of).toLocaleString()}` : ' '}
+            </p>
           </div>
-        </Card>
+        </div>
 
-        {/* Bottom-left: Trade Reports */}
-        <Card title="Trade Reports">
-          <div className="grid grid-cols-2 gap-3">
-            <MetricCard
-              label="Sharpe Ratio"
-              value={
-                chartLoading
-                  ? '...'
-                  : fmtNum(metrics?.sharpe_ratio != null ? Number(metrics.sharpe_ratio) : null) ?? '—'
-              }
-              positive={metrics?.sharpe_ratio == null ? null : Number(metrics.sharpe_ratio) >= 1}
+        <div className="flex items-center gap-3 shrink-0">
+          {updateMsg && <span className="text-xs hidden lg:inline" style={{ color: '#9ca3af' }}>{updateMsg}</span>}
+          {ibkrStatus?.enabled && (
+            <span
+              title={ibkrStatus.connected && ibkrStatus.authenticated ? 'IBKR connected' : 'IBKR connecting'}
+              className={`w-2 h-2 rounded-full ${ibkrStatus.connected ? 'animate-pulse' : ''}`}
+              style={{ backgroundColor: ibkrDotColor }}
             />
-            <MetricCard
-              label="Win Rate"
-              value={
-                chartLoading
-                  ? '...'
-                  : fmtNum(metrics?.win_rate != null ? Number(metrics.win_rate) : null, 1, '%') ?? '—'
-              }
-              positive={metrics?.win_rate == null ? null : Number(metrics.win_rate) >= 50}
-            />
-            <MetricCard
-              label="Beta (vs SPY)"
-              value={
-                chartLoading
-                  ? '...'
-                  : fmtNum(metrics?.beta != null ? Number(metrics.beta) : null) ?? '—'
-              }
-            />
-            <MetricCard
-              label="Std Dev (Annual)"
-              value={
-                chartLoading
-                  ? '...'
-                  : fmtNum(metrics?.std_dev_annualized != null ? Number(metrics.std_dev_annualized) : null, 2, '%') ?? '—'
-              }
-            />
-          </div>
-        </Card>
-
-        {/* Bottom-right: Current Positions */}
-        <Card
-          title="Current Positions"
-          action={
-            <span className="text-xs font-normal" style={{ color: '#9ca3af' }}>
-              {filteredPositions.length} open
-            </span>
-          }
-        >
-          {loading ? (
-            <div className="text-sm" style={{ color: '#9ca3af' }}>Loading...</div>
-          ) : (
-            <PositionsTable positions={filteredPositions} />
           )}
-        </Card>
+          <button
+            onClick={() => setShowCashFlowModal(true)}
+            className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium border transition-colors hover:bg-gray-50"
+            style={{ borderColor: '#d0dce8', color: '#374151' }}
+            title="Log a deposit or withdrawal so it doesn't get counted as gain/loss"
+          >
+            <Wallet size={15} />
+            Deposit/Withdrawal
+          </button>
+          <button
+            onClick={handleUpdateClick}
+            disabled={updating}
+            className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold shadow-sm hover:shadow-md disabled:opacity-50 disabled:shadow-none transition-all"
+            style={{ backgroundColor: '#1a2744', color: '#ffffff' }}
+          >
+            <RefreshCw size={15} className={updating ? 'animate-spin' : ''} />
+            {updating ? 'Updating…' : 'Update Portfolio'}
+          </button>
+
+          <div className="flex items-center" style={{ borderLeft: '1px solid #e2e8f0', paddingLeft: 12, gap: 6 }}>
+            <div
+              className="flex items-center justify-center rounded-full transition-transform duration-150 hover:scale-105 cursor-pointer"
+              style={{ width: 34, height: 34, backgroundColor: '#d1dce8' }}
+              title="Account"
+            >
+              <User size={16} color="#6b7a99" />
+            </div>
+            <button className="p-2 rounded-lg hover:bg-gray-50 transition-colors" title="Settings">
+              <Settings size={16} color="#9ca3af" strokeWidth={1.8} />
+            </button>
+            <button className="p-2 rounded-lg hover:bg-gray-50 transition-colors" title="Notifications">
+              <Bell size={16} color="#9ca3af" strokeWidth={1.8} />
+            </button>
+            <button onClick={signOut} className="p-2 rounded-lg hover:bg-gray-50 transition-colors" title="Sign out">
+              <LogOut size={16} color="#9ca3af" strokeWidth={1.8} />
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <div className="flex-1 p-6 pb-0 flex flex-col">
+        {/* Tab row + period selector & search */}
+        <div className="flex items-center justify-between flex-wrap gap-3 mb-4">
+          <div className="flex items-end gap-1" style={{ borderBottom: '1px solid #e2e8f0' }}>
+            {TABS.map((t) => {
+              const isActive = selectedTab === t.key
+              return (
+                <button
+                  key={t.key}
+                  onClick={() => !t.disabled && setSelectedTab(t.key)}
+                  disabled={t.disabled && !isActive}
+                  className="relative px-4 py-2 text-sm font-medium transition-colors"
+                  style={{
+                    color: isActive ? '#2563eb' : t.disabled ? '#c0ccd8' : '#6b7a99',
+                    cursor: t.disabled ? 'default' : 'pointer',
+                  }}
+                >
+                  {t.label}
+                  {t.disabled && (
+                    <span
+                      className="ml-1.5 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded"
+                      style={{ backgroundColor: '#f1f5f9', color: '#9ca3af' }}
+                    >
+                      Soon
+                    </span>
+                  )}
+                  <span
+                    className="absolute left-0 right-0 -bottom-px h-0.5 rounded-full transition-all duration-200"
+                    style={{
+                      backgroundColor: isActive ? '#2563eb' : 'transparent',
+                      transform: isActive ? 'scaleX(1)' : 'scaleX(0.6)',
+                      opacity: isActive ? 1 : 0,
+                    }}
+                  />
+                </button>
+              )
+            })}
+          </div>
+
+          {selectedTab !== 'trades' && (
+            <div className="flex items-center gap-3">
+              <div className="flex bg-white border rounded-lg p-1 gap-0.5" style={{ borderColor: '#d0dce8' }}>
+                {PERIODS.map((p) => (
+                  <button
+                    key={p.value}
+                    onClick={() => setPeriod(p.value)}
+                    className="px-3 py-1.5 rounded text-sm font-medium transition-all"
+                    style={{
+                      backgroundColor: period === p.value ? '#2563eb' : 'transparent',
+                      color: period === p.value ? '#ffffff' : '#6b7a99',
+                      boxShadow: period === p.value ? '0 1px 4px rgba(37,99,235,0.35)' : 'none',
+                    }}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+
+              <div
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg transition-all focus-within:shadow-md"
+                style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8', minWidth: 180 }}
+              >
+                <Search size={13} color="#9ca3af" />
+                <input
+                  type="text"
+                  placeholder="Search..."
+                  value={symbolSearch}
+                  onChange={(e) => setSymbolSearch(e.target.value)}
+                  className="text-sm bg-transparent outline-none w-full"
+                  style={{ color: '#1a2744' }}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+
+        {selectedTab === 'fidelity' && (
+          <div
+            className="mb-3 px-4 py-2.5 rounded-lg text-sm animate-fade-in"
+            style={{ backgroundColor: '#eff6ff', border: '1px solid #bfdbfe', color: '#1e40af' }}
+          >
+            <span className="font-medium">Fidelity</span>
+            {' · '}positions are cached from your last upload — no need to re-upload every visit.
+            Use Update Portfolio above to refresh.
+          </div>
+        )}
+
+        {showFidelityWizard && (
+          <FidelityUpdateWizard
+            defaultAccountId={brokerAccounts.find((a) => a.source === 'fidelity')?.account_id ?? ''}
+            onClose={() => setShowFidelityWizard(false)}
+            // A fresh commit only writes quantity/avg_cost — it isn't priced
+            // and no snapshot exists for it yet. updatePortfolio() runs the
+            // real pricing + snapshot pass (skipping IBKR-sourced rows) and
+            // then reloads the summary, so the tab actually reflects the
+            // upload instead of showing stale/unpriced numbers.
+            onComplete={updatePortfolio}
+          />
+        )}
+
+        {showCashFlowModal && (
+          <CashFlowModal
+            defaultAccountId={brokerAccountId ?? ''}
+            onClose={() => setShowCashFlowModal(false)}
+            onSaved={() => { loadSummary(); loadAnalytics() }}
+          />
+        )}
+
+        {/* Error bar */}
+        {error && (
+          <div
+            className="mb-3 px-4 py-2.5 rounded-lg text-sm animate-fade-in"
+            style={{ backgroundColor: '#fef2f2', border: '1px solid #fecaca', color: '#dc2626' }}
+          >
+            {error}
+          </div>
+        )}
+
+        {selectedTab === 'trades' ? (
+          <div className="flex-1 -mx-6">
+            <Trades />
+          </div>
+        ) : selectedTab === 'ironbeam' ? (
+          <div
+            className="flex-1 flex flex-col items-center justify-center gap-3 rounded-xl pb-6 mb-6 animate-fade-in-up"
+            style={{ backgroundColor: '#ffffff', border: '1px dashed #d0dce8', color: '#9ca3af' }}
+          >
+            <Construction size={32} strokeWidth={1.5} />
+            <p className="text-sm font-medium" style={{ color: '#6b7a99' }}>IronBeam integration coming soon</p>
+            <p className="text-xs max-w-sm text-center">
+              We don't have an IronBeam connection wired up yet. This tab will show positions,
+              performance, and trade reports once that integration lands.
+            </p>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-4 pb-6 min-h-0">
+            {/* Stats row — replaces the old per-broker status banner */}
+            <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))' }}>
+              <MetricCard
+                label="Portfolio Value"
+                value={loading ? '...' : (fmt$(equityValue != null ? Number(equityValue) : null) ?? '—')}
+              />
+              <MetricCard
+                label="Today's P&L"
+                value={loading ? '...' : (fmt$(dayPnl != null ? Number(dayPnl) : null) ?? '—')}
+                subValue={fmtPct(dayPnlPct != null ? Number(dayPnlPct) : null)}
+                positive={dayPnl == null ? null : Number(dayPnl) >= 0}
+              />
+              <MetricCard
+                label="Unrealized P&L"
+                value={loading ? '...' : (fmt$(unrealizedPnl != null ? Number(unrealizedPnl) : null) ?? '—')}
+                positive={unrealizedPnl == null ? null : Number(unrealizedPnl) >= 0}
+              />
+              <MetricCard
+                label="Realized P&L"
+                value={loading ? '...' : (fmt$(realizedPnl != null ? Number(realizedPnl) : null) ?? '—')}
+                positive={realizedPnl == null ? null : Number(realizedPnl) >= 0}
+              />
+              <MetricCard
+                label={`Return (${period.toUpperCase()})`}
+                value={
+                  chartLoading
+                    ? '...'
+                    : fmtPct(metrics?.total_return_pct != null ? Number(metrics.total_return_pct) : null) ?? '—'
+                }
+                subValue={
+                  metrics?.spy_return_pct != null
+                    ? `SPY: ${fmtPct(Number(metrics.spy_return_pct))}`
+                    : undefined
+                }
+                positive={metrics?.total_return_pct == null ? null : Number(metrics.total_return_pct) >= 0}
+              />
+              <MetricCard
+                label="Max Drawdown"
+                value={
+                  chartLoading
+                    ? '...'
+                    : fmtNum(metrics?.max_drawdown_pct != null ? Number(metrics.max_drawdown_pct) : null, 2, '%') ?? '—'
+                }
+                positive={false}
+              />
+              <MetricCard
+                label="Sharpe Ratio"
+                value={
+                  chartLoading
+                    ? '...'
+                    : fmtNum(metrics?.sharpe_ratio != null ? Number(metrics.sharpe_ratio) : null) ?? '—'
+                }
+                positive={metrics?.sharpe_ratio == null ? null : Number(metrics.sharpe_ratio) >= 1}
+              />
+              <MetricCard
+                label="Win Rate"
+                value={
+                  chartLoading
+                    ? '...'
+                    : fmtNum(metrics?.win_rate != null ? Number(metrics.win_rate) : null, 1, '%') ?? '—'
+                }
+                positive={metrics?.win_rate == null ? null : Number(metrics.win_rate) >= 50}
+              />
+              <MetricCard
+                label="Beta (vs SPY)"
+                value={
+                  chartLoading
+                    ? '...'
+                    : fmtNum(metrics?.beta != null ? Number(metrics.beta) : null) ?? '—'
+                }
+              />
+              <MetricCard
+                label="Std Dev (Annual)"
+                value={
+                  chartLoading
+                    ? '...'
+                    : fmtNum(metrics?.std_dev_annualized != null ? Number(metrics.std_dev_annualized) : null, 2, '%') ?? '—'
+                }
+              />
+            </div>
+
+            {/* Big performance graph, full width */}
+            <Card
+              title="Performance Graph"
+              delay={0}
+              action={<span className="text-xs" style={{ color: '#9ca3af' }}>Cumulative % vs SPY</span>}
+            >
+              <div style={{ height: 360 }}>
+                {chartLoading ? (
+                  <div className="h-full flex items-center justify-center text-sm" style={{ color: '#9ca3af' }}>
+                    Loading...
+                  </div>
+                ) : (
+                  <PerformanceChart data={performance} />
+                )}
+              </div>
+            </Card>
+
+            {/* Current positions, full width, cash pinned + highlighted inside PositionsTable */}
+            <Card
+              title="Current Positions"
+              delay={120}
+              action={
+                <span className="text-xs font-normal" style={{ color: '#9ca3af' }}>
+                  {filteredPositions.length} open
+                </span>
+              }
+            >
+              {loading ? (
+                <div className="text-sm" style={{ color: '#9ca3af' }}>Loading...</div>
+              ) : (
+                <PositionsTable positions={filteredPositions} />
+              )}
+            </Card>
+          </div>
+        )}
       </div>
     </div>
   )

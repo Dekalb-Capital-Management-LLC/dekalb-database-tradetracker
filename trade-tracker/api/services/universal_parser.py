@@ -134,7 +134,11 @@ def parse_portfolio_xlsx(raw_bytes: bytes, import_id: int, account_id: str = "PO
 
             gross = (qty * price).quantize(Decimal("0.01"))
             trades.append(TradeCreate(
-                source="portfolio",
+                # 'portfolio' was never a real source value (schema only ever
+                # documented 'ibkr' | 'fidelity') — using it here meant every
+                # custom-sheet upload was invisible to anything that filtered
+                # by source='fidelity' (the Fidelity tab, trade log filter, etc).
+                source="fidelity",
                 account_id=account_id,
                 trade_date=trade_date,
                 symbol=symbol,

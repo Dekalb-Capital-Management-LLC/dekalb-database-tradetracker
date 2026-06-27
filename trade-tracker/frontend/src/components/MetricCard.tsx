@@ -16,6 +16,7 @@ export default function MetricCard({ label, value, subValue, positive }: MetricC
 
   return (
     <div
+      className="transition-all duration-150 hover:shadow-md hover:-translate-y-px"
       style={{
         backgroundColor: '#ffffff',
         border: '1px solid #d0dce8',
