@@ -6,6 +6,7 @@ with yfinance as fallback for quotes and historical bars.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +36,28 @@ logger = logging.getLogger(__name__)
 _price_cache: dict[str, tuple[float, PriceQuote]] = {}  # symbol -> (expires_at, quote)
 _hist_cache: dict[tuple, tuple[float, list[HistoricalBar]]] = {}  # cache key -> (expires_at, bars)
 _last_yf_request_at: float = 0.0
+
+# Cash-sweep symbols (IBKR's XXCASH, Fidelity's money-market funds) aren't real
+# tickers — quoting them via IBKR/yfinance always 404s. Checked here, the lowest
+# common layer every quote path (get_quote, warm_quote_cache) funnels through,
+# so any caller is covered even if it forgets its own cash-symbol filter.
+CASH_SYMBOLS = {"XXCASH", "CASH", "SPAXX", "FDRXX", "FCASH"}
+
+
+def is_cash_symbol(symbol: str) -> bool:
+    return symbol.strip().upper().rstrip("*") in CASH_SYMBOLS
+
+
+def _cash_quote(symbol: str) -> PriceQuote:
+    return PriceQuote(
+        symbol=symbol.upper(),
+        price=Decimal("1"),
+        change=None,
+        change_pct=None,
+        previous_close=None,
+        source="cash",
+        as_of=datetime.utcnow(),
+    )
 
 
 def _throttle_yfinance() -> None:
@@ -378,6 +401,9 @@ def _fetch_quote(symbol: str) -> Optional[PriceQuote]:
     Get current price for a symbol (sync).
     Uses IBKR when enabled, otherwise yfinance. Results cached briefly.
     """
+    if is_cash_symbol(symbol):
+        return _cash_quote(symbol)
+
     cached = _cached_quote(symbol)
     if cached:
         logger.debug("Cache hit for %s", symbol)
@@ -397,15 +423,30 @@ def _fetch_quote(symbol: str) -> Optional[PriceQuote]:
 
 # Async API used by routers (main branch compatibility)
 async def warm_quote_cache(pool, symbols: list[str]) -> None:
-    """Pre-fetch quotes for many symbols (sequential; uses IBKR/yfinance cache)."""
+    """Pre-fetch quotes for many symbols (sequential; uses IBKR/yfinance cache).
+
+    Runs on a worker thread: _fetch_quote is synchronous and throttles itself
+    with time.sleep between IBKR/yfinance calls, which would otherwise block
+    the single asyncio event loop — freezing every other concurrent request
+    (every other user's dashboard) for as long as this batch takes.
+    """
     uncached = [s.upper() for s in symbols if s and not _cached_quote(s.upper())]
-    for sym in uncached:
-        _fetch_quote(sym)
+    if not uncached:
+        return
+
+    def _fetch_all():
+        for sym in uncached:
+            _fetch_quote(sym)
+
+    await asyncio.to_thread(_fetch_all)
 
 
 async def get_quote(pool, symbol: str) -> Optional[PriceQuote]:
     """Async wrapper for routers — pool unused but kept for API compatibility."""
-    return _fetch_quote(symbol.upper())
+    cached = _cached_quote(symbol.upper())
+    if cached:
+        return cached
+    return await asyncio.to_thread(_fetch_quote, symbol.upper())
 
 
 def get_spy_history(start: date, end: date) -> list[HistoricalBar]:
