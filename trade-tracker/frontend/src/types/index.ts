@@ -145,7 +145,6 @@ export interface IBKRStatus {
   account_id?: string
   positions_count?: number
   message?: string
-  positions_count?: number
 }
 
 export interface IBKRAccount {
