@@ -89,6 +89,49 @@ export interface FidelityImport {
   imported_at: string
 }
 
+export interface PositionDiffRow {
+  account_id: string
+  symbol: string
+  old_quantity: number
+  new_quantity: number
+  delta: number
+  avg_cost: number
+}
+
+export interface ImportCommitPosition {
+  account_id: string
+  symbol: string
+  quantity: number
+  avg_cost: number
+}
+
+export interface ImportPreviewResponse {
+  preview_id: string
+  account_ids: string[]
+  filename: string
+  diff: PositionDiffRow[]
+  positions: ImportCommitPosition[]
+  errors: string[]
+}
+
+export interface LatestImportSummary {
+  account_id: string | null
+  filename: string | null
+  imported_at: string | null
+  position_count: number
+}
+
+export interface CashFlow {
+  id: number
+  account_id: string
+  flow_date: string
+  flow_type: 'deposit' | 'withdrawal' | 'dividend' | 'interest'
+  amount: number
+  source: string
+  notes: string | null
+  created_at: string
+}
+
 export type Period = '1m' | '3m' | '6m' | 'ytd' | '1y'
 
 export type TradeLabel = 'event-driven' | 'hedge' | 'long-term' | 'short-term' | 'unclassified'
@@ -101,6 +144,7 @@ export interface IBKRStatus {
   api_url?: string
   account_id?: string
   message?: string
+  positions_count?: number
 }
 
 export interface IBKRAccount {

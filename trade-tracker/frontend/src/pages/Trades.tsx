@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Search } from 'lucide-react'
+import { Search, Trash2 } from 'lucide-react'
 import type { Trade, TradeLabel } from '../types'
-import { get, patch, post } from '../api/client'
+import { del, get, patch } from '../api/client'
 import LabelBadge from '../components/LabelBadge'
 
 const LABELS: TradeLabel[] = ['event-driven', 'hedge', 'long-term', 'short-term', 'unclassified']
@@ -22,7 +22,8 @@ export default function Trades() {
   const [labelFilter, setLabelFilter] = useState('')
 
   const [editingId, setEditingId] = useState<number | null>(null)
-  const [syncing, setSyncing] = useState(false)
+  const [confirmingClear, setConfirmingClear] = useState(false)
+  const [clearing, setClearing] = useState(false)
   const popoverRef = useRef<HTMLDivElement>(null)
 
   const fetchTrades = useCallback(() => {
@@ -43,15 +44,16 @@ export default function Trades() {
 
   useEffect(() => { fetchTrades() }, [fetchTrades])
 
-  async function syncFromIbkr() {
-    setSyncing(true)
+  async function clearTradeLog() {
+    setClearing(true)
     try {
-      await post('/ibkr/sync/trades')
+      await del('/trades/reset')
+      setConfirmingClear(false)
       fetchTrades()
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'IBKR sync failed')
+      setError(e instanceof Error ? e.message : 'Clear failed')
     } finally {
-      setSyncing(false)
+      setClearing(false)
     }
   }
 
@@ -115,18 +117,39 @@ export default function Trades() {
       <div className="flex items-center justify-between mb-6">
         <h2 className="text-2xl font-bold" style={{ color: '#1a2744' }}>Trade Log</h2>
         <div className="flex items-center gap-3">
-          <span className="text-sm" style={{ color: '#9ca3af' }}>
-            {syncing ? 'Syncing from IBKR…' : `${trades.length} trades`}
-          </span>
-          <button
-            type="button"
-            onClick={syncFromIbkr}
-            disabled={syncing}
-            className="text-xs px-2 py-1 rounded border disabled:opacity-50"
-            style={{ borderColor: '#d0dce8', color: '#6b7a99' }}
-          >
-            Sync IBKR
-          </button>
+          <span className="text-sm" style={{ color: '#9ca3af' }}>{trades.length} trades</span>
+          {confirmingClear ? (
+            <div
+              className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs"
+              style={{ backgroundColor: '#fef2f2', border: '1px solid #fecaca', color: '#991b1b' }}
+            >
+              <span>Clear all trades, snapshots &amp; positions?</span>
+              <button
+                onClick={clearTradeLog}
+                disabled={clearing}
+                className="font-semibold px-2.5 py-1 rounded-md transition-colors disabled:opacity-50"
+                style={{ backgroundColor: '#dc2626', color: '#ffffff' }}
+              >
+                {clearing ? 'Clearing…' : 'Yes, clear'}
+              </button>
+              <button
+                onClick={() => setConfirmingClear(false)}
+                className="font-medium px-2.5 py-1 rounded-md border transition-colors hover:bg-white"
+                style={{ borderColor: '#fecaca', color: '#991b1b' }}
+              >
+                Cancel
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setConfirmingClear(true)}
+              className="inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border transition-colors hover:bg-[#fef2f2]"
+              style={{ borderColor: '#fecaca', color: '#dc2626' }}
+            >
+              <Trash2 size={13} /> Clear trade log
+            </button>
+          )}
         </div>
       </div>
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Optional
@@ -232,15 +233,28 @@ def get_historical_bars_batch(
         return result
 
     if config.IBKR_ENABLED:
+        # IBKR's history endpoint can take 10s+ per symbol (and frequently 503s) —
+        # fetching one symbol at a time here can block the whole request for
+        # minutes. Run them concurrently instead; still IBKR-first, just not serial.
         still_missing: list[str] = []
-        for sym in missing:
-            ibkr_bars = _fetch_hist_ibkr(sym, start, end, interval)
-            if ibkr_bars:
-                key = _hist_cache_key(sym, start, end, interval)
-                _store_bars(key, ibkr_bars)
-                result[sym] = ibkr_bars
-            else:
-                still_missing.append(sym)
+        with ThreadPoolExecutor(max_workers=min(8, len(missing))) as pool:
+            future_to_sym = {
+                pool.submit(_fetch_hist_ibkr, sym, start, end, interval): sym
+                for sym in missing
+            }
+            for future in future_to_sym:
+                sym = future_to_sym[future]
+                try:
+                    ibkr_bars = future.result()
+                except Exception as exc:
+                    logger.warning("IBKR history fetch failed for %s: %s", sym, exc)
+                    ibkr_bars = []
+                if ibkr_bars:
+                    key = _hist_cache_key(sym, start, end, interval)
+                    _store_bars(key, ibkr_bars)
+                    result[sym] = ibkr_bars
+                else:
+                    still_missing.append(sym)
         missing = still_missing
 
     if not missing:

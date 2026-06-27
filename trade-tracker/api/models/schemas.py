@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 # Enums / Literals
 # ---------------------------------------------------------------------------
 
-TradeSource = Literal["ibkr", "fidelity", "portfolio"]
+TradeSource = Literal["ibkr", "fidelity", "portfolio"]  # "portfolio" is legacy/deprecated — new rows use "fidelity"; kept here so old un-migrated rows still validate
 TradeSide = Literal["BUY", "SELL"]
 TradeLabel = Literal["event-driven", "hedge", "long-term", "short-term", "unclassified"]
 
@@ -184,3 +184,62 @@ class FidelityImportResponse(BaseModel):
     error_count: int
     error_message: Optional[str]
     imported_at: datetime
+
+
+class PositionDiffRow(BaseModel):
+    account_id: str
+    symbol: str
+    old_quantity: Decimal
+    new_quantity: Decimal
+    delta: Decimal
+    avg_cost: Decimal
+
+
+class ImportCommitPosition(BaseModel):
+    account_id: str
+    symbol: str
+    quantity: Decimal
+    avg_cost: Decimal
+
+
+class ImportPreviewResponse(BaseModel):
+    preview_id: str
+    account_ids: list[str]                    # all accounts touched by this file (1 for .xlsx, possibly many for a multi-account Fidelity CSV)
+    filename: str
+    diff: list[PositionDiffRow]               # changed rows only, for display
+    positions: list[ImportCommitPosition]     # full new snapshot, echo back (with edits) on commit
+    errors: list[str]
+
+
+class ImportCommitRequest(BaseModel):
+    preview_id: str
+    positions: list[ImportCommitPosition]
+
+
+class LatestImportSummary(BaseModel):
+    account_id: Optional[str]
+    filename: Optional[str]
+    imported_at: Optional[datetime]
+    position_count: int
+
+
+# ---------------------------------------------------------------------------
+# Cash flows (deposits/withdrawals excluded from performance; dividends/
+# interest are real return and stay in)
+# ---------------------------------------------------------------------------
+
+CashFlowType = Literal["deposit", "withdrawal", "dividend", "interest"]
+
+
+class CashFlowCreate(BaseModel):
+    account_id: str
+    flow_date: datetime
+    flow_type: CashFlowType
+    amount: Decimal           # positive = inflow, negative = outflow
+    source: TradeSource | Literal["manual"] = "manual"
+    notes: Optional[str] = None
+
+
+class CashFlowResponse(CashFlowCreate):
+    id: int
+    created_at: datetime

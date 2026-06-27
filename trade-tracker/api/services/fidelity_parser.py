@@ -34,6 +34,11 @@ _SELL_KEYWORDS = {"YOU SOLD", "SOLD", "SELL"}
 # Symbols to always skip
 _SKIP_SYMBOLS = {"SPAXX**", "SPAXX", "FDRXX", "FDRXX**", "FCASH**"}
 
+# Money-market / cash-sweep funds — real holdings (often 5-10% of an account),
+# but reported with no share quantity, so they need $1-NAV handling instead of
+# being skipped outright. Matches CASH_SYMBOLS in routers/portfolio.py.
+_CASH_FUND_SYMBOLS = {"SPAXX", "FDRXX", "FCASH"}
+
 
 def _parse_fidelity_decimal(raw: str) -> Optional[Decimal]:
     """Handle Fidelity number formats: (1,234.56) = -1234.56, +$1.23 = 1.23"""
@@ -253,11 +258,43 @@ def _parse_positions(
     today = datetime.combine(date.today(), datetime.min.time())
 
     for row_num, row in enumerate(reader, start=header_idx + 2):
+        row_account_id = (
+            col(row, "account name") or col(row, "account number", "account") or account_id
+        ).strip().upper() or account_id
+
         raw_symbol = _clean_symbol(col(row, "symbol"))
         description = col(row, "description", "security description")
 
         if not raw_symbol:
             continue
+
+        # Cash / money-market sweep positions (e.g. "SPAXX**") are real holdings
+        # — often 5-10% of an account — but have no share quantity, so they'd
+        # otherwise get silently dropped by _is_skip_row below. Represent them
+        # as a $1-NAV position using Current Value as the quantity, matching
+        # the CASH_SYMBOLS convention used elsewhere (routers/portfolio.py).
+        clean_for_cash = raw_symbol.lstrip("-").rstrip("*").strip()
+        if clean_for_cash in _CASH_FUND_SYMBOLS or "HELD IN MONEY MARKET" in description.upper():
+            cash_value = _parse_fidelity_decimal(col(row, "current value"))
+            if cash_value and cash_value > 0:
+                trades.append(TradeCreate(
+                    source="fidelity",
+                    account_id=row_account_id,
+                    trade_date=today,
+                    symbol=clean_for_cash or "CASH",
+                    side="BUY",
+                    quantity=cash_value,
+                    price=Decimal("1"),
+                    commission=Decimal(0),
+                    gross_amount=cash_value,
+                    net_amount=-cash_value,
+                    label=None,
+                    is_hedge=False,
+                    fidelity_import_id=import_id,
+                    raw_data={k.strip(): v.strip() for k, v in row.items() if k},
+                ))
+            continue
+
         if _is_skip_row(raw_symbol, description):
             continue
         raw_symbol = raw_symbol.lstrip("-").strip()
@@ -294,7 +331,7 @@ def _parse_positions(
 
         trades.append(TradeCreate(
             source="fidelity",
-            account_id=account_id,
+            account_id=row_account_id,
             trade_date=today,
             symbol=raw_symbol,
             side=side,

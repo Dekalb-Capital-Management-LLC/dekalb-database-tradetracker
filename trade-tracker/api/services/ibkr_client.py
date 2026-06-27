@@ -578,23 +578,32 @@ class IBKRClient:
 
 
     def get_conid(self, symbol: str) -> Optional[int]:
-
+        """
+        Resolve a ticker to an IBKR conid. /trsrv/stocks can return several
+        candidate companies/exchanges for one symbol (foreign listings,
+        unrelated companies that share a ticker abroad, etc.) — blindly
+        taking the first one risked pricing a completely different
+        instrument. Prefer a US-listed contract; only fall back to "first
+        result" if nothing is explicitly marked US.
+        """
         data = self._get("/v1/api/trsrv/stocks", params={"symbols": symbol})
 
         if not data:
-
             return None
 
         try:
+            entries = data.get(symbol.upper(), [])
+            if not entries:
+                return None
 
-            contracts = data.get(symbol.upper(), [])
+            for entry in entries:
+                for contract in entry.get("contracts", []):
+                    if contract.get("isUS"):
+                        return contract["conid"]
 
-            if contracts:
-
-                return contracts[0]["contracts"][0]["conid"]
+            return entries[0]["contracts"][0]["conid"]
 
         except (KeyError, IndexError, TypeError):
-
             logger.warning("Unexpected conid response for %s: %s", symbol, data)
 
         return None
@@ -768,8 +777,13 @@ class IBKRClient:
                     if cid is not None and raw not in (None, ""):
 
                         try:
-
-                            result[int(cid)] = float(raw)
+                            # Field 31 can come back prefixed with a status
+                            # character (e.g. "C" = reflects yesterday's
+                            # close, market not yet open) — strip leading
+                            # non-numeric characters instead of discarding
+                            # the value outright.
+                            cleaned = str(raw).lstrip("CcHh+ ")
+                            result[int(cid)] = float(cleaned)
 
                         except (TypeError, ValueError):
 

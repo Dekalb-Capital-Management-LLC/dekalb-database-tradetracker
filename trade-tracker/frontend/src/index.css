@@ -29,3 +29,11 @@ body {
 tr:hover td {
   background-color: rgba(37, 99, 235, 0.03);
 }
+
+/* Smooth focus rings everywhere */
+button, input, a {
+  transition: box-shadow 0.15s ease, transform 0.15s ease, background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+button:active {
+  transform: scale(0.97);
+}
