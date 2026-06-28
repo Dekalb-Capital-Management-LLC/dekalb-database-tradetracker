@@ -281,52 +281,23 @@ A web dashboard for tracking positions, P&L, and portfolio metrics vs SPY.
 
 ---
 
-## Deploying to Production (Railway + Vercel)
+## Deploying to Production (Railway + Cloudflare Pages)
 
-The backend deploys to **Railway**, the frontend to **Vercel**, linked via env
-vars (no shared secrets file). **This has not been completed/verified yet** — and
-note that until auth is actually enforced in the backend, `AUTH_ENABLED=true` is
-a no-op (see `docs/REPO_AUDIT.md`).
+The backend deploys to **Railway**, the frontend to **Cloudflare Pages**
+(chosen over Vercel — free tier, no new vendor to evaluate), linked via env
+vars (no shared secrets file). Google SSO is enforced server-side via
+`AuthMiddleware` in `main.py` — `AUTH_ENABLED=true` actually does something
+now, it's not a no-op.
 
-### 1. Backend → Railway
+Full step-by-step runbooks, in order:
 
-1. New Railway project from this repo. In the service's **Settings → Source**,
-   set **Root Directory** to `trade-tracker/api` (picks up `railway.toml` —
-   Dockerfile build, `/health` healthcheck).
-2. Add a **PostgreSQL** plugin. Railway injects `DATABASE_URL`; `config.py`
-   parses it and turns on `DB_SSL=require`.
-3. Set service env vars:
-
-   | Variable | Value |
-   |---|---|
-   | `AUTH_ENABLED` | `true` (no effect until auth is wired up — see audit) |
-   | `GOOGLE_CLIENT_ID` | from Google Cloud Console |
-   | `ALLOWED_EMAIL_DOMAIN` | `dekalbcapitalmanagement.com` |
-   | `FRONTEND_URL` | the Vercel URL (set after step 2) |
-   | `IBKR_ENABLED` | `false` (IBKR data doesn't work yet — leave off) |
-
-4. Deploy. Verify: `curl https://<service>.up.railway.app/health` → `status: ok`.
-
-### 2. Frontend → Vercel
-
-1. New Vercel project from this repo, **Root Directory** = `trade-tracker/frontend`
-   (Vite auto-detected via `vercel.json`).
-2. Set `VITE_API_BASE_URL` to the Railway URL from step 1 (no trailing slash, no
-   `/api` suffix — the API has no path prefix). Don't hardcode the Railway URL in
-   `vercel.json`; rewrites can't read env vars.
-
-### 3. Close the loop
-
-Set `FRONTEND_URL` on Railway to the Vercel URL and redeploy so CORS picks it up,
-then add the Vercel URL to the Google OAuth client's **Authorized JavaScript
-origins**.
+1. [`docs/DEPLOY_RAILWAY.md`](docs/DEPLOY_RAILWAY.md) — backend + Postgres
+2. [`docs/DEPLOY_GOOGLE_OAUTH.md`](docs/DEPLOY_GOOGLE_OAUTH.md) — domain-restricted Google sign-in
+3. [`docs/DEPLOY_CLOUDFLARE_PAGES.md`](docs/DEPLOY_CLOUDFLARE_PAGES.md) — frontend
 
 > **Railway gotcha:** don't use `${VAR:-default}` in `railway.toml` — Railway's
 > templating uses `${{...}}` and the two conflict. Put shell-expansion logic in
 > the Dockerfile `CMD` (`sh -c "..."`).
-> **CORS gotcha:** `main.py` currently appends `FRONTEND_URL` as a single origin
-> and does **not** split on commas — multiple origins won't work until that's
-> fixed (audit item).
 
 ---
 
