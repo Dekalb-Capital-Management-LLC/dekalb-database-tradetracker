@@ -3,21 +3,23 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
 
+# No startCommand here on purpose: Railway does not shell-expand a bare
+# "$PORT" in startCommand the way you'd expect from a shell script, so a
+# literal "$PORT" string gets passed to uvicorn's --port flag instead of the
+# actual port number. Falls back to the Dockerfile's CMD instead, which is
+# shell-wrapped ("sh -c ...") and expands ${PORT:-8000} correctly.
+#
 # Required environment variables (set these in Railway dashboard):
 #
-#   DB_HOST          = your Railway PostgreSQL host
-#   POSTGRES_DB      = trade_tracker
-#   POSTGRES_USER    = postgres
-#   POSTGRES_PASSWORD = (from Railway Postgres service)
+#   DATABASE_URL     = ${{Postgres.DATABASE_URL}} (reference, not a literal value)
+#   AUTH_ENABLED     = true
+#   GOOGLE_CLIENT_ID = (from Google Cloud Console — see docs/DEPLOY_GOOGLE_OAUTH.md)
+#   ALLOWED_EMAIL_DOMAIN = dekalbcapitalmanagement.com
+#   FRONTEND_URL     = (Cloudflare Pages URL — see docs/DEPLOY_CLOUDFLARE_PAGES.md)
 #
 #   IBKR_ENABLED     = true
-#   IBKR_CLIENT_ID   = (from IBKR developer portal)
-#   IBKR_CLIENT_SECRET = (from IBKR developer portal)
-#   IBKR_ACCOUNT_ID  = U1234567
-#   IBKR_REDIRECT_URI = https://YOUR-APP.railway.app/ibkr/auth/callback
-#
-#   FRONTEND_URL     = https://YOUR-APP.vercel.app
+#   IBKR_ACCOUNT_ID, IBKR_CLIENT_ID, IBKR_CLIENT_KEY_ID, IBKR_CREDENTIAL,
+#   IBKR_PRIVATE_KEY, IBKR_SERVER_IP = see README's "IBKR Web API Setup"

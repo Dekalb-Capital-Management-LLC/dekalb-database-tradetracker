@@ -11,12 +11,15 @@ import asyncio
 import logging
 from datetime import date
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 import config, db
 from routers import auth as auth_router
 from routers import ibkr, imports, market, portfolio, trades
 from routers.ibkr import sync_ibkr_trades
+from services.auth import AuthError, verify_google_id_token
 from services.ibkr_client import ibkr_client
 
 logging.basicConfig(
@@ -31,6 +34,43 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """Verifies the Google ID token on every request when AUTH_ENABLED.
+
+    Added before CORSMiddleware so that, in Starlette's middleware stack
+    (last-added = outermost), CORS wraps this and handles preflight OPTIONS
+    requests before they ever reach here.
+    """
+
+    _BYPASS_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
+
+    async def dispatch(self, request: Request, call_next):
+        if not config.AUTH_ENABLED:
+            return await call_next(request)
+        path = request.url.path
+        if path in self._BYPASS_PATHS or path.startswith("/auth/"):
+            return await call_next(request)
+
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header.lower().startswith("bearer "):
+            return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+
+        try:
+            claims = verify_google_id_token(auth_header[len("bearer "):].strip())
+        except AuthError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=401)
+
+        request.state.user = {
+            "email": claims.get("email"),
+            "name": claims.get("name"),
+            "picture": claims.get("picture"),
+            "sub": claims.get("sub"),
+        }
+        return await call_next(request)
+
+
+app.add_middleware(AuthMiddleware)
 
 _allowed_origins = [
     "http://localhost:3000",

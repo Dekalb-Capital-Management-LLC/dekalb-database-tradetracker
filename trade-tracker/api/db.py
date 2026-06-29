@@ -48,11 +48,14 @@ async def _ensure_db_exists() -> None:
 
 
 async def _apply_schema_if_empty(conn: asyncpg.Connection) -> None:
-    count = await conn.fetchval(
-        "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'"
-    )
-    if count == 0 and os.path.exists(_SCHEMA_FILE):
-        logger.warning("Database '%s' is empty — applying schema...", config.POSTGRES_DB)
+    # Check for the "trades" table specifically, not "any tables at all" — a
+    # prior crashed startup can leave stray tables behind (e.g. _apply_migrations
+    # creates ibkr_tokens via CREATE TABLE IF NOT EXISTS before failing on a
+    # later statement), which would otherwise permanently wedge this check into
+    # thinking the schema is already applied when it isn't.
+    has_core_table = await conn.fetchval("SELECT to_regclass('public.trades') IS NOT NULL")
+    if not has_core_table and os.path.exists(_SCHEMA_FILE):
+        logger.warning("Database '%s' is missing the base schema — applying it...", config.POSTGRES_DB)
         with open(_SCHEMA_FILE) as f:
             ddl = f.read()
         await conn.execute(ddl)
