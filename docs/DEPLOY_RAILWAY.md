@@ -48,12 +48,17 @@ Post-deploy, all green) and not "no active deployment":
 
 ## 4. Set the remaining env vars
 
+> If `AUTH_ENABLED` is currently `false` on Railway (e.g. left off during
+> dashboard testing), flip it back to `true` for the real go-live — and
+> confirm `GOOGLE_CLIENT_ID`/`ALLOWED_EMAIL_DOMAIN` below are real values, not
+> placeholders, before doing so.
+
 | Variable | Value | Why |
 |---|---|---|
 | `AUTH_ENABLED` | `true` | Turns on `AuthMiddleware` (see `docs/DEPLOY_GOOGLE_OAUTH.md`) |
 | `GOOGLE_CLIENT_ID` | from Google Cloud Console | Set after step 2 of the OAuth doc |
 | `ALLOWED_EMAIL_DOMAIN` | `dekalbcapitalmanagement.com` | Only this domain can sign in |
-| `IBKR_ENABLED` | `false` | IBKR positions/pricing don't work yet — stay on yfinance |
+| `IBKR_ENABLED` | `true` | IBKR positions/pricing work now; yfinance is just the fallback. Needs `IBKR_ACCOUNT_ID`, `IBKR_CLIENT_ID`, `IBKR_CLIENT_KEY_ID`, `IBKR_CREDENTIAL`, `IBKR_PRIVATE_KEY`, `IBKR_SERVER_IP` set too (see README's IBKR Web API setup) |
 | `FRONTEND_URL` | placeholder for now, e.g. `http://localhost:3000` | Update once Cloudflare Pages is live (step 3 of this deploy) — this drives CORS |
 
 ## 5. Expose it publicly

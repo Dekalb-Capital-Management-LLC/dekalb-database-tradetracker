@@ -1,6 +1,6 @@
 # Repo Audit & Roadmap
 
-_Last updated: 2026-06-11_
+_Last updated: 2026-06-28_
 
 Single source of truth for outstanding work across the repo. This is the input
 for Linear — each bullet below is roughly one issue. Projects are the top-level
@@ -8,12 +8,14 @@ headings; bullets under them are the work. Priorities are inline (**Urgent /
 High / Medium / Low**). No milestone structure yet — keep it flat and easy to
 triage.
 
-> **Reality check:** the Trade Tracker is **not** production-ready. Auth is wired
-> up in the frontend but not enforced by the backend, IBKR has never been
-> verified end-to-end against a live account, the production deploy was never
-> finished, parts of the dashboard are visually broken, and the docs (README /
-> CLAUDE.md) describe an older architecture that no longer matches the code. The
-> sections below break that down so it can be assigned out.
+> **Reality check:** this doc was last rewritten 2026-06-11, and a lot has
+> shipped since (IBKR integration, Fidelity CSV import wizard, Railway deploy,
+> dashboard UI fixes, cash-flow tracking, win-rate fix). Most of what used to
+> be "broken" below is now genuinely working — verified by reading the current
+> code, not just taken on faith. What's left is a shorter, more honest list:
+> mostly schema drift, missing automated tests, and a couple of approximate
+> metrics. The production deploy (Railway done; Google OAuth + Cloudflare
+> Pages in progress) is the active focus as of this update.
 
 ---
 
@@ -25,253 +27,223 @@ triage.
 - `docker compose up --build` provisions both Postgres DBs and starts all
   services.
 - Trade Tracker API boots, serves `/health`, `/docs`, and the portfolio / trades
-  / import / market endpoints against the `trade_tracker` DB.
+  / import / market / ibkr endpoints against the `trade_tracker` DB.
+- **Google SSO auth** — `AuthMiddleware` is registered and `routers/auth.py` is
+  included in `main.py`. `AUTH_ENABLED=true` genuinely enforces sign-in,
+  restricted to `@<ALLOWED_EMAIL_DOMAIN>`. (Currently set to `false` while
+  testing the dashboard without it — see Auth project below for what to check
+  before flipping it back on.)
+- **IBKR integration** — the cloud Web API (RSA OAuth) connects *and* returns
+  real positions, live pricing, and trade history. `services/ibkr_client.py`
+  has retry logic for IBKR's first-call-empty quirk, a `portfolio2` fallback,
+  US-listed conid disambiguation, and 429-rate-limit backoff. `market_data.py`
+  routes quotes/history through IBKR first, yfinance as fallback.
+- **Fidelity CSV import** — real Fidelity Activity and Portfolio Positions CSV
+  exports parse correctly (`services/fidelity_parser.py`), via a
+  preview/diff/commit wizard (`/import/preview` → `/import/commit`,
+  `FidelityUpdateWizard.tsx`). Multi-account (per-row Account Name/Number),
+  cash-sweep funds represented as $1-NAV positions instead of dropped.
+- **Cash flow tracking** — `/portfolio/cash-flows` CRUD writes to `cash_flows`,
+  and `portfolio_metrics.py` excludes them from the return/Sharpe/drawdown
+  calc.
+- **Win rate** — now real FIFO-matched per-sell P&L, not the old
+  "positive cash proceeds" approximation that read ~100% unconditionally.
+- Dashboard header/theme is consistent (no more invisible white-on-light
+  text or mixed dark-theme classes); Sign-out button is wired to `signOut()`.
 - yfinance price fetching + in-process auto-refresh loop (every 5 min) writing
   NAV snapshots.
-- Frontend Dashboard / Trades / Import pages render and call the API.
-- A **custom XLSX** portfolio upload (`Ticker | Date Acquired | Amount | Price
-  Acquired`) imports into `trades` + `imported_positions` — but only for a single
-  hardcoded `PORTFOLIO` account, and it's not an actual Fidelity export (see the
-  Import project).
+- A custom XLSX portfolio upload (`Ticker | Date Acquired | Amount | Price
+  Acquired`) still works as a secondary import path for the single
+  `PORTFOLIO` account (`/import/trades`, legacy — the live UI uses the CSV
+  wizard above for everything else).
+- Railway backend deploy is live (`docs/DEPLOY_RAILWAY.md`); Vercel has been
+  dropped in favor of Cloudflare Pages for the frontend.
 
-**Broken / unverified / unfinished (the rest of this document):**
-- Google SSO auth is **not enforced** — backend never registers the auth router
-  or middleware.
-- IBKR (cloud Web API, RSA OAuth) **connects but can't pull positions or
-  pricing** — effectively non-functional; everything runs on yfinance.
-- Fidelity **CSV** import doesn't work — the CSV parser is dead code and the live
-  endpoint only takes a hand-built XLSX.
-- Production deploy (Railway + Vercel) was never completed or smoke-tested.
-- Dashboard has visible UI bugs (invisible header text, dead nav buttons, mixed
-  light/dark theming).
+**Still open / worth tracking (the rest of this document):**
+- Google OAuth Cloud Console setup + Cloudflare Pages deploy — in progress,
+  not yet smoke-tested end-to-end in production.
 - DB schema has drifted — three tables (`imported_positions`, `ibkr_tokens`,
   `instrument_conids`) exist only as runtime migrations in `db.py`, not in the
   schema file.
+- `RISK_FREE_RATE_ANNUAL` still hardcoded to `0.0` in `portfolio_metrics.py`.
+- No token-refresh flow for Google ID tokens (expire ~1h, hard-redirect to
+  `/login` on expiry instead of silent re-auth).
+- Settings/Notifications buttons in `Dashboard.tsx` still have no handler.
+- Positions-as-synthetic-trades still double-counts in the trade ledger (both
+  import paths).
+- Three unreconciled refresh cadences (in-process 5 min, hourly
+  `snapshot-cron`, frontend 5 min poll).
+- Zero automated tests; CI is lint+build only, all steps report-only.
 
-_(The docs themselves — README, CLAUDE.md, FEATURES.md — have been rewritten to
-match this reality as of 2026-06-11.)_
+_(The docs themselves — CLAUDE.md, this file, FEATURES.md — were rewritten to
+match this reality as of 2026-06-28, after roughly two weeks of unlogged
+progress on IBKR, Fidelity import, and the production deploy.)_
 
 ---
 
-## Project: Trade Tracker — Auth (broken, top priority)
+## Project: Trade Tracker — Auth (working, finishing touches)
 
 The frontend has a full Google SSO flow (`AuthContext`, `Login.tsx`,
-`client.ts` bearer headers + `handle401`), but the **backend does not enforce
-any of it**. As written, `AUTH_ENABLED=true` does nothing and the app is
-effectively open.
+`client.ts` bearer headers + `handle401`), and the backend now enforces it —
+`main.py` registers `AuthMiddleware` and includes the auth router.
+`AUTH_ENABLED` is currently set to `false` on Railway for dashboard testing
+without sign-in friction.
 
-- **Register the auth router** — **Urgent.** `main.py` imports
-  `from routers import auth as auth_router` but never calls
-  `app.include_router(auth_router.router)`. So `/auth/config`, `/auth/verify`,
-  and `/auth/me` all return 404. The frontend's `AuthContext` fetches
-  `/api/auth/config`, gets a 404, hits its `.catch()`, and silently defaults to
-  `auth_enabled: false` — so the login page never even shows.
-- **Add the AuthMiddleware** — **Urgent.** `main.py` imports
-  `BaseHTTPMiddleware`, `AuthError`, and `verify_google_id_token` but never adds
-  a middleware that uses them. No endpoint verifies the `Authorization: Bearer`
-  token the frontend sends. Even with the router registered, `AUTH_ENABLED=true`
-  would protect nothing and `/auth/me` would always 401 (nothing ever sets
-  `request.state.user`). Build the middleware: verify the Google ID token on
-  every request, skip bypass paths (`/health`, `/docs`, `/redoc`,
-  `/openapi.json`, `/auth/*`), set `request.state.user`. CLAUDE.md already
-  describes this behavior as if it exists — make the code match.
-- **Verify the full sign-in flow end-to-end** — **High.** Depends on the two
-  above. With `AUTH_ENABLED=true`: confirm the login page renders, a
-  `@dekalbcapitalmanagement.com` Google account can sign in, the ID token is
-  accepted, protected endpoints return data, and a non-allowed domain is
-  rejected.
-- **Wire up the frontend sign-out button** — **Medium.** `Layout.tsx`'s "Sign
-  out" button (and the Settings / Notifications buttons next to it) have no
-  `onClick`. `AuthContext` exposes `signOut()` but nothing calls it. Hook it up;
-  remove or implement the dead Settings/Notifications buttons.
+- **Before flipping `AUTH_ENABLED=true` in production** — **Urgent.** Confirm
+  `GOOGLE_CLIENT_ID` and `ALLOWED_EMAIL_DOMAIN` are set to real values (not
+  placeholders) on Railway — `verify_google_id_token` raises immediately if
+  `GOOGLE_CLIENT_ID` is empty, which would 401 every request. Also confirm the
+  Google Cloud Console OAuth client's Authorized JavaScript origins include
+  the live Cloudflare Pages URL (see `docs/DEPLOY_GOOGLE_OAUTH.md`).
+- **Hardcoded `/api/...` fetches bypassing `BASE`** — **Fixed 2026-06-28.**
+  `AuthContext.tsx` and `Login.tsx` used to call `fetch('/api/auth/config')` /
+  `fetch('/api/auth/verify')` directly instead of routing through `client.ts`'s
+  `BASE` constant. This worked locally (Vite proxies `/api/*`) but would have
+  silently broken sign-in on Cloudflare Pages, where there's no backend behind
+  `/api/*` — the request would hit the SPA's catch-all `_redirects` rule and
+  get back HTML instead of JSON. Both files now import `BASE` from
+  `client.ts`. Watch for this pattern in any new auth-adjacent code.
 - **Token refresh** — **Medium.** ID tokens expire after ~1h; `client.ts`'s
   `handle401()` hard-redirects to `/login` with no warning. Use Google Identity
   Services silent re-auth (`google.accounts.id.prompt()` / One Tap) to refresh
   before expiry, falling back to the redirect.
+- **Wire up Settings/Notifications buttons** — **Low.** `Dashboard.tsx`'s
+  Settings and Notifications buttons (next to the now-working Sign-out button)
+  have no `onClick`. Either implement or remove them.
 
-## Project: Trade Tracker — IBKR Integration (does not work)
+## Project: Trade Tracker — IBKR Integration (working)
 
 The implementation is the **IBKR cloud Web API** (`api.ibkr.com`) using RSA
 key-based OAuth 2.0 / JWT bearer flow — server-to-server, no browser login, no
-desktop gateway. See `services/ibkr_client.py` and `config.py`. The docs
-(README/CLAUDE.md) still describe the old Client Portal Gateway (port 5001,
-desktop app, 2FA) — that architecture is gone; see the Docs project below.
+desktop gateway. See `services/ibkr_client.py` and `config.py`.
 
-**Current real state: the session connects, but nothing past connection works.**
-We can authenticate (bearer token → SSO session → iserver init), but we have
-**never successfully pulled positions or pricing** out of the API. So IBKR is
-effectively non-functional today — the dashboard runs entirely on yfinance +
-Fidelity CSVs. The bullets below are roughly in dependency order.
+**Current state: positions, pricing, and trade history all return real data.**
+The historical blocker — IBKR's `/portfolio/{account}/positions` returning
+`[]` on first call, snapshot endpoints needing a poll-until-populated loop —
+is handled: retries + `portfolio2` fallback for positions, polling for
+`field 31` (with status-character stripping like `"C"` for stale closes) for
+snapshots, US-listed conid preference for symbol resolution.
 
-- **Get positions out of IBKR** — **Urgent.** `get_positions()` /
-  `GET /ibkr/positions` / `POST /ibkr/sync/positions` return nothing usable.
-  IBKR's `/portfolio/{account}/positions` is notorious for returning `[]` on the
-  first call (subscription warm-up) and for needing `/portfolio/accounts` called
-  first — the code attempts both with retries/pagination but it still isn't
-  yielding data. Investigate against a live session: log the raw responses,
-  confirm the account ID format, confirm the warm-up sequence, and figure out
-  why positions come back empty. This is the single biggest blocker.
-- **Get pricing/snapshots out of IBKR** — **Urgent.** `get_market_snapshot_batch()`
-  (`/iserver/marketdata/snapshot`) also isn't returning prices. Same class of
-  problem: the snapshot endpoint requires conid resolution (`/trsrv/stocks`) and
-  a poll-until-populated loop (field `31` = last). Confirm conid lookup works,
-  then confirm the snapshot poll actually fills in. Until this works, all pricing
-  is yfinance.
-- **Confirm `IBKR_SERVER_IP` handling** — **High.** IBKR ties the session to an
-  outbound IP. A wrong/changing IP is a likely cause of the session being
-  "connected" but unauthorized for data. Locally this is the home IP; on Railway
-  it's the static outbound IP (Pro plan). The `_detect_ip()` fallback is fragile.
-  Pin down the canonical way to set this per environment and verify it's the IP
-  IBKR actually sees.
-- **Verify account summary + trade sync once data flows** — **High.** Depends on
-  the above. Re-check `GET /ibkr/account` (NAV/ledger) and
-  `POST /ibkr/sync/trades` (→ `trades`) actually return real data and dedupe.
-  Document which sync endpoint the hourly cron + dashboard rely on (there are two:
-  `sync/positions` vs `sync/trades`).
-- **Decide the production IBKR story** — **Medium.** Unlike the old desktop
-  gateway, this Web API client *can* run headless on Railway (it just needs a
-  stable outbound IP). But until positions + pricing actually work, prod must run
-  `IBKR_ENABLED=false` (yfinance). Revisit once the blockers above are fixed.
-- **`market_data.py` IBKR routing** — **Medium.** It falls back to yfinance when
-  IBKR is unreachable; confirm the fallback triggers cleanly (no hangs/timeouts)
-  when `IBKR_ENABLED=true` but the session can't return data — which is the
-  current state, so this fallback path is what's actually in use.
+- **Keep an eye on `IBKR_SERVER_IP`** — **Medium.** IBKR ties the OAuth session
+  to an outbound IP. On Railway this is the static outbound IP (Pro plan
+  feature); `config.validate_ibkr_oauth_config` logs a warning if the detected
+  IP doesn't match what's configured. Re-verify after any Railway plan/region
+  change.
+- **`ibkr_parser.py` (CSV import) is dead code** — **Low, not a bug.**
+  Unreferenced by any router. Superseded by the live API integration, which
+  gets the same data without a manual IBKR Activity Statement export. Fine to
+  leave as-is; flag if asked to clean up unused services.
+- **Decide whether to keep both sync endpoints** — **Low.** `routers/ibkr.py`
+  has `/ibkr/sync/trades` (PA transactions + recent iserver fills) feeding the
+  `trades` table; confirm this is the only one the snapshot-cron and dashboard
+  actually rely on, and document it if there's a second path still in use.
 
-## Project: Trade Tracker — CSV / Fidelity Import (built wrong)
+## Project: Trade Tracker — CSV / Fidelity Import (working, one cleanup item)
 
-This is one of the most broken areas. The "Fidelity import" doesn't actually
-import Fidelity's CSV format — the careful CSV parser is dead code, and the
-only live path takes a hand-built XLSX and force-fits everything into a single
-account. Treat this as a near-rewrite, not a set of tweaks.
+The live UI path (`FidelityUpdateWizard.tsx` → `/import/preview` →
+`/import/commit`) correctly parses real Fidelity Activity and Portfolio
+Positions CSV exports, supports multiple accounts per file (via the Account
+Name/Number columns), and represents cash-sweep funds (SPAXX/FDRXX/FCASH) as
+$1-NAV positions instead of dropping them. Options (dash-prefixed or
+`YYMMDD[PC]strike` symbols) are intentionally skipped — not a bug, just an
+unsupported instrument type for now.
 
-- **The Fidelity CSV parser is dead code** — **High.** `fidelity_parser.py`
-  (Activity + Positions CSV detection, `parse_fidelity_csv`,
-  `extract_positions_snapshot`) and `ibkr_parser.py`'s CSV path are **never
-  called by any router**. The only live import endpoint, `POST /import/trades`,
-  uses `parse_portfolio_xlsx` (`universal_parser.py`) and **rejects anything that
-  isn't `.xlsx`/`.xlsm`**. So uploading an actual Fidelity CSV export — the
-  whole point — 400s. Decide: wire the CSV parser back in, or delete it and stop
-  calling the feature "Fidelity import."
-- **Frontend accepts file types the backend rejects** — **High.** `Import.tsx`
-  accepts `.csv,.xlsx,.xlsm,.xls,.tsv,.txt` (and the error text says "Drop a
-  .csv … file"), and `imports.py` even defines `_SUPPORTED_EXTENSIONS` including
-  csv/tsv/txt — but `/import/trades` only honors `.xlsx`/`.xlsm`. A user dropping
-  a CSV gets a confusing 400. Make the accepted types match on both ends.
-- **The real input is a hand-built spreadsheet, not a broker export** — **High.**
-  `parse_portfolio_xlsx` expects sheets of `Ticker | Date Acquired | Amount |
-  Price Acquired`. That's a manually-maintained file, not anything Fidelity or
-  IBKR exports. Decide the intended source of truth (real Fidelity Activity CSV?
-  Positions CSV? IBKR Activity Statement? the custom XLSX?) and build to it —
-  right now the feature's name and its behavior don't match.
-- **Everything is hardcoded to one account** — **High.** `upload_trades`
-  hardcodes `account_id='PORTFOLIO'`, `parse_portfolio_xlsx` defaults to
-  `'PORTFOLIO'`, and every import runs
-  `DELETE FROM imported_positions WHERE account_id='PORTFOLIO'` first — so each
-  upload **wipes all existing positions** and multi-account tracking is
-  impossible. The per-account `Account`/`Account Number` columns in the real
-  exports are ignored. Multi-account support needs a real design.
-- **Positions-as-synthetic-trades double counts** — **Medium.** Each holding row
-  becomes a synthetic BUY in `trades` **and** is aggregated into
+- **Positions-as-synthetic-trades still double counts** — **Medium.** Each
+  holding row in a Positions-format CSV (or the legacy XLSX) becomes a
+  synthetic BUY/SELL in `trades` **and** is aggregated into
   `imported_positions`; both feed `/portfolio/summary`. A position snapshot is
-  not a set of fills — these synthetic trades have made-up dates and corrupt
-  anything that reads the trade ledger (win-rate, realized P&L, performance).
-  Separate "holdings snapshot" from "trade history" as distinct concepts.
-- **Silent data loss** — **Medium.** Options (any symbol starting `-` or matching
-  the `YYMMDD[PC]strike` pattern) and cash/money-market positions (SPAXX/FDRXX/
-  FCASH) are silently dropped on import, so NAV computed from positions excludes
-  them and is understated. Meanwhile `main.py`'s auto-refresh treats `XXCASH` as
-  price 1.0 even though such rows never make it into `imported_positions` —
-  inconsistent cash handling. Decide how cash and options should be represented.
+  not a set of fills — these synthetic trades have made-up dates (today, for
+  positions snapshots) and would corrupt anything that reads the trade ledger
+  for realized P&L/performance by date. Win-rate already works around this by
+  doing real FIFO matching: separating "holdings snapshot" from "trade
+  history" as distinct concepts would still be the cleaner long-term fix.
+- **Legacy `/import/trades` (XLSX) stays hardcoded to one account** —
+  **Low.** `upload_trades` still hardcodes `account_id='PORTFOLIO'` and wipes
+  that account's positions on each import. Not currently a live UI bug — the
+  wizard (multi-account, CSV+XLSX via `/import/preview`) is what the frontend
+  actually calls — but worth deciding whether to keep the legacy endpoint
+  around or retire it in favor of routing XLSX uploads through the wizard too.
 
-## Project: Trade Tracker — Production Deployment (not done)
+## Project: Trade Tracker — Production Deployment (Railway done, finishing the rest)
 
-Railway (`railway.toml`) and Vercel (`vercel.json`) configs exist but the deploy
-was never finished or smoke-tested. Do these in order.
+Backend is deployed and running on Railway. Vercel has been dropped — the
+frontend deploy target is Cloudflare Pages (free tier, no new vendor to
+evaluate). Step-by-step docs: `docs/DEPLOY_RAILWAY.md` →
+`docs/DEPLOY_GOOGLE_OAUTH.md` → `docs/DEPLOY_CLOUDFLARE_PAGES.md`.
 
-- **Configure the Railway service** — **Urgent.** Set Settings → Source → Root
-  Directory to `trade-tracker/api` (picks up `railway.toml` / Dockerfile), add a
-  Postgres plugin (`DATABASE_URL` auto-injected; `config.py` turns on
-  `DB_SSL=require`).
-- **Set Railway env vars** — **Urgent.** Depends on the service existing. At
-  minimum `AUTH_ENABLED=true`, `GOOGLE_CLIENT_ID`,
-  `ALLOWED_EMAIL_DOMAIN=dekalbcapitalmanagement.com`, an IBKR decision (see IBKR
-  project), and a placeholder `FRONTEND_URL`. Acceptance:
-  `curl https://<railway-url>/health` returns 200. **Note:** this only matters
-  once the auth backend is actually wired up (Auth project) — otherwise
-  `AUTH_ENABLED=true` is a no-op.
-- **Deploy the frontend to Vercel** — **Urgent.** Root Directory =
-  `trade-tracker/frontend`, set `VITE_API_BASE_URL` to the Railway URL (no
-  trailing slash, no `/api` suffix).
-- **Wire FRONTEND_URL + Google OAuth origins** — **Urgent.** Set `FRONTEND_URL`
-  on Railway to the Vercel URL(s) and redeploy. Add the Vercel URL(s) to the
-  Google OAuth client's Authorized JavaScript origins. **Blocker:** `main.py`
-  appends `FRONTEND_URL` to CORS origins as a single string and never splits on
-  commas — so the documented "comma-separated list" silently breaks with more
-  than one origin. Fix the split as part of this.
-- **Production smoke test** — **High.** On the live URLs: sign in, Dashboard
-  loads summary + chart, Trades filters work, a small Fidelity CSV imports,
-  `/health` and `/docs` reachable without auth. File any failures as new issues.
+- **Finish the Google OAuth Cloud Console setup** — **Urgent.** Create/confirm
+  the OAuth client, set Authorized JavaScript origins (localhost + the
+  Cloudflare Pages URL once live), set `GOOGLE_CLIENT_ID` and
+  `ALLOWED_EMAIL_DOMAIN` on Railway with real values.
+- **Deploy the frontend to Cloudflare Pages** — **Urgent.** Root directory
+  `trade-tracker/frontend`, build command `npm run build`, output `dist`, env
+  var `VITE_API_BASE_URL` = the Railway API URL (set before the first build —
+  it's baked in at build time).
+- **Wire `FRONTEND_URL` + Google OAuth origins together** — **Urgent.** Set
+  `FRONTEND_URL` on Railway to the Cloudflare Pages URL and redeploy; add the
+  same URL to the Google OAuth client's Authorized JavaScript origins.
+  `main.py` already splits `FRONTEND_URL` on commas, so a custom domain can be
+  added alongside the `.pages.dev` URL later without code changes.
+- **Production smoke test** — **High.** On the live URLs, with
+  `AUTH_ENABLED=true`: sign in with a `@dekalbcapitalmanagement.com` account,
+  confirm Dashboard loads (summary + chart), Trades tab works, a Fidelity CSV
+  imports via the wizard, IBKR tab shows live positions, `/health`/`/docs`
+  reachable without auth, a non-domain Google account is rejected.
 
-## Project: Trade Tracker — Frontend / UI (broken in parts)
+## Project: Trade Tracker — Frontend / UI (mostly fixed)
 
-- **Invisible dashboard header text** — **High.** `Dashboard.tsx` renders the
-  "Portfolio Overview" title and the "As of …" line with `text-white`, but the
-  page background (`Layout.tsx` main area) is light (`#e8edf5`). The header text
-  is effectively invisible. The period selector also uses dark-theme classes
-  (`bg-gray-900`, `border-gray-800`) that clash with the otherwise light theme.
-  Pick one theme and make the page header consistent with the white cards below
-  it.
-- **Dashboard header layout** — **Medium.** The header is a single flex row with
-  `justify-between` wrapping four separate groups (title, Update button +
-  message, period selector, search). They spread unevenly and the update message
-  can overflow. Restructure into a clean header / toolbar.
-- **Dead nav buttons** — **Medium.** `Layout.tsx` Settings, Notifications, and
-  Sign-out buttons have no handlers. The top-right "Account" avatar is static
-  (no user name/picture even though `AuthContext` has them). Either implement or
-  remove; wire Sign-out to `signOut()` (see Auth project).
-- **Audit the other pages** — **Medium.** Trades and Import pages haven't been
-  visually reviewed on this branch — check for the same light/dark theme drift
-  and any broken states (empty data, error bars, loading).
+- **Header/theme — fixed.** `Dashboard.tsx`'s header now uses a consistent
+  light theme (`#1a2744` text on the light card background, no more
+  `text-white`/`bg-gray-900` leftovers from a dark theme).
+- **Sign-out — fixed.** Wired to `signOut()`.
+- **Dead Settings/Notifications buttons** — **Low.** Still no `onClick`. See
+  Auth project above.
+- **No `Layout.tsx`/sidebar exists** — **Low, doc-accuracy only.** The nav is
+  inline in `Dashboard.tsx`'s header; there's no separate routed page for
+  Trades/Import — they're tabs/components inside the one `Dashboard` view
+  (`react-router-dom` is installed and `BrowserRouter` wraps the app, but
+  there's no `<Routes>`/`<Route>` yet). Not a bug, just don't go looking for
+  files that don't exist.
+- **Audit remaining tab states** — **Low.** IronBeam tab is a disabled
+  placeholder; haven't done a full visual pass on empty/error/loading states
+  across all tabs.
 
 ## Project: Trade Tracker — Data Model & Metrics correctness
 
-- **Schema drift — `imported_positions` / `ibkr_tokens` / `instrument_conids`** —
-  **High.** These three tables exist **only** as runtime migrations in
-  `db.py` (`_apply_migrations`), not in `schemas/trade_tracker_schema.sql`. The
-  entire portfolio/positions path depends on `imported_positions`. Because
-  `_apply_schema_if_empty` only runs the schema file on an empty DB and the
-  migrations run separately, the schema file and the real schema have diverged.
-  Decide the source of truth (fold migrations into the schema file, or adopt a
-  real migration tool) and update all docs to list the actual 7 tables.
-- **Cash flow tracking (deposits/withdrawals)** — **High.** `cash_flows` exists
-  in the schema (comment: "excluded from NAV performance calc") but nothing
-  writes or reads it, so deposits/withdrawals show up as portfolio gains/losses
-  in `/portfolio/performance` and `/portfolio/metrics` (beta, Sharpe, alpha,
-  drawdown all wrong around those dates). Add a way to record cash flows and
-  adjust the return calc (Modified Dietz or similar) to exclude them.
-- **Make the risk-free rate configurable** — **Medium.** `RISK_FREE_RATE_ANNUAL`
-  is hardcoded to `0.0` in `portfolio_metrics.py`. Move it to `config.py` as an
-  env var with a documented default; Sharpe should change when it changes.
-- **Document or fix win-rate** — **Low.** Win rate is "% of SELL trades with
-  positive `net_amount`", not FIFO-matched realized P&L. Either label it
-  approximate in the UI or implement FIFO lot matching (separate, bigger issue).
-- **Reconcile refresh cadences** — **Low.** Three different cadences are in play:
-  the in-process `_auto_refresh_loop` in `main.py` (every 5 min), the
-  `snapshot-cron` docker service (hourly: snapshot + IBKR trade sync), and the
-  frontend's `setInterval(loadSummary, 300_000)` (5 min). The README claims "auto
-  refreshes every 60 seconds." Pick the intended behavior, remove the redundant
-  one, and make the docs match.
+- **Schema drift — `imported_positions` / `ibkr_tokens` / `instrument_conids`**
+  — **High, still open.** These three tables exist **only** as runtime
+  migrations in `db.py` (`_apply_migrations`), not in
+  `schemas/trade_tracker_schema.sql`. The entire portfolio/positions path
+  depends on `imported_positions`. Decide the source of truth (fold migrations
+  into the schema file, or adopt a real migration tool) and update the schema
+  file to list the actual 7 tables.
+- **Cash flow tracking — fixed.** `/portfolio/cash-flows` CRUD + excluded from
+  the return calc in `portfolio_metrics.py`.
+- **Make the risk-free rate configurable** — **Medium, still open.**
+  `RISK_FREE_RATE_ANNUAL` is hardcoded to `0.0` in `portfolio_metrics.py`. Move
+  it to `config.py` as an env var with a documented default; Sharpe should
+  change when it changes.
+- **Win-rate — fixed.** Real FIFO-matched per-sell P&L now (see
+  `_calculate_win_rate`), not the old "SELL trades with positive net_amount"
+  approximation.
+- **Reconcile refresh cadences** — **Low, still open.** Three different
+  cadences are in play: the in-process `_auto_refresh_loop` in `main.py`
+  (every 5 min), the `snapshot-cron` docker service (hourly: snapshot + IBKR
+  trade sync), and the frontend's `setInterval(loadSummary, 300_000)` (5 min).
+  Pick the intended behavior, remove the redundant one, and make the docs
+  match.
 
 ## Project: Trade Tracker — Testing & CI
 
 - **Add pytest setup for `trade-tracker/api`** — **Medium.** Zero automated
   tests exist. Add `pytest` / `pytest-asyncio` / `httpx`, a throwaway test
   Postgres seeded from the real schema (including the `db.py` migrations), and
-  tests for `/health`, trades CRUD, auth middleware (once it exists), and
-  `portfolio_metrics` (covering the cash-flow fix).
-- **Add CI workflow** — **Medium.** Depends on pytest setup. GitHub Actions:
-  spin up Postgres, apply the schema + migrations, run `pytest` on PRs touching
-  `trade-tracker/api/**`.
+  tests for `/health`, trades CRUD, the auth middleware, and `portfolio_metrics`
+  (covering the cash-flow exclusion).
+- **CI currently report-only** — **Medium.** `.github/workflows/ci.yml` runs
+  frontend typecheck+build and Python lint+compile on every PR, but every step
+  is `continue-on-error: true` — nothing blocks a merge yet. Once pytest exists
+  and the codebase is stable enough, make the relevant steps blocking.
 
 ## Project: QuestDB schema auto-apply (quant-side, low priority)
 
@@ -287,8 +259,8 @@ was never finished or smoke-tested. Do these in order.
 
 A Dashboard sidebar surfacing AI-summarized X/Twitter content relevant to the
 firm's open positions — **without ever telling the AI service what the firm
-holds.** Nothing is built yet. Lower priority than getting the existing Trade
-Tracker actually working, but captured here so the design isn't lost.
+holds.** Nothing is built yet. Lower priority than the production deploy
+above, but captured here so the design isn't lost.
 
 **Privacy invariant (do not relax):** the AI/analysis step must never receive
 DeKalb's holdings, position sizes, P&L, or account values. The set of tickers
@@ -322,7 +294,8 @@ queries.
   place positions and social signals meet. Subject to normal auth.
 - **Build the NewsSidebar component** — **Medium.** Collapsible Dashboard
   sidebar polling `/news/relevant`; each item shows ticker badge(s), sentiment,
-  summary, timestamp, source link. Wire into `Layout.tsx`.
+  summary, timestamp, source link. Wire into the Dashboard header area (there's
+  no `Layout.tsx` to hook into — see Frontend/UI project above).
 - **Retention/cleanup job for `social_signals`** — **Low.** Periodic delete of
   rows past the retention window.
 - **Tests for extraction + `/news/relevant`** — **Medium.** Mock the LLM for

@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { useAuth } from '../auth/AuthContext'
+import { BASE } from '../api/client'
 
 declare global {
   interface Window { google?: { accounts: { id: { initialize: (c: object) => void; renderButton: (el: HTMLElement, c: object) => void } } } }
@@ -25,7 +26,7 @@ export default function Login() {
   }, [config])
 
   const handleCredential = async (response: { credential: string }) => {
-    const res = await fetch('/api/auth/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id_token: response.credential }) })
+    const res = await fetch(`${BASE}/auth/verify`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id_token: response.credential }) })
     if (!res.ok) { const e = await res.json().catch(() => ({ detail: 'Unknown error' })); alert(`Sign-in failed: ${e.detail}`); return }
     const user = await res.json()
     localStorage.setItem('dekalb_id_token', response.credential)

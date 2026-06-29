@@ -1,6 +1,8 @@
 # Deploying Auth — Google OAuth Client
 
-_Step 2 of 3 in the production deploy (Railway → Google OAuth → Cloudflare Pages)._
+_Step 2 of 3 in the production deploy (Railway → Google OAuth → Cloudflare
+Pages) by dependency, but **do the Cloudflare Pages deploy itself first** —
+see the note below on why, then come back here._
 
 Restricts sign-in to `@dekalbcapitalmanagement.com` Google accounts only.
 This is the actual security boundary for the app — nobody outside the
@@ -23,28 +25,52 @@ can reach the URL.
 You don't need to write any code for this step — it's entirely Google Cloud
 Console configuration plus setting env vars on Railway.
 
-## 1. Create (or reuse) the OAuth client
+**Starting state (confirmed 2026-06-28):** no Google Cloud project exists for
+this app yet — step 1 below is a from-scratch project creation, not a "reuse"
+case. The `dekalbcapitalmanagement.com` Google Workspace itself already
+exists (team members, including whoever does this setup, already have
+`@dekalbcapitalmanagement.com` accounts) — that's what makes **Internal** in
+step 2 available; it's not something you need to set up separately.
 
-- Go to [Google Cloud Console](https://console.cloud.google.com/) →
-  **APIs & Services → Credentials**.
-- If there's no project for this app yet, create one first.
-- **Create Credentials → OAuth client ID → Application type: Web application.**
-- Name it something like "DeKalb Trade Tracker".
+**Do this before step 3 of this deploy (Cloudflare Pages):** get the
+Cloudflare Pages URL first — deploy the frontend (`docs/DEPLOY_CLOUDFLARE_PAGES.md`),
+note the `.pages.dev` URL it gives you, *then* come back here for steps 1-5.
+You need that URL for step 3 below, and it's one less trip back and forth.
+
+## 1. Create the OAuth client
+
+- **Sign into [Google Cloud Console](https://console.cloud.google.com/) with
+  your `@dekalbcapitalmanagement.com` account, not a personal Gmail.** This is
+  the single most common way to get this wrong — if the project is created
+  under a personal account, it won't be associated with the Workspace org and
+  **Internal** won't be offered as an option in step 2.
+- **Create a new project** (top-left project dropdown → New Project). Name it
+  something like "DeKalb Trade Tracker".
+- Go to **APIs & Services → Credentials → Create Credentials → OAuth client ID
+  → Application type: Web application.** Name it the same.
 
 ## 2. Configure the OAuth consent screen
 
-- **User type: Internal** if this Google Cloud project is tied to the
-  `dekalbcapitalmanagement.com` Google Workspace — this restricts sign-in to
-  your org at the Google level, before the app's own domain check even runs
-  (defense in depth). If it's set to **External** instead, the app's own
-  `ALLOWED_EMAIL_DOMAIN` check in `services/auth.py` is the only thing
-  blocking outside accounts — still effective, just one layer instead of two.
+- **User type: Internal.** Since the Google Cloud project is created under a
+  `@dekalbcapitalmanagement.com` account (step 1), this option will be
+  available — pick it. It restricts sign-in to your Workspace org at the
+  Google level, before the app's own domain check even runs (defense in
+  depth). If **Internal** isn't showing up as an option, the project was
+  created under the wrong account — go back to step 1.
+- If you ever do end up on **External** instead (e.g. the project predates
+  this setup and was created under a personal account), it still works — the
+  app's own `ALLOWED_EMAIL_DOMAIN` check in `services/auth.py` is the only
+  thing blocking outside accounts in that case, just one layer instead of two.
 
 ## 3. Authorized JavaScript origins
 
 Add every origin the frontend will actually be served from:
 
-- `https://<your-cloudflare-pages-url>` (added once step 3 of this deploy is done)
+- `https://<your-cloudflare-pages-url>` — the URL from the Cloudflare Pages
+  deploy you should have already done (see the note above). If you skipped
+  ahead and don't have it yet, you can come back and add it later — this
+  field is editable after the client is created, it just means sign-in won't
+  work from that URL until you do.
 - `http://localhost:3000` (local dev)
 
 No redirect URIs are needed — this app uses Google Identity Services' token
