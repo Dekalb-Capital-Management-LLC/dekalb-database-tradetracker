@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useState, ReactNode } from 'react'
+import { get } from '../api/client'
 
 interface AuthConfig { auth_enabled: boolean; google_client_id: string; allowed_domain: string }
 interface User { email: string; name: string; picture: string; sub: string }
@@ -19,7 +20,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    fetch('/api/auth/config').then(r => r.json())
+    get<AuthConfig>('/auth/config')
       .then((cfg: AuthConfig) => { setAuthConfig(cfg); if (!cfg.auth_enabled) setUserState(null) })
       .catch(() => setAuthConfig({ auth_enabled: false, google_client_id: '', allowed_domain: '' }))
       .finally(() => setLoading(false))
