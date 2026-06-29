@@ -299,6 +299,30 @@ Full step-by-step runbooks, in order:
 > templating uses `${{...}}` and the two conflict. Put shell-expansion logic in
 > the Dockerfile `CMD` (`sh -c "..."`).
 
+### Verifying the deploy
+
+Quick commands for checking the live Railway backend without needing the
+frontend deployed yet.
+
+```bash
+# 1. Basic health + DB connectivity check
+curl https://<your-railway-domain>/health
+# expect: {"status":"ok","database":"connected",...}
+
+# 2. Confirm auth is actually enforced (should reject with no token)
+curl https://<your-railway-domain>/trades
+# expect: {"detail":"Not authenticated"} with a 401, if AUTH_ENABLED=true
+
+# 3. Run the dashboard locally against the live Railway backend, instead of
+#    a local Docker stack — useful before the frontend itself is deployed
+cd trade-tracker/frontend
+VITE_API_BASE_URL=https://<your-railway-domain> npm run dev
+```
+
+For fully local development against a throwaway local database instead
+(doesn't touch Railway at all), use `docker compose up --build` per the
+"Running Locally" section above.
+
 ---
 
 ## IBKR Web API Setup
