@@ -3,7 +3,7 @@ Portfolio router.
 
   GET  /portfolio/summary       - combined + per-account P&L
   GET  /portfolio/positions     - current positions with live P&L
-  POST /portfolio/refresh-prices - fetch live prices via yfinance, update P&L, write snapshot
+  POST /portfolio/refresh-prices - fetch live prices via market data, update P&L, write snapshot
   GET  /portfolio/performance   - NAV time series (+ SPY overlay)
   GET  /portfolio/metrics       - beta, sharpe, alpha, max drawdown
   GET  /portfolio/snapshots     - raw daily NAV snapshot rows
@@ -560,11 +560,9 @@ async def get_positions(
 async def update_all(pool=Depends(get_pool)):
     """
     One-shot update: sync IBKR positions (if connected), then price everything
-    via yfinance, then write today's snapshot. Both Fidelity and IBKR accounts
+    via the configured market-data provider, then write today's snapshot. Both Fidelity and IBKR accounts
     show up as separate entries ΓÇö the existing account tab system handles it.
     """
-    from services.portfolio_metrics import upsert_snapshot
-
     # ΓöÇΓöÇ Step 1: sync IBKR holdings (symbols + qty + avg_cost) + trade history ΓöÇΓöÇ
     ibkr_synced = 0
     ibkr_trades_synced = 0
@@ -608,7 +606,7 @@ async def update_all(pool=Depends(get_pool)):
                     ibkr_synced += 1
                 logger.info("IBKR positions synced: %d for account %s", ibkr_synced, config.IBKR_ACCOUNT_ID)
             except Exception as exc:
-                logger.warning("IBKR position sync failed (yfinance will still run): %s", exc)
+                logger.warning("IBKR position sync failed (market-data pricing will still run): %s", exc)
 
             # Pull trade/fill history too, so this one button covers what the
             # separate "Sync IBKR" action used to do.
@@ -619,7 +617,7 @@ async def update_all(pool=Depends(get_pool)):
             except Exception as exc:
                 logger.warning("IBKR trade history sync failed: %s", exc)
 
-    # ΓöÇΓöÇ Step 2: price non-IBKR positions via yfinance ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+    # ΓöÇΓöÇ Step 2: price non-IBKR positions via market_data ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
     # IBKR-sourced rows already have a correct live price from Step 1 / the
     # live IBKR branch in _compute_positions — re-pricing them here via
     # yfinance is what caused real positions to show $0.01-type garbage.
@@ -631,6 +629,8 @@ async def update_all(pool=Depends(get_pool)):
         return {
             "ibkr_positions": ibkr_synced,
             "ibkr_trades_synced": ibkr_trades_synced,
+            "market_data_updated": 0,
+            "market_data_total": 0,
             "yfinance_updated": 0,
             "yfinance_total": 0,
             "snapshot_written": False,
@@ -639,42 +639,19 @@ async def update_all(pool=Depends(get_pool)):
         }
 
     symbols = list({r["symbol"] for r in rows})
-    prices: dict[str, float] = {}
-    price_errors: list[str] = []
-
-    # Explicit allowlist, not broad pattern matching ΓÇö some real tickers can
-    # look cash-like (e.g. "$CASH" is an actual traded symbol), so we only
-    # special-case well-known money-market/cash-sweep symbols.
-    CASH_SYMBOLS = {"XXCASH", "CASH", "SPAXX", "FDRXX", "FCASH"}
-    def _clean_sym(s: str) -> str:
-        return s.strip().upper().rstrip("*")
-    cash_syms = {s for s in symbols if _clean_sym(s) in CASH_SYMBOLS}
-    market_syms = [s for s in symbols if s not in cash_syms]
-
-    for s in cash_syms:
-        prices[s] = 1.0
-
-    # Use the same live-quote primitive as everywhere else (real last-trade
-    # price via market_data.get_quote) instead of a separate yf.download with
-    # auto_adjust=True, which returns dividend/split-adjusted closes that
-    # drift from the actual quoted price, plus only ever the last completed
-    # daily bar rather than the live price.
+    # Use the same provider primitive as everywhere else. This may use
+    # FirstRateData, IBKR, or yfinance depending on config and availability.
     MIN_SANE_PRICE = 0.05  # reject obviously-bad quotes (halted/unresolved tickers) instead of trusting any price > 0
-    if market_syms:
-        await market_data.warm_quote_cache(pool, market_syms)
-        for sym in market_syms:
-            quote = await market_data.get_quote(pool, sym)
-            if quote is None:
-                price_errors.append(f"{sym}: no quote available")
-                continue
-            if quote.price >= Decimal(str(MIN_SANE_PRICE)):
-                prices[sym] = float(quote.price)
-            else:
-                price_errors.append(f"{sym}: suspiciously low price {quote.price}, rejected")
+    prices, price_errors = await market_data.get_latest_prices(pool, symbols)
+    prices = {
+        sym: price
+        for sym, price in prices.items()
+        if price >= MIN_SANE_PRICE or market_data.is_cash_symbol(sym)
+    }
 
-    yf_updated = 0
+    market_data_updated = 0
     for r in rows:
-        sym = r["symbol"]
+        sym = r["symbol"].upper()
         price = prices.get(sym)
         if price is None:
             continue
@@ -693,12 +670,12 @@ async def update_all(pool=Depends(get_pool)):
             price, current_value, total_gl, total_gl_pct,
             r["account_id"], sym,
         )
-        yf_updated += 1
+        market_data_updated += 1
 
     # ΓöÇΓöÇ Step 3: write today's snapshot for every account (IBKR uses live NAV) ΓöÇΓöÇ
     snapshot_written = False
     snapshot_nav = None
-    if yf_updated > 0 or ibkr_synced > 0:
+    if market_data_updated > 0 or ibkr_synced > 0:
         try:
             result = await portfolio_metrics.backfill_snapshots(pool)
             snapshot_written = True
@@ -707,12 +684,14 @@ async def update_all(pool=Depends(get_pool)):
         except Exception as exc:
             logger.error("update-all: snapshot write failed: %s", exc)
 
-    logger.info("update-all: ibkr=%d ibkr_trades=%d yfinance=%d/%d errors=%d",
-                ibkr_synced, ibkr_trades_synced, yf_updated, len(symbols), len(price_errors))
+    logger.info("update-all: ibkr=%d ibkr_trades=%d market_data=%d/%d errors=%d",
+                ibkr_synced, ibkr_trades_synced, market_data_updated, len(symbols), len(price_errors))
     return {
         "ibkr_positions": ibkr_synced,
         "ibkr_trades_synced": ibkr_trades_synced,
-        "yfinance_updated": yf_updated,
+        "market_data_updated": market_data_updated,
+        "market_data_total": len(symbols),
+        "yfinance_updated": market_data_updated,
         "yfinance_total": len(symbols),
         "snapshot_written": snapshot_written,
         "portfolio_nav": snapshot_nav,
@@ -766,7 +745,7 @@ async def get_snapshots(
                 limit,
             )
         return [dict(r) for r in rows]
-    except Exception as exc:
+    except Exception:
         raise HTTPException(status_code=500, detail="Error fetching snapshots")
 
 

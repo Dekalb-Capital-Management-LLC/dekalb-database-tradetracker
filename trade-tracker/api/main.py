@@ -15,10 +15,13 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
-import config, db
+
+import config
+import db
 from routers import auth as auth_router
 from routers import ibkr, imports, market, portfolio, trades
 from routers.ibkr import sync_ibkr_trades
+from services import market_data as market_data_service
 from services.auth import AuthError, verify_google_id_token
 from services.ibkr_client import ibkr_client
 
@@ -100,8 +103,7 @@ app.include_router(ibkr.router)
 
 
 async def _auto_refresh_loop():
-    """Refresh yfinance prices + write snapshot every 5 minutes for imported positions."""
-    import yfinance as yf
+    """Refresh market-data prices + write snapshot every 5 minutes for imported positions."""
     from decimal import Decimal
     from services.portfolio_metrics import upsert_snapshot
 
@@ -116,43 +118,14 @@ async def _auto_refresh_loop():
             )
             if rows:
                 symbols = list({r["symbol"] for r in rows})
-                CASH_SYMS = {"XXCASH", "CASH", "SPAXX", "FDRXX", "FCASH"}
-                prices: dict[str, float] = {}
-                cash_syms = {s for s in symbols if s.upper() in CASH_SYMS or s.upper().startswith("XX")}
-                market_syms = [s for s in symbols if s not in cash_syms]
-                for s in cash_syms:
-                    prices[s] = 1.0
-                if market_syms:
-                    try:
-                        df = await asyncio.get_event_loop().run_in_executor(
-                            None,
-                            lambda: yf.download(
-                                " ".join(market_syms),
-                                period="5d",
-                                auto_adjust=True,
-                                progress=False,
-                                threads=True,
-                            ),
-                        )
-                        if not df.empty:
-                            close = df["Close"] if "Close" in df.columns else df.xs("Close", axis=1, level=0)
-                            for sym in market_syms:
-                                try:
-                                    val = (
-                                        float(close.dropna().iloc[-1])
-                                        if len(market_syms) == 1
-                                        else float(close[sym].dropna().iloc[-1])
-                                    )
-                                    if val > 0:
-                                        prices[sym] = val
-                                except Exception:
-                                    pass
-                    except Exception as exc:
-                        logger.warning("Auto-refresh batch price fetch failed: %s", exc)
+                prices, price_errors = await market_data_service.get_latest_prices(pool, symbols)
+                if price_errors:
+                    logger.warning("Auto-refresh price errors: %s", price_errors[:5])
 
                 updated = 0
                 for r in rows:
-                    price = prices.get(r["symbol"])
+                    symbol = r["symbol"].upper()
+                    price = prices.get(symbol)
                     if price is None:
                         continue
                     qty = float(r["quantity"] or 0)
@@ -172,7 +145,7 @@ async def _auto_refresh_loop():
                         total_gl,
                         total_gl_pct,
                         r["account_id"],
-                        r["symbol"],
+                        symbol,
                     )
                     updated += 1
 
@@ -255,7 +228,7 @@ async def startup():
                 config.IBKR_ACCOUNT_ID,
             )
     else:
-        logger.warning("IBKR disabled — yfinance fallback for market data.")
+        logger.warning("IBKR disabled — market data will use FirstRateData if configured, then yfinance.")
 
 
 async def _startup_ibkr_trade_sync() -> None:
@@ -301,7 +274,8 @@ async def health():
     return {
         "status": "ok" if db_ok else "degraded",
         "database": "connected" if db_ok else "unreachable",
-        "ibkr": "enabled" if config.IBKR_ENABLED else "disabled (yfinance fallback)",
+        "ibkr": "enabled" if config.IBKR_ENABLED else "disabled",
+        "market_data": market_data_service.provider_status(),
         "trades": trade_count,
         "latest_snapshot": str(snap_date) if snap_date else "none",
         "version": "0.1.0",

@@ -14,6 +14,7 @@ import asyncio
 import logging
 import math
 from collections import defaultdict
+import statistics
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Optional
@@ -48,19 +49,40 @@ def _std_dev(values: list[float]) -> float:
     return math.sqrt(_variance(values))
 
 
-def _covariance(x: list[float], y: list[float]) -> float:
-    if len(x) != len(y) or len(x) < 2:
-        return 0.0
-    mx, my = _mean(x), _mean(y)
-    return sum((xi - mx) * (yi - my) for xi, yi in zip(x, y)) / (len(x) - 1)
-
-
 def _beta(portfolio_returns: list[float], benchmark_returns: list[float]) -> Optional[float]:
-    var_bm = _variance(benchmark_returns)
-    if var_bm == 0:
+    """
+    Beta is the regression slope of portfolio returns on benchmark returns.
+
+    This is equivalent to Excel SLOPE(portfolio_returns, benchmark_returns)
+    and to covariance(portfolio, benchmark) / variance(benchmark), but using
+    the standard-library regression helper makes the intended calculation
+    explicit.
+    """
+    if len(portfolio_returns) != len(benchmark_returns) or len(portfolio_returns) < 2:
         return None
-    cov = _covariance(portfolio_returns, benchmark_returns)
-    return cov / var_bm
+    try:
+        regression = statistics.linear_regression(benchmark_returns, portfolio_returns)
+    except statistics.StatisticsError:
+        return None
+    return regression.slope
+
+
+def _paired_beta_returns(rows: list[asyncpg.Record]) -> tuple[list[float], list[float]]:
+    """
+    Return date-aligned portfolio/benchmark daily returns for beta.
+
+    Missing SPY rows are common around market holidays or data outages. Pairing
+    within the same snapshot row avoids the previous length-truncation behavior,
+    which could regress returns from different dates against each other.
+    """
+    portfolio_returns: list[float] = []
+    benchmark_returns: list[float] = []
+    for row in rows:
+        if row["daily_pnl_pct"] is None or row["spy_daily_pct"] is None:
+            continue
+        portfolio_returns.append(float(row["daily_pnl_pct"]) / 100)
+        benchmark_returns.append(float(row["spy_daily_pct"]) / 100)
+    return portfolio_returns, benchmark_returns
 
 
 def _max_drawdown(nav_series: list[float]) -> float:
@@ -187,8 +209,6 @@ async def upsert_snapshot(
     Upsert a portfolio NAV snapshot.
     Also fetches SPY close for the date and stores it for overlay calculations.
     """
-    from services.market_data import get_historical_bars
-
     # Get SPY data for this date
     spy_bars = get_historical_bars("SPY", snapshot_date, snapshot_date)
     spy_close = Decimal(str(spy_bars[0].close)) if spy_bars else None
@@ -644,11 +664,17 @@ async def _metrics_from_points(
 
     start, end = _period_bounds(period)
     port_daily = [float(p.portfolio_pct_change) / 100 for p in points if p.portfolio_pct_change is not None]
-    spy_daily = [float(p.spy_pct_change) / 100 for p in points if p.spy_pct_change is not None]
     nav_series = [float(p.portfolio_nav) for p in points]
 
-    min_len = min(len(port_daily), len(spy_daily))
-    beta_val = _beta(port_daily[:min_len], spy_daily[:min_len])
+    paired_beta_returns = [
+        (float(p.portfolio_pct_change) / 100, float(p.spy_pct_change) / 100)
+        for p in points
+        if p.portfolio_pct_change is not None and p.spy_pct_change is not None
+    ]
+    beta_val = _beta(
+        [portfolio_return for portfolio_return, _ in paired_beta_returns],
+        [benchmark_return for _, benchmark_return in paired_beta_returns],
+    )
 
     std_dev_daily = _std_dev(port_daily)
     std_dev_annual = std_dev_daily * math.sqrt(252) * 100 if std_dev_daily else None
@@ -753,16 +779,9 @@ async def calculate_metrics(
     port_daily_returns = [
         float(r["daily_pnl_pct"]) / 100 for r in rows if r["daily_pnl_pct"] is not None
     ]
-    spy_daily_returns = [
-        float(r["spy_daily_pct"]) / 100 for r in rows if r["spy_daily_pct"] is not None
-    ]
-
-    # Align lengths (in case some days missing spy data)
-    min_len = min(len(port_daily_returns), len(spy_daily_returns))
-    port_r = port_daily_returns[:min_len]
-    spy_r = spy_daily_returns[:min_len]
 
     # Beta
+    port_r, spy_r = _paired_beta_returns(rows)
     beta_val = _beta(port_r, spy_r)
 
     # Annualized std dev (assuming 252 trading days)

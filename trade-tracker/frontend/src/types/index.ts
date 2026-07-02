@@ -147,6 +147,17 @@ export interface IBKRStatus {
   message?: string
 }
 
+export interface MarketDataStatus {
+  mode: string
+  active_provider: string
+  provider_order: string[]
+  firstrate_configured: boolean
+  firstrate_path: string | null
+  ibkr_enabled: boolean
+  cache_ttl_seconds: number
+  historical_cache_ttl_seconds: number
+}
+
 export interface IBKRAccount {
   account_id: string
   total_nav: number | null

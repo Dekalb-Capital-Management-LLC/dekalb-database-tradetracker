@@ -85,7 +85,8 @@ dekalb-database/
 │   │   │   ├── universal_parser.py # parse_portfolio_xlsx — the live import path
 │   │   │   ├── fidelity_parser.py  # Fidelity CSV parser (DEAD CODE — not called)
 │   │   │   ├── ibkr_parser.py      # IBKR Activity CSV parser (DEAD CODE — not called)
-│   │   │   ├── market_data.py      # yfinance (+ IBKR when it works) with cache
+│   │   │   ├── first_rate_data.py  # FirstRateData ZIP/directory bundle reader
+│   │   │   ├── market_data.py      # FirstRateData + IBKR market data cache
 │   │   │   └── portfolio_metrics.py
 │   │   ├── requirements.txt
 │   │   ├── Dockerfile
@@ -192,8 +193,9 @@ Services that start:
 | PostgreSQL | localhost:5432 | Direct DB access |
 | Ingestion Service | port 5555 | ZMQ PULL for quant events |
 
-IBKR credentials are optional — the dashboard works with yfinance for prices and
-the XLSX import for holdings.
+IBKR credentials are optional. For local market-data proxy testing, download the
+FirstRateData sample ZIP and set `FIRST_RATE_DATA_PATH` to that file; the XLSX
+import still supplies holdings.
 
 ### Option B — Without Docker
 
@@ -268,10 +270,11 @@ A web dashboard for tracking positions, P&L, and portfolio metrics vs SPY.
   under a single `PORTFOLIO` account, and each upload replaces the previous
   positions. This is **not** a Fidelity/IBKR export format — see the caveats
   below.
-- **Prices**: yfinance, refreshed automatically in the background.
-- **IBKR**: a cloud Web API client exists (see setup below) and the session
-  connects, but it **cannot yet pull positions or pricing** — so IBKR data is
-  not usable today.
+- **Prices**: FirstRateData is preferred when `FIRST_RATE_DATA_PATH` points at a
+  ZIP bundle or extracted directory; otherwise IBKR is primary and yfinance is
+  the final fallback.
+- **IBKR**: the cloud Web API client can pull positions, pricing, account data,
+  and trade history when OAuth credentials are configured.
 
 > **Known gaps (tracked in `docs/REPO_AUDIT.md`):** the Fidelity/IBKR **CSV**
 > parsers are written but not wired to any endpoint; the import is single-account
@@ -401,7 +404,8 @@ Full interactive docs at `/docs` (Swagger UI). Endpoints have no path prefix.
 | `POST /import/trades` | Upload portfolio `.xlsx` (aliases: `/import/fidelity`, `/import/ibkr`) |
 | `GET /import/history` | List past imports |
 | **Market** | |
-| `GET /market/quote/{symbol}` | Current price (IBKR when working, else yfinance) |
+| `GET /market/provider/status` | Active market-data provider order/config |
+| `GET /market/quote/{symbol}` | Current price (FirstRateData when configured, else IBKR/yfinance) |
 | `GET /market/quotes?symbols=AAPL,MSFT` | Batch quotes |
 | `GET /market/history/{symbol}` | Historical bars |
 | `GET /market/spy` | SPY benchmark data |
