@@ -19,7 +19,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 import config
 import db
 from routers import auth as auth_router
-from routers import ibkr, imports, market, portfolio, trades
+from routers import dashboard, ibkr, imports, market, portfolio, trades
 from routers.ibkr import sync_ibkr_trades
 from services import market_data as market_data_service
 from services.auth import AuthError, verify_google_id_token
@@ -99,6 +99,7 @@ app.include_router(portfolio.router)
 app.include_router(trades.router)
 app.include_router(imports.router)
 app.include_router(market.router)
+app.include_router(dashboard.router)
 app.include_router(ibkr.router)
 
 

@@ -171,6 +171,42 @@ class HistoricalBar(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Dashboard compatibility models
+# ---------------------------------------------------------------------------
+
+DashboardModuleStatus = Literal["active", "configured", "planned", "disabled"]
+DashboardModuleOwner = Literal["equities", "quant", "shared"]
+
+
+class DashboardCapability(BaseModel):
+    key: str
+    label: str
+    owner: DashboardModuleOwner
+    status: DashboardModuleStatus
+    description: str
+    endpoints: list[str] = Field(default_factory=list)
+    data_contracts: list[str] = Field(default_factory=list)
+    notes: Optional[str] = None
+
+
+class QuantDashboardConfig(BaseModel):
+    compat_enabled: bool
+    event_source: str
+    postgres_db: str
+    questdb_http_url: str
+    questdb_ilp_host: str
+
+
+class DashboardCompatibilityResponse(BaseModel):
+    schema_version: str
+    dashboard: str
+    generated_at: datetime
+    modules: list[DashboardCapability]
+    extension_points: list[str] = Field(default_factory=list)
+    quant_config: QuantDashboardConfig
+
+
+# ---------------------------------------------------------------------------
 # Fidelity import models
 # ---------------------------------------------------------------------------
 

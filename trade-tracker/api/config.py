@@ -77,6 +77,17 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 ALLOWED_EMAIL_DOMAIN = os.getenv("ALLOWED_EMAIL_DOMAIN", "dekalbcapitalmanagement.com")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "")
 
+# ---------------------------------------------------------------------------
+# Dashboard compatibility hooks for future quant-division modules.
+# These advertise contract readiness only; the Trade Tracker API still uses the
+# isolated trade_tracker database until quant data endpoints are implemented.
+# ---------------------------------------------------------------------------
+QUANT_DASHBOARD_COMPAT_ENABLED = os.getenv("QUANT_DASHBOARD_COMPAT_ENABLED", "false").lower() == "true"
+QUANT_POSTGRES_DB = os.getenv("QUANT_POSTGRES_DB", "trading")
+QUANT_QUESTDB_HTTP_URL = os.getenv("QUANT_QUESTDB_HTTP_URL", "http://questdb:9000")
+QUANT_QUESTDB_ILP_HOST = os.getenv("QUANT_QUESTDB_ILP_HOST", "questdb")
+QUANT_EVENT_SOURCE = os.getenv("QUANT_EVENT_SOURCE", "ingestion-service")
+
 
 def validate_ibkr_oauth_config(log) -> None:
     """Startup checks for OAuth — log only, never crash the API."""

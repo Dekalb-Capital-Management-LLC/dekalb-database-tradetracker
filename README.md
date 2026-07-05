@@ -81,6 +81,7 @@ dekalb-database/
 │   │   │   ├── portfolio.py        # /portfolio/* — summary, positions, metrics
 │   │   │   ├── trades.py           # /trades/* — trade log, labels
 │   │   │   ├── imports.py          # /import/* — Fidelity CSV wizard + legacy XLSX upload
+│   │   │   ├── dashboard.py        # /dashboard/* — capability manifest
 │   │   │   └── market.py           # /market/* — quotes, history, SPY
 │   │   ├── services/
 │   │   │   ├── auth.py             # Google ID-token verification, called on every request
@@ -88,8 +89,9 @@ dekalb-database/
 │   │   │   ├── universal_parser.py # parse_portfolio_xlsx — legacy single-account XLSX import
 │   │   │   ├── fidelity_parser.py  # Fidelity CSV parser — live, wired to /import/preview+commit
 │   │   │   ├── ibkr_parser.py      # IBKR Activity CSV parser (unreferenced — superseded by ibkr_client.py)
-│   │   │   ├── market_data.py      # IBKR-first, yfinance fallback, with cache
-
+│   │   │   ├── first_rate_data.py  # FirstRateData ZIP/directory bundle reader
+│   │   │   ├── market_data.py      # FirstRateData + IBKR/yfinance market-data cache
+│   │   │   ├── dashboard_capabilities.py
 │   │   │   └── portfolio_metrics.py
 │   │   ├── requirements.txt
 │   │   ├── Dockerfile
@@ -447,6 +449,8 @@ Full interactive docs at `/docs` (Swagger UI). Endpoints have no path prefix.
 | `GET /trades` | Trade log — filter by symbol, side, label, date |
 | `PATCH /trades/{id}/label` | Set label, hedge flag, notes |
 | `DELETE /trades/reset` | Wipe all trades + snapshots (irreversible) |
+| **Dashboard** | |
+| `GET /dashboard/capabilities` | Stable dashboard module/capability manifest for current and future quant panels |
 | **Imports** | |
 | `POST /import/preview` | Upload Fidelity CSV/XLSX → diff preview (used by `FidelityUpdateWizard.tsx`) |
 | `POST /import/commit` | Commit a previewed import |

@@ -158,6 +158,37 @@ export interface MarketDataStatus {
   historical_cache_ttl_seconds: number
 }
 
+export type DashboardModuleStatus = 'active' | 'configured' | 'planned' | 'disabled'
+export type DashboardModuleOwner = 'equities' | 'quant' | 'shared'
+
+export interface DashboardCapability {
+  key: string
+  label: string
+  owner: DashboardModuleOwner
+  status: DashboardModuleStatus
+  description: string
+  endpoints: string[]
+  data_contracts: string[]
+  notes?: string | null
+}
+
+export interface QuantDashboardConfig {
+  compat_enabled: boolean
+  event_source: string
+  postgres_db: string
+  questdb_http_url: string
+  questdb_ilp_host: string
+}
+
+export interface DashboardCompatibilityStatus {
+  schema_version: string
+  dashboard: string
+  generated_at: string
+  modules: DashboardCapability[]
+  extension_points: string[]
+  quant_config: QuantDashboardConfig
+}
+
 export interface IBKRAccount {
   account_id: string
   total_nav: number | null

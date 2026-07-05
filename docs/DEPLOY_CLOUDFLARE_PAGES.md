@@ -38,6 +38,12 @@ assets directory`.
   Workers static assets — see the SPA routing note below, it replaces the
   old `_redirects`-file approach.
 
+The frontend also includes `wrangler.toml` with `pages_build_output_dir = "./dist"`
+for Pages-compatible repo configuration. If Cloudflare shows this repo as a
+Workers service instead of a Pages project, recreate/repoint it as Pages with
+the root directory above; Workers builds are not the intended deploy target for
+this Vite dashboard.
+
 ## 2. Set the build-time env var
 
 - `VITE_API_BASE_URL` = your Railway API URL (no trailing slash, no `/api`

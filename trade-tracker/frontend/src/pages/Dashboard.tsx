@@ -3,6 +3,7 @@ import { Search, Construction, Database, RefreshCw, Settings, Bell, LogOut, User
 
 import type {
   AccountSummary,
+  DashboardCompatibilityStatus,
   IBKRAccount,
   IBKRStatus,
   MarketDataStatus,
@@ -79,6 +80,18 @@ function marketProviderLabel(provider: string | null | undefined) {
   }
 }
 
+function quantCompatLabel(status: string | null | undefined) {
+  switch ((status ?? '').toLowerCase()) {
+    case 'active':
+    case 'configured':
+      return 'Quant ready'
+    case 'planned':
+      return 'Quant hooks'
+    default:
+      return 'Quant'
+  }
+}
+
 /* ── card shell ── */
 function Card({
   title,
@@ -137,6 +150,7 @@ export default function Dashboard() {
   const [ibkrStatus, setIbkrStatus] = useState<IBKRStatus | null>(null)
   const [ibkrAccount, setIbkrAccount] = useState<IBKRAccount | null>(null)
   const [marketDataStatus, setMarketDataStatus] = useState<MarketDataStatus | null>(null)
+  const [dashboardCompat, setDashboardCompat] = useState<DashboardCompatibilityStatus | null>(null)
   const [showFidelityWizard, setShowFidelityWizard] = useState(false)
   const [showCashFlowModal, setShowCashFlowModal] = useState(false)
 
@@ -252,6 +266,12 @@ export default function Dashboard() {
       .catch(() => setMarketDataStatus(null))
   }, [])
 
+  useEffect(() => {
+    get<DashboardCompatibilityStatus>('/dashboard/capabilities')
+      .then(setDashboardCompat)
+      .catch(() => setDashboardCompat(null))
+  }, [])
+
   // Wait for summary before analytics on broker tabs so account_id is known.
   useEffect(() => {
     if (selectedTab === 'trades') return
@@ -304,6 +324,7 @@ export default function Dashboard() {
     : ibkrStatus.connected && ibkrStatus.authenticated
     ? '#16a34a'
     : '#d97706'
+  const quantModule = dashboardCompat?.modules.find((module) => module.key === 'quant-ingestion')
 
   return (
     <div className="flex flex-col min-h-screen" style={{ backgroundColor: '#e8edf5' }}>
@@ -346,6 +367,16 @@ export default function Dashboard() {
             >
               <Database size={14} color="#6b7a99" strokeWidth={1.8} />
               {marketProviderLabel(marketDataStatus.active_provider)}
+            </span>
+          )}
+          {quantModule && (
+            <span
+              className="hidden xl:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium"
+              style={{ borderColor: '#d0dce8', color: '#374151', backgroundColor: '#f8fafc' }}
+              title={`Quant dashboard compatibility: ${quantModule.status}`}
+            >
+              <Construction size={14} color="#6b7a99" strokeWidth={1.8} />
+              {quantCompatLabel(quantModule.status)}
             </span>
           )}
           {ibkrStatus?.enabled && (
