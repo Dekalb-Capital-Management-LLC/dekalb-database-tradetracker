@@ -1,0 +1,9 @@
+{
+  "name": "dekalb-database-tradetracker",
+  "private": true,
+  "scripts": {
+    "build": "npm --prefix trade-tracker/frontend ci && npm --prefix trade-tracker/frontend run build",
+    "deploy": "wrangler deploy",
+    "deploy:preview": "wrangler versions upload"
+  }
+}

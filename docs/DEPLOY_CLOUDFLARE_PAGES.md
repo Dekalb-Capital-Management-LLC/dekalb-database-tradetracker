@@ -39,10 +39,18 @@ assets directory`.
   old `_redirects`-file approach.
 
 The frontend also includes `wrangler.toml` with `pages_build_output_dir = "./dist"`
-for Pages-compatible repo configuration. If Cloudflare shows this repo as a
-Workers service instead of a Pages project, recreate/repoint it as Pages with
-the root directory above; Workers builds are not the intended deploy target for
-this Vite dashboard.
+for Pages-compatible repo configuration.
+
+The repo root includes a separate `wrangler.toml` for Cloudflare Workers Builds.
+That file exists because the current GitHub check is attached to a Workers
+service, not a Pages project. It runs the frontend build from
+`trade-tracker/frontend` and deploys `trade-tracker/frontend/dist` as Workers
+Static Assets with SPA fallback. The root `.node-version` pins Cloudflare's
+build image to Node 22 because current Wrangler releases require Node 22+.
+The root `package.json` also makes a dashboard-configured `npm run build`
+work from the monorepo root by delegating to `trade-tracker/frontend`.
+If you want the simpler Pages flow instead, recreate/repoint Cloudflare as
+Pages with the root directory above.
 
 ## 2. Set the build-time env var
 

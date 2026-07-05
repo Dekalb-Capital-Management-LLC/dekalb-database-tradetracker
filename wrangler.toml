@@ -1,0 +1,10 @@
+name = "dekalb-database-tradetracker"
+compatibility_date = "2026-07-05"
+
+[build]
+command = "npm install && npm run build"
+cwd = "trade-tracker/frontend"
+
+[assets]
+directory = "./trade-tracker/frontend/dist"
+not_found_handling = "single-page-application"
