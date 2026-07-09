@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback, type ReactNode } from 'react'
 import { Search, Construction, RefreshCw, Settings, Bell, LogOut, User, Wallet } from 'lucide-react'
 import type {
   AccountSummary,
@@ -73,8 +73,8 @@ function Card({
   className = '',
 }: {
   title: string
-  children: React.ReactNode
-  action?: React.ReactNode
+  children: ReactNode
+  action?: ReactNode
   delay?: number
   className?: string
 }) {
@@ -131,21 +131,21 @@ export default function Dashboard() {
   // Metrics/performance endpoints only take a single account_id, so we use the
   // first matching account for the active broker (today there's at most one per broker)
   const brokerAccountId = brokerAccounts[0]?.account_id ?? null
-  const accountParam = brokerAccountId ? `&account_id=${encodeURIComponent(brokerAccountId)}` : ''
 
-  function loadSummary() {
+  const loadSummary = useCallback(() => {
     return get<PortfolioSummary>('/portfolio/summary')
       .then(setSummary)
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false))
-  }
+  }, [])
 
-  function loadAnalytics() {
+  const loadAnalytics = useCallback(() => {
     if (selectedTab === 'trades') return Promise.resolve()
+    const param = brokerAccountId ? `&account_id=${encodeURIComponent(brokerAccountId)}` : ''
     setChartLoading(true)
     return Promise.allSettled([
-      get<PortfolioMetrics>(`/portfolio/metrics?period=${period}${accountParam}`),
-      get<PerformancePoint[]>(`/portfolio/performance?period=${period}${accountParam}`),
+      get<PortfolioMetrics>(`/portfolio/metrics?period=${period}${param}`),
+      get<PerformancePoint[]>(`/portfolio/performance?period=${period}${param}`),
     ])
       .then(([metricsResult, perfResult]) => {
         if (metricsResult.status === 'fulfilled') setMetrics(metricsResult.value)
@@ -154,7 +154,7 @@ export default function Dashboard() {
         else setPerformance([])
       })
       .finally(() => setChartLoading(false))
-  }
+  }, [period, selectedTab, brokerAccountId])
 
   async function updatePortfolio() {
     setUpdating(true)
@@ -195,16 +195,18 @@ export default function Dashboard() {
     }
   }
 
-  // Load summary once on mount, auto-refresh every 5 min — matches the
-  // backend cron that now refreshes IBKR prices/snapshots on the same cadence.
+  // Load summary on mount; auto-refresh every 5 min — matches backend cadence.
   useEffect(() => {
     loadSummary()
+  }, [loadSummary])
+
+  useEffect(() => {
     const id = setInterval(() => {
       loadSummary()
       loadAnalytics()
     }, 300_000)
     return () => clearInterval(id)
-  }, [])
+  }, [loadSummary, loadAnalytics])
 
   useEffect(() => {
     if (selectedTab === 'fidelity' && !sessionStorage.getItem(FIDELITY_WIZARD_SESSION_KEY)) {
@@ -224,14 +226,36 @@ export default function Dashboard() {
       .catch(() => setIbkrStatus(null))
   }, [])
 
+  // Wait for summary before analytics on broker tabs so account_id is known.
   useEffect(() => {
+    if (selectedTab === 'trades') return
+    if (loading) return
+    const needsAccount = selectedTab === 'ibkr' || selectedTab === 'fidelity'
+    if (needsAccount && !brokerAccountId) {
+      setMetrics(null)
+      setPerformance([])
+      setChartLoading(false)
+      return
+    }
     loadAnalytics()
-  }, [period, selectedTab])
+  }, [period, selectedTab, brokerAccountId, loading, loadAnalytics])
 
   const hasBrokerData = brokerAccounts.length > 0
 
-  const equityValue = hasBrokerData
-    ? sumOrNull(brokerAccounts.map((a) => a.equity_value)) ?? ibkrAccount?.total_nav
+  // Portfolio Value = full account NAV (equities + cash), not stock-only equity.
+  const portfolioValue = hasBrokerData
+    ? (
+        sumOrNull(brokerAccounts.map((a) => a.total_nav))
+        ?? sumOrNull(
+          brokerAccounts.map((a) => {
+            const eq = a.equity_value != null ? Number(a.equity_value) : null
+            const cash = a.cash_balance != null ? Number(a.cash_balance) : 0
+            return eq != null ? eq + cash : null
+          }),
+        )
+        ?? ibkrAccount?.total_nav
+        ?? null
+      )
     : null
   const dayPnl = hasBrokerData ? sumOrNull(brokerAccounts.map((a) => a.day_pnl)) : null
   const dayPnlPct = brokerAccounts.length === 1 ? brokerAccounts[0].day_pnl_pct : null
@@ -474,7 +498,7 @@ export default function Dashboard() {
             <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))' }}>
               <MetricCard
                 label="Portfolio Value"
-                value={loading ? '...' : (fmt$(equityValue != null ? Number(equityValue) : null) ?? '—')}
+                value={loading ? '...' : (fmt$(portfolioValue != null ? Number(portfolioValue) : null) ?? '—')}
               />
               <MetricCard
                 label="Today's P&L"
@@ -574,7 +598,7 @@ export default function Dashboard() {
               delay={120}
               action={
                 <span className="text-xs font-normal" style={{ color: '#9ca3af' }}>
-                  {filteredPositions.length} open
+                  {filteredPositions.filter((p) => !['CASH', 'XXCASH', 'SPAXX', 'FDRXX', 'FCASH'].includes(p.symbol.trim().toUpperCase().replace(/\*+$/, ''))).length} open
                 </span>
               }
             >

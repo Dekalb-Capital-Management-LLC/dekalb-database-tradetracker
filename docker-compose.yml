@@ -87,7 +87,7 @@ services:
 
   # ---------------------------------------------------------------
   # Trade Tracker Frontend - React dashboard (equities team)
-  # http://localhost:3000
+  # http://localhost:3001  (host port — 3000 is often taken locally)
   #
   # Built with Vite + React + Recharts + Tailwind.
   # nginx serves the static build and proxies /api/* → trade-tracker:8000
@@ -95,7 +95,7 @@ services:
   trade-tracker-frontend:
     build: ./trade-tracker/frontend
     ports:
-      - "3000:3000"
+      - "3001:3000"
     depends_on:
       - trade-tracker
 
@@ -129,15 +129,15 @@ services:
   # ---------------------------------------------------------------
   # Trade Tracker API - equities team FastAPI backend
   # Connects to: trade_tracker DB (PostgreSQL only, no QuestDB)
-  # Swagger docs: http://localhost:8000/docs
-  # Health check: http://localhost:8000/health
+  # Swagger docs: http://localhost:8001/docs  (host port — 8000 is often taken locally)
+  # Health check: http://localhost:8001/health
   # ---------------------------------------------------------------
   trade-tracker:
     build:
-      context: .
-      dockerfile: trade-tracker/api/Dockerfile
+      context: ./trade-tracker/api
+      dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "8001:8000"
     env_file:
       - .env
     dns:
@@ -157,7 +157,7 @@ services:
       - IBKR_ACCOUNT_ID=${IBKR_ACCOUNT_ID:-}
       - IBKR_SERVER_IP=${IBKR_SERVER_IP:-}
       - IBKR_PRIVATE_KEY=${IBKR_PRIVATE_KEY:-}
-      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3001}
       # Tune as needed
       - PRICE_CACHE_TTL_SECONDS=60
       - DEBUG=false

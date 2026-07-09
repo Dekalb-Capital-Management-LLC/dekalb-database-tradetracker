@@ -4,6 +4,9 @@
   "private": true,
   "scripts": {
     "dev": "vite",
+    "dev:api": "node scripts/dev-api.cjs",
+    "setup:api": "node scripts/dev-api.cjs --setup-only",
+    "dev:all": "concurrently -k -n api,web -c blue,green \"npm run dev:api\" \"npm run dev\"",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },
@@ -19,6 +22,7 @@
     "@types/react-dom": "^18.2.0",
     "@vitejs/plugin-react": "^4.2.0",
     "autoprefixer": "^10.4.17",
+    "concurrently": "^9.1.2",
     "postcss": "^8.4.35",
     "tailwindcss": "^3.4.1",
     "typescript": "^5.3.3",
