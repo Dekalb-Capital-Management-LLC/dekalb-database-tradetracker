@@ -52,10 +52,13 @@ The app uses React Router's `BrowserRouter` (real URLs like `/trades`, not
 hash-based). Without a fallback rule, refreshing on `/trades` would 404 on
 any static host. For this Workers-static-assets deploy, that fallback is
 `"not_found_handling": "single-page-application"` in `wrangler.jsonc`
-(already committed, see step 1) — Workers assets don't reliably honor the
-old Pages-style `public/_redirects` file, so don't rely on that alone.
-Nothing to configure here beyond what's already committed; the smoke test
-in step 6 confirms it's working.
+(already committed, see step 1). There is **no** `public/_redirects` file —
+don't add one back. Workers' redirect-rule validator treats a catch-all
+`/* /index.html 200` rule as conflicting with `not_found_handling` (it errors
+at deploy time with "Infinite loop detected in this rule"), so
+`not_found_handling` alone is both necessary and sufficient here. Nothing to
+configure beyond what's already committed; the smoke test in step 6 confirms
+it's working.
 
 ## 4. Deploy and get the URL
 
