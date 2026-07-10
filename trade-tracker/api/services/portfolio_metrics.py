@@ -336,8 +336,12 @@ async def get_performance_series(
     # A single day of snapshot history (e.g. right after a reset) makes for a
     # dead one-point graph even though there's plenty of real trade/price
     # history to replay — only trust the snapshot table once it has enough
-    # rows to be more informative than the live/trade-replay fallbacks below.
-    if len(rows) >= 2:
+    # rows AND those rows actually cover the requested window. Otherwise an
+    # account with just a few days of real snapshots (e.g. newly deployed)
+    # would show a flat/thin graph instead of the much richer trade-replay
+    # reconstruction below, even though that reconstruction covers the full
+    # requested period.
+    if len(rows) >= 2 and (rows[0]["snapshot_date"] - start) <= timedelta(days=3):
         return _performance_from_snapshots(rows)
 
     acct = account_id or config.IBKR_ACCOUNT_ID
@@ -356,6 +360,11 @@ async def get_performance_series(
         trade_pts = await _trades_performance_series(pool, acct, start, end)
         if trade_pts:
             return trade_pts
+
+    # Nothing richer available — fall back to whatever real snapshot rows
+    # exist, even if they don't fully cover the requested window.
+    if rows:
+        return _performance_from_snapshots(rows)
 
     return []
 
@@ -722,7 +731,10 @@ async def calculate_metrics(
     start, end = _period_bounds(period)
     rows = await _fetch_snapshots(pool, start, end, account_id)
 
-    if len(rows) < 2:
+    # Same reasoning as get_performance_series: a few recent snapshot rows
+    # that don't actually cover the requested window shouldn't win out over
+    # the richer trade-replay/IBKR-replay reconstruction below.
+    if len(rows) < 2 or (rows[0]["snapshot_date"] - start) > timedelta(days=3):
         # Allow the IBKR live-estimate fallback both for the combined view
         # (account_id=None) and when the IBKR account itself is requested —
         # excluding the latter meant the IBKR tab always got an all-blank
@@ -737,18 +749,22 @@ async def calculate_metrics(
             replay = await _replay_period_metrics(pool, account_id, period)
             if replay.total_return_pct is not None:
                 return replay
-        return PortfolioMetrics(
-            period=period,
-            beta=None,
-            std_dev_annualized=None,
-            sharpe_ratio=None,
-            total_return_pct=None,
-            spy_return_pct=None,
-            alpha=None,
-            max_drawdown_pct=None,
-            win_rate=None,
-            as_of=datetime.utcnow(),
-        )
+        # Nothing richer available — fall through and compute from whatever
+        # real snapshot rows exist rather than returning all-blank, unless
+        # there genuinely are none.
+        if not rows:
+            return PortfolioMetrics(
+                period=period,
+                beta=None,
+                std_dev_annualized=None,
+                sharpe_ratio=None,
+                total_return_pct=None,
+                spy_return_pct=None,
+                alpha=None,
+                max_drawdown_pct=None,
+                win_rate=None,
+                as_of=datetime.utcnow(),
+            )
 
     port_daily_returns = [
         float(r["daily_pnl_pct"]) / 100 for r in rows if r["daily_pnl_pct"] is not None
