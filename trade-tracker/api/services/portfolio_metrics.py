@@ -347,7 +347,9 @@ async def get_performance_series(
             return trade_pts
 
     rows = await _fetch_snapshots(pool, start, end, account_id)
-    if len(rows) >= 2:
+    # Only trust snapshots when they cover the requested window (main's
+    # coverage check). Otherwise prefer IBKR/trade replay below.
+    if len(rows) >= 2 and (rows[0]["snapshot_date"] - start) <= timedelta(days=3):
         return _performance_from_snapshots(rows)
 
     if (
@@ -360,6 +362,11 @@ async def get_performance_series(
         ibkr_pts = await loop.run_in_executor(None, _ibkr_performance_series, start, end)
         if ibkr_pts:
             return ibkr_pts
+
+    # Nothing richer available — fall back to whatever real snapshot rows
+    # exist, even if they don't fully cover the requested window.
+    if rows:
+        return _performance_from_snapshots(rows)
 
     return []
 
