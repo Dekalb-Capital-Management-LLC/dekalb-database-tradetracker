@@ -4,14 +4,17 @@ Backend infrastructure for DeKalb Capital. Handles live trading-event ingestion
 (quant team) and the equities team's trade-tracker dashboard. Two
 mostly-independent halves share one Postgres instance.
 
-> **⚠️ Status:** The ingestion service is solid. The **Trade Tracker is not
-> production-ready** — auth isn't enforced, IBKR connects but can't pull
-> positions/pricing, the Fidelity *CSV* import is currently dead code (only a
-> custom XLSX import works), and the production deploy has never been completed.
-> **[`docs/REPO_AUDIT.md`](docs/REPO_AUDIT.md) is the source of truth for what
-> works vs. what's broken** — read it before relying on any Trade Tracker
-> feature. [`docs/FEATURES.md`](docs/FEATURES.md) has the per-feature status
-> table.
+> **⚠️ Status (2026-07-09):** The ingestion service is solid. The **Trade
+> Tracker's equities half is largely working now** — Google SSO auth is fully
+> wired and enforced (gated by `AUTH_ENABLED`), IBKR pulls real
+> positions/pricing/trade history, Fidelity CSV import is live via a
+> preview/commit wizard, and the production deploy is in progress (Railway
+> backend is live; Google OAuth + Cloudflare frontend are being finished now).
+> **[`docs/REPO_AUDIT.md`](docs/REPO_AUDIT.md) is the source of truth for
+> what's still outstanding** (schema drift, no automated tests, a couple of
+> approximate metrics) — read it before assuming something is finished, but
+> don't assume it's broken either. [`docs/FEATURES.md`](docs/FEATURES.md) has
+> the per-feature status table.
 
 ---
 
@@ -73,29 +76,29 @@ dekalb-database/
 │   │   ├── db.py                   # Connection pool + auto-migrations
 │   │   ├── models/schemas.py
 │   │   ├── routers/
-│   │   │   ├── auth.py             # /auth/* — Google SSO (NOT wired into main.py yet)
-│   │   │   ├── ibkr.py             # /ibkr/* — connect, account, positions, sync
+│   │   │   ├── auth.py             # /auth/* — Google SSO, registered + enforced in main.py
+│   │   │   ├── ibkr.py             # /ibkr/* — connect, account, positions, sync (real data)
 │   │   │   ├── portfolio.py        # /portfolio/* — summary, positions, metrics
 │   │   │   ├── trades.py           # /trades/* — trade log, labels
-│   │   │   ├── imports.py          # /import/* — XLSX portfolio upload
+│   │   │   ├── imports.py          # /import/* — Fidelity CSV wizard + legacy XLSX upload
 │   │   │   └── market.py           # /market/* — quotes, history, SPY
 │   │   ├── services/
-│   │   │   ├── auth.py             # Google ID-token verification (unused at runtime)
-│   │   │   ├── ibkr_client.py      # IBKR cloud Web API client (RSA OAuth 2.0)
-│   │   │   ├── universal_parser.py # parse_portfolio_xlsx — the live import path
-│   │   │   ├── fidelity_parser.py  # Fidelity CSV parser (DEAD CODE — not called)
-│   │   │   ├── ibkr_parser.py      # IBKR Activity CSV parser (DEAD CODE — not called)
-│   │   │   ├── market_data.py      # yfinance (+ IBKR when it works) with cache
+│   │   │   ├── auth.py             # Google ID-token verification, called on every request
+│   │   │   ├── ibkr_client.py      # IBKR cloud Web API client (RSA OAuth 2.0) — live data
+│   │   │   ├── universal_parser.py # parse_portfolio_xlsx — legacy single-account XLSX import
+│   │   │   ├── fidelity_parser.py  # Fidelity CSV parser — live, wired to /import/preview+commit
+│   │   │   ├── ibkr_parser.py      # IBKR Activity CSV parser (unreferenced — superseded by ibkr_client.py)
+│   │   │   ├── market_data.py      # IBKR-first, yfinance fallback, with cache
 │   │   │   └── portfolio_metrics.py
 │   │   ├── requirements.txt
 │   │   ├── Dockerfile
 │   │   └── railway.toml
 │   └── frontend/                   # React + Vite + Tailwind
 │       ├── src/
-│       │   ├── pages/              # Dashboard, Trades, Import, Login
+│       │   ├── pages/              # Dashboard, Login
 │       │   ├── auth/               # AuthContext, Login
-│       │   └── components/         # Layout, charts, tables
-│       ├── vercel.json
+│       │   └── components/         # FidelityUpdateWizard, PositionsTable, PerformanceChart, etc.
+│       ├── wrangler.jsonc          # Cloudflare Workers static-assets deploy config
 │       └── package.json
 │
 ├── schemas/
@@ -260,36 +263,76 @@ python tests/fake_zmq_sender.py   # sends 5 batches of 3 events; check Adminer
 
 A web dashboard for tracking positions, P&L, and portfolio metrics vs SPY.
 
-### How data gets in (current reality)
+### How data gets in
 
-- **Portfolio XLSX upload** (the only working import): on the **Import** page,
-  upload an `.xlsx`/`.xlsm` file whose sheets have columns
-  `Ticker | Date Acquired | Amount | Price Acquired`. Everything is recorded
-  under a single `PORTFOLIO` account, and each upload replaces the previous
-  positions. This is **not** a Fidelity/IBKR export format — see the caveats
-  below.
-- **Prices**: yfinance, refreshed automatically in the background.
-- **IBKR**: a cloud Web API client exists (see setup below) and the session
-  connects, but it **cannot yet pull positions or pricing** — so IBKR data is
-  not usable today.
+- **Fidelity CSV import** (the primary path): on the **Import** tab, upload a
+  Fidelity Activity/Orders CSV (trade history) or Portfolio Positions CSV
+  (holdings, including multi-account via the Account Name/Number columns).
+  Goes through a preview/diff wizard (`FidelityUpdateWizard.tsx`) before
+  committing. Money-market/cash-sweep funds get $1-NAV synthetic positions;
+  options are skipped.
+- **IBKR** (live): the cloud Web API client (RSA OAuth, see setup below) pulls
+  real positions, live pricing, and trade history — this used to be the
+  biggest blocker and is now fixed.
+- **Portfolio XLSX upload** (legacy, still works): a custom multi-sheet XLSX
+  with columns `Ticker | Date Acquired | Amount | Price Acquired`, recorded
+  under a single `PORTFOLIO` account. Not a Fidelity/IBKR export format —
+  kept as a secondary path.
+- **Prices**: IBKR-first when `IBKR_ENABLED=true`, yfinance fallback
+  otherwise, refreshed automatically in the background.
 
-> **Known gaps (tracked in `docs/REPO_AUDIT.md`):** the Fidelity/IBKR **CSV**
-> parsers are written but not wired to any endpoint; the import is single-account
-> only; Google SSO is built in the frontend but not enforced by the backend; and
-> parts of the Dashboard UI are visually broken. Don't assume a feature works
-> just because it appears in the UI.
+> **Known gaps (tracked in `docs/REPO_AUDIT.md`):** schema drift (three tables
+> only exist as runtime migrations, not in the schema file), no automated
+> tests, `RISK_FREE_RATE_ANNUAL` hardcoded to `0.0`, no token-refresh flow for
+> Google sign-in (expires ~1h, hard-redirects to `/login` on expiry). Don't
+> assume something's broken just because an older doc said so — check
+> `docs/REPO_AUDIT.md` for the current list.
 
 ---
 
-## Deploying to Production (Railway + Cloudflare Pages)
+## Deploying to Production (Railway + Cloudflare)
 
-The backend deploys to **Railway**, the frontend to **Cloudflare Pages**
-(chosen over Vercel — free tier, no new vendor to evaluate), linked via env
-vars (no shared secrets file). Google SSO is enforced server-side via
-`AuthMiddleware` in `main.py` — `AUTH_ENABLED=true` actually does something
-now, it's not a no-op.
+### The shape of it, in plain terms
 
-Full step-by-step runbooks, in order:
+The Trade Tracker has two halves that deploy to two different places:
+
+- **Backend** (the API/database logic) → **Railway**.
+- **Frontend** (the dashboard people open in a browser) → **Cloudflare**.
+
+This is entirely separate infrastructure from DeKalb's main company website
+at `dekalbcapitalmanagement.com`, which runs on **Vercel** and is untouched
+by any of this — different repo, different hosting account, no shared DNS
+unless you deliberately connect them (see custom domain, below).
+
+The two Trade Tracker halves are linked purely by env vars, no shared
+secrets file: `FRONTEND_URL` (on Railway, drives CORS) and
+`VITE_API_BASE_URL` (on Cloudflare, baked into the frontend at build time so
+it knows which API to call). Google SSO is enforced server-side via
+`AuthMiddleware` in `main.py` — `AUTH_ENABLED=true` actually does something,
+it's not a no-op.
+
+### About the Cloudflare URL
+
+Cloudflare's dashboard now deploys git-connected static sites as a **Worker
+with static assets**, not the older "Pages" product (even though the nav
+item is still labeled "Workers & Pages" and it's easy to click through what
+looks like a Pages flow — see `docs/DEPLOY_CLOUDFLARE_PAGES.md` step 1 for
+the tell-tale signs and the `wrangler.jsonc` config this requires).
+
+Practically, that just changes the free default URL you get: instead of
+`*.pages.dev` it's `*.<subdomain>.workers.dev` — and unlike Pages, it isn't
+enabled by default; flip it on under the project's **Domains & Routes** tab.
+That URL is a **real, permanent, fully-working production address** the
+moment it's live, not a placeholder or local link — you can run on it
+indefinitely with no custom domain at all.
+
+A prettier URL (e.g. `tradetracker.dekalbcapitalmanagement.com`) is an
+optional later step — one DNS record added wherever `dekalbcapitalmanagement.com`'s
+DNS is actually managed, which does **not** need to be Cloudflare and does
+**not** touch the existing Vercel site, as long as you scope it to a
+subdomain rather than routing the root domain through Cloudflare.
+
+### Runbooks, in order
 
 1. [`docs/DEPLOY_RAILWAY.md`](docs/DEPLOY_RAILWAY.md) — backend + Postgres
 2. [`docs/DEPLOY_GOOGLE_OAUTH.md`](docs/DEPLOY_GOOGLE_OAUTH.md) — domain-restricted Google sign-in
@@ -335,9 +378,11 @@ docs mentioning a "Client Portal Gateway", port 5001, or "Pangolin" are stale.)
 → that token + your IBKR username + your server's outbound IP creates a session
 → the session is kept alive with a tickle every 60s. It reconnects on its own.
 
-> **Status:** this gets as far as a connected session, but **pulling positions
-> and pricing does not work yet** — see `docs/REPO_AUDIT.md` (IBKR project). Leave
-> `IBKR_ENABLED=false` until that's fixed.
+> **Status:** working — positions, live pricing, and trade history all pull
+> real data now (retry logic for IBKR's first-call-empty quirk, a `portfolio2`
+> fallback, US-listed conid disambiguation, 429-backoff). Set
+> `IBKR_ENABLED=true` to use it; see `docs/REPO_AUDIT.md` for remaining edge
+> cases.
 
 **Credentials** live in Ryan's zip (`privatekey.pem`) and ticket #619394. Set in
 `.env`:
@@ -375,10 +420,11 @@ Full interactive docs at `/docs` (Swagger UI). Endpoints have no path prefix.
 | Endpoint | What it does |
 |---|---|
 | `GET /health` | Health check (DB, IBKR flag, trade count, latest snapshot) |
-| **Auth** | (router exists but is not registered in `main.py` yet) |
+| **Auth** | Registered in `main.py`; `AuthMiddleware` enforces it on every request except `/health`, `/docs`, `/auth/*` when `AUTH_ENABLED=true` |
 | `GET /auth/config` | Auth config for the frontend |
 | `POST /auth/verify` | Verify a Google ID token |
-| **IBKR** | (connects, but data calls don't return yet) |
+| `GET /auth/me` | Current authenticated user |
+| **IBKR** | Connects and returns real data |
 | `GET /ibkr/status` | Is IBKR connected? |
 | `POST /ibkr/connect` | Trigger reconnect |
 | `GET /ibkr/account` | Account NAV/balances |
@@ -393,12 +439,15 @@ Full interactive docs at `/docs` (Swagger UI). Endpoints have no path prefix.
 | `POST /portfolio/update-all` | Refresh prices + write a snapshot now |
 | `POST /portfolio/snapshots/generate` | Generate today's NAV snapshot |
 | `POST /portfolio/snapshots/backfill` | Backfill missing historical snapshots |
+| `GET/POST/PATCH/DELETE /portfolio/cash-flows` | Deposits/withdrawals — excluded from return/Sharpe/drawdown calcs |
 | **Trades** | |
 | `GET /trades` | Trade log — filter by symbol, side, label, date |
 | `PATCH /trades/{id}/label` | Set label, hedge flag, notes |
 | `DELETE /trades/reset` | Wipe all trades + snapshots (irreversible) |
 | **Imports** | |
-| `POST /import/trades` | Upload portfolio `.xlsx` (aliases: `/import/fidelity`, `/import/ibkr`) |
+| `POST /import/preview` | Upload Fidelity CSV/XLSX → diff preview (used by `FidelityUpdateWizard.tsx`) |
+| `POST /import/commit` | Commit a previewed import |
+| `POST /import/trades` | Legacy portfolio `.xlsx` upload (hardcoded to `account_id='PORTFOLIO'`) |
 | `GET /import/history` | List past imports |
 | **Market** | |
 | `GET /market/quote/{symbol}` | Current price (IBKR when working, else yfinance) |

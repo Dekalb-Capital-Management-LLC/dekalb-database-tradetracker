@@ -39,7 +39,7 @@ You need that URL for step 3 below, and it's one less trip back and forth.
 
 ## 1. Create the OAuth client
 
-- **Sign into [Google Cloud Console](https://console.cloud.google.com/) with
+- **Sign into [console.cloud.google.com](https://console.cloud.google.com/) with
   your `@dekalbcapitalmanagement.com` account, not a personal Gmail.** This is
   the single most common way to get this wrong — if the project is created
   under a personal account, it won't be associated with the Workspace org and
