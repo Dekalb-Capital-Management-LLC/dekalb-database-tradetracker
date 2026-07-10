@@ -174,38 +174,22 @@ def _fetch_hist_ibkr(
     return bars
 
 
-def get_historical_bars(
+def _fetch_hist_yfinance(
     symbol: str,
     start: date,
     end: date,
     interval: str = "1d",
 ) -> list[HistoricalBar]:
-    """
-    Fetch OHLCV bars via IBKR (when connected) or yfinance.
-    interval: '1d', '1wk', '1mo'  (daily is most useful for portfolio metrics)
-    """
-    key = _hist_cache_key(symbol, start, end, interval)
-    cached = _cached_bars(key)
-    if cached is not None:
-        return cached
-
-    ibkr_bars = _fetch_hist_ibkr(symbol, start, end, interval)
-    if ibkr_bars:
-        _store_bars(key, ibkr_bars)
-        return ibkr_bars
-
     try:
         _throttle_yfinance()
         ticker = yf.Ticker(symbol, session=_yf_session)
         df = ticker.history(
             start=start.isoformat(),
-            end=(end + timedelta(days=1)).isoformat(),  # yfinance end is exclusive
+            end=(end + timedelta(days=1)).isoformat(),
             interval=interval,
             auto_adjust=True,
         )
         if df.empty:
-            logger.warning("No historical data for %s %s-%s", symbol, start, end)
-            _store_bars(key, [])
             return []
 
         bars: list[HistoricalBar] = []
@@ -220,15 +204,43 @@ def get_historical_bars(
                     volume=int(row["Volume"]),
                 )
             )
-        _store_bars(key, bars)
-        logger.info("Fetched %d bars for %s via yfinance", len(bars), symbol)
         return bars
-
     except Exception as exc:
         logger.error("yfinance historical error for %s: %s", symbol, exc)
         if "rate limit" in str(exc).lower():
             time.sleep(config.YFINANCE_REQUEST_DELAY_SECONDS * 3)
         return []
+
+
+def get_historical_bars(
+    symbol: str,
+    start: date,
+    end: date,
+    interval: str = "1d",
+) -> list[HistoricalBar]:
+    """
+    Fetch OHLCV bars via yfinance first (consistent SPY/portfolio replay),
+    IBKR fallback when yfinance misses.
+    """
+    key = _hist_cache_key(symbol, start, end, interval)
+    cached = _cached_bars(key)
+    if cached is not None:
+        return cached
+
+    yf_bars = _fetch_hist_yfinance(symbol, start, end, interval)
+    if yf_bars:
+        _store_bars(key, yf_bars)
+        logger.info("Fetched %d bars for %s via yfinance", len(yf_bars), symbol)
+        return yf_bars
+
+    ibkr_bars = _fetch_hist_ibkr(symbol, start, end, interval)
+    if ibkr_bars:
+        _store_bars(key, ibkr_bars)
+        return ibkr_bars
+
+    _store_bars(key, [])
+    logger.warning("No historical data for %s %s-%s", symbol, start, end)
+    return []
 
 
 def get_historical_bars_batch(
@@ -255,38 +267,31 @@ def get_historical_bars_batch(
     if not missing:
         return result
 
-    if config.IBKR_ENABLED:
-        # IBKR's history endpoint can take 10s+ per symbol (and frequently 503s) —
-        # fetching one symbol at a time here can block the whole request for
-        # minutes. Run them concurrently instead; still IBKR-first, just not serial.
-        still_missing: list[str] = []
-        with ThreadPoolExecutor(max_workers=min(8, len(missing))) as pool:
-            future_to_sym = {
-                pool.submit(_fetch_hist_ibkr, sym, start, end, interval): sym
-                for sym in missing
-            }
-            for future in future_to_sym:
-                sym = future_to_sym[future]
-                try:
-                    ibkr_bars = future.result()
-                except Exception as exc:
-                    logger.warning("IBKR history fetch failed for %s: %s", sym, exc)
-                    ibkr_bars = []
-                if ibkr_bars:
-                    key = _hist_cache_key(sym, start, end, interval)
-                    _store_bars(key, ibkr_bars)
-                    result[sym] = ibkr_bars
-                else:
-                    still_missing.append(sym)
-        missing = still_missing
-
-    if not missing:
-        return result
-
     chunk_size = 5
     for i in range(0, len(missing), chunk_size):
         chunk = missing[i : i + chunk_size]
         _download_hist_chunk(chunk, start, end, interval, result)
+
+    # IBKR fallback for symbols yfinance still missed
+    if config.IBKR_ENABLED:
+        still_missing = [sym for sym in missing if sym not in result or not result.get(sym)]
+        if still_missing:
+            with ThreadPoolExecutor(max_workers=min(8, len(still_missing))) as pool:
+                future_to_sym = {
+                    pool.submit(_fetch_hist_ibkr, sym, start, end, interval): sym
+                    for sym in still_missing
+                }
+                for future in future_to_sym:
+                    sym = future_to_sym[future]
+                    try:
+                        ibkr_bars = future.result()
+                    except Exception as exc:
+                        logger.warning("IBKR history fetch failed for %s: %s", sym, exc)
+                        ibkr_bars = []
+                    if ibkr_bars:
+                        key = _hist_cache_key(sym, start, end, interval)
+                        _store_bars(key, ibkr_bars)
+                        result[sym] = ibkr_bars
 
     return result
 
@@ -396,6 +401,16 @@ def _fetch_quote_ibkr(symbol: str) -> Optional[PriceQuote]:
 # Public interface
 # ---------------------------------------------------------------------------
 
+def _fetch_quote_yfinance_only(symbol: str) -> Optional[PriceQuote]:
+    """Live quote via yfinance only — for non-IBKR/Fidelity refresh paths."""
+    if is_cash_symbol(symbol):
+        return _cash_quote(symbol)
+    cached = _cached_quote(symbol.upper())
+    if cached and cached.source in ("yfinance", "cash"):
+        return cached
+    return _fetch_quote_yfinance(symbol)
+
+
 def _fetch_quote(symbol: str) -> Optional[PriceQuote]:
     """
     Get current price for a symbol (sync).
@@ -422,6 +437,19 @@ def _fetch_quote(symbol: str) -> Optional[PriceQuote]:
 
 
 # Async API used by routers (main branch compatibility)
+async def warm_yfinance_quote_cache(pool, symbols: list[str]) -> None:
+    """Pre-fetch yfinance-only quotes (skips IBKR)."""
+    uncached = [s.upper() for s in symbols if s and not _cached_quote(s.upper())]
+    if not uncached:
+        return
+
+    def _fetch_all():
+        for sym in uncached:
+            _fetch_quote_yfinance_only(sym)
+
+    await asyncio.to_thread(_fetch_all)
+
+
 async def warm_quote_cache(pool, symbols: list[str]) -> None:
     """Pre-fetch quotes for many symbols (sequential; uses IBKR/yfinance cache).
 
@@ -439,6 +467,15 @@ async def warm_quote_cache(pool, symbols: list[str]) -> None:
             _fetch_quote(sym)
 
     await asyncio.to_thread(_fetch_all)
+
+
+async def get_yfinance_quote(pool, symbol: str) -> Optional[PriceQuote]:
+    """Async yfinance-only quote — avoids IBKR for non-IBKR account rows."""
+    sym = symbol.upper()
+    cached = _cached_quote(sym)
+    if cached and cached.source in ("yfinance", "cash"):
+        return cached
+    return await asyncio.to_thread(_fetch_quote_yfinance_only, sym)
 
 
 async def get_quote(pool, symbol: str) -> Optional[PriceQuote]:

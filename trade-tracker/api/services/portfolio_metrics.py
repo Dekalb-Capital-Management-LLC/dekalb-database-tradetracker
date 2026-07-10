@@ -326,40 +326,42 @@ async def backfill_snapshots(pool: asyncpg.Pool) -> dict:
 # Performance series (for graph)
 # ---------------------------------------------------------------------------
 
+async def _has_trades(pool: asyncpg.Pool, account_id: str) -> bool:
+    row = await pool.fetchrow(
+        "SELECT 1 FROM trades WHERE account_id = $1 LIMIT 1", account_id
+    )
+    return row is not None
+
+
 async def get_performance_series(
     pool: asyncpg.Pool,
     start: date,
     end: date,
     account_id: Optional[str] = None,
 ) -> list[PerformancePoint]:
+    # Trade replay is the source of truth when synced trades exist — snapshots
+    # may be sparse/today-only and IBKR holdings replay ignores buys/sells.
+    if account_id and await _has_trades(pool, account_id):
+        trade_pts = await _trades_performance_series(pool, account_id, start, end)
+        if trade_pts:
+            return trade_pts
+
     rows = await _fetch_snapshots(pool, start, end, account_id)
-    # A single day of snapshot history (e.g. right after a reset) makes for a
-    # dead one-point graph even though there's plenty of real trade/price
-    # history to replay — only trust the snapshot table once it has enough
-    # rows AND those rows actually cover the requested window. Otherwise an
-    # account with just a few days of real snapshots (e.g. newly deployed)
-    # would show a flat/thin graph instead of the much richer trade-replay
-    # reconstruction below, even though that reconstruction covers the full
-    # requested period.
+    # Only trust snapshots when they cover the requested window (main's
+    # coverage check). Otherwise prefer IBKR/trade replay below.
     if len(rows) >= 2 and (rows[0]["snapshot_date"] - start) <= timedelta(days=3):
         return _performance_from_snapshots(rows)
 
-    acct = account_id or config.IBKR_ACCOUNT_ID
-
-    if config.IBKR_ENABLED and config.IBKR_ACCOUNT_ID:
-        if not account_id or account_id == config.IBKR_ACCOUNT_ID:
-            # Synchronous (blocking HTTP/yfinance calls) — run off the event
-            # loop so a slow historical-bars fetch doesn't freeze every other
-            # concurrent request.
-            loop = asyncio.get_event_loop()
-            ibkr_pts = await loop.run_in_executor(None, _ibkr_performance_series, start, end)
-            if ibkr_pts:
-                return ibkr_pts
-
-    if acct:
-        trade_pts = await _trades_performance_series(pool, acct, start, end)
-        if trade_pts:
-            return trade_pts
+    if (
+        config.IBKR_ENABLED
+        and config.IBKR_ACCOUNT_ID
+        and (not account_id or account_id == config.IBKR_ACCOUNT_ID)
+        and not (account_id and await _has_trades(pool, account_id))
+    ):
+        loop = asyncio.get_event_loop()
+        ibkr_pts = await loop.run_in_executor(None, _ibkr_performance_series, start, end)
+        if ibkr_pts:
+            return ibkr_pts
 
     # Nothing richer available — fall back to whatever real snapshot rows
     # exist, even if they don't fully cover the requested window.
@@ -369,6 +371,56 @@ async def get_performance_series(
     return []
 
 
+def _apply_trade_cash(
+    cash: float,
+    side: str,
+    qty: float,
+    price: float,
+    commission: float,
+) -> tuple[float, float]:
+    """
+    Apply one trade to cash. Returns (new_cash, implicit_external_flow).
+
+    IBKR/Fidelity trade sync often has buys/sells but no deposit rows in
+    cash_flows. Without funding, cash goes deeply negative and TWR explodes
+    (e.g. +294% on a ~$20k account). Treat any cash shortfall on a BUY as an
+    implicit deposit (excluded from return). Treat cash that would go more
+    negative on a SELL covering a short the same way only for the buy side —
+    sells just add proceeds.
+    """
+    if side == "BUY":
+        cost = qty * price + commission
+        if cash >= cost:
+            return cash - cost, 0.0
+        # Fund the shortfall as new capital entering the account.
+        shortfall = cost - max(cash, 0.0)
+        return 0.0, shortfall
+    # SELL
+    return cash + qty * price - commission, 0.0
+
+
+def _mark_equity(
+    holdings: dict[str, float],
+    closes: dict[str, dict[date, float]],
+    last_close: dict[str, float],
+    d: date,
+) -> float:
+    """Mark holdings to market; forward-fill last known close; include shorts."""
+    equity = 0.0
+    for sym, qty in holdings.items():
+        if abs(qty) < 0.00001:
+            continue
+        px = closes.get(sym, {}).get(d)
+        if px is not None:
+            last_close[sym] = px
+        else:
+            px = last_close.get(sym)
+        if px is None:
+            continue
+        equity += qty * px
+    return equity
+
+
 async def _trades_performance_series(
     pool: asyncpg.Pool,
     account_id: str,
@@ -376,8 +428,11 @@ async def _trades_performance_series(
     end: date,
 ) -> list[PerformancePoint]:
     """
-    Replay synced trades to rebuild daily holdings, then mark-to-market via yfinance.
-    More accurate than applying current share counts across history.
+    Replay synced trades → daily holdings, mark-to-market, time-weighted return.
+
+    External cash (recorded cash_flows + implicit funding when a BUY would
+    otherwise drive cash negative) is excluded from daily return so deposits
+    don't look like investment gains.
     """
     rows = await pool.fetch(
         """
@@ -392,15 +447,10 @@ async def _trades_performance_series(
     if not rows:
         return []
 
-    # Custom cost-basis-lot sheets (universal_parser.py) record every lot as a
-    # synthetic BUY with no corresponding cash/deposit ever recorded — it's a
-    # "here's what I currently hold" snapshot, not a real cash-tracked ledger.
-    # Modeling "cash" for these drains to a huge negative number with nothing
-    # to offset it, which blew up every ratio that divides by portfolio value
-    # (the +450% return / -97% drawdown / beta-138 readings). If this account
-    # has never recorded a real SELL, skip cash entirely and value the
-    # portfolio as just the stock — there's no real cash balance to model.
+    # Lot-only sheets (all BUYs, no SELLs, no cash ledger): value equity only
+    # and treat each buy cost as an implicit deposit.
     has_sells = any(r["side"] == "SELL" for r in rows)
+    lot_only = not has_sells
 
     symbols = sorted({r["symbol"].upper() for r in rows})
     loop = asyncio.get_event_loop()
@@ -409,25 +459,40 @@ async def _trades_performance_series(
         logger.warning("No SPY history for performance series")
         return []
 
-    batch = await loop.run_in_executor(None, get_historical_bars_batch, symbols, start, end)
+    # Need history from first trade (may be before `start`) so holdings are
+    # correct at the period open — but only emit points inside [start, end].
+    first_trade = rows[0]["trade_date"]
+    first_trade_d = first_trade.date() if hasattr(first_trade, "date") else first_trade
+    hist_start = min(start, first_trade_d)
+
+    batch = await loop.run_in_executor(
+        None, get_historical_bars_batch, symbols, hist_start, end
+    )
     closes: dict[str, dict[date, float]] = {
         sym: {b.date: float(b.close) for b in batch.get(sym, [])}
         for sym in symbols
     }
-    flows_by_date = await _cash_flows_by_date(pool, account_id, start, end)
+    flows_by_date = await _cash_flows_by_date(pool, account_id, hist_start, end)
+
+    # Replay calendar = SPY bars from hist_start (trading days only)
+    all_spy = await loop.run_in_executor(None, get_spy_history, hist_start, end)
+    if not all_spy:
+        all_spy = spy_bars
 
     holdings: dict[str, float] = defaultdict(float)
     cash = 0.0
     trade_idx = 0
     points: list[PerformancePoint] = []
-    spy_base = float(spy_bars[0].close)
+    last_close: dict[str, float] = {}
     prev_port: Optional[float] = None
     prev_spy: Optional[float] = None
     cum_factor = 1.0
+    spy_base: Optional[float] = None
 
-    for bar in spy_bars:
+    for bar in all_spy:
         d = bar.date
-        implicit_deposit_today = 0.0
+        flow_today = 0.0
+
         while trade_idx < len(rows):
             t = rows[trade_idx]
             td = t["trade_date"].date() if hasattr(t["trade_date"], "date") else t["trade_date"]
@@ -437,47 +502,67 @@ async def _trades_performance_series(
             qty = float(t["quantity"])
             price = float(t["price"])
             commission = float(t["commission"] or 0)
-            if t["side"] == "BUY":
-                cost = qty * price + commission
-                if has_sells:
-                    cash -= cost
+            if lot_only:
+                if t["side"] == "BUY":
+                    flow_today += qty * price + commission
+                    holdings[sym] += qty
                 else:
-                    # Lot-only sheet: this "purchase" is newly-tracked capital
-                    # entering the portfolio (there's no real cash account it
-                    # came out of), not investment growth — exclude its cost
-                    # from today's return the same way a real cash deposit
-                    # would be excluded. Without this, every new lot's full
-                    # value appeared "for free" the day it's acquired, which
-                    # is exactly what was producing the absurd +1985% return.
-                    implicit_deposit_today += cost
-                holdings[sym] += qty
+                    holdings[sym] -= qty
             else:
-                cash += qty * price - commission
-                holdings[sym] -= qty
+                if t["side"] == "BUY":
+                    cash, implicit = _apply_trade_cash(cash, "BUY", qty, price, commission)
+                    flow_today += implicit
+                    holdings[sym] += qty
+                else:
+                    cash, _ = _apply_trade_cash(cash, "SELL", qty, price, commission)
+                    holdings[sym] -= qty
             trade_idx += 1
 
-        # External deposits/withdrawals land in cash like any other day's
-        # activity (so the dollar NAV stays real), but get excluded from the
-        # *return* below — otherwise funding a purchase with new cash reads
-        # as investment growth.
-        flow_today = (flows_by_date.get(d, 0.0) if has_sells else 0.0) + implicit_deposit_today
-        if has_sells:
-            cash += flows_by_date.get(d, 0.0)
+        recorded = flows_by_date.get(d, 0.0)
+        if not lot_only:
+            cash += recorded
+        flow_today += recorded
 
-        equity = sum(
-            holdings[sym] * closes[sym][d]
-            for sym in holdings
-            if holdings[sym] > 0 and d in closes.get(sym, {})
-        )
-        port_val = (cash + equity) if has_sells else equity
+        equity = _mark_equity(holdings, closes, last_close, d)
+        port_val = equity if lot_only else cash + equity
         if port_val <= 0:
             continue
-        daily_pct = ((port_val - prev_port - flow_today) / prev_port * 100) if prev_port else None
-        spy_daily_pct = ((float(bar.close) - prev_spy) / prev_spy * 100) if prev_spy else None
-        if daily_pct is not None:
-            cum_factor *= (1 + daily_pct / 100)
-        port_cum = (cum_factor - 1) * 100
-        spy_cum = (float(bar.close) - spy_base) / spy_base * 100
+
+        # Only publish points inside the requested window; still update state
+        # before `start` so the period opens with correct holdings/cash.
+        if d < start:
+            prev_port = port_val
+            prev_spy = float(bar.close)
+            continue
+
+        if spy_base is None:
+            spy_base = float(bar.close)
+            # First published day: return starts at 0; don't treat opening NAV
+            # as a gain. Reset TWR chain here.
+            cum_factor = 1.0
+            daily_pct = None
+            spy_daily_pct = None
+            port_cum = 0.0
+            spy_cum = 0.0
+        else:
+            # TWR: r_t = (V_t - V_{t-1} - flow_t) / V_{t-1}
+            # When flow funds a buy, V also rises by ~flow, so net return ≈ 0
+            # that day aside from price moves — which is what we want.
+            if prev_port and prev_port > 0:
+                daily_pct = (port_val - prev_port - flow_today) / prev_port * 100
+            else:
+                daily_pct = None
+            spy_daily_pct = (
+                (float(bar.close) - prev_spy) / prev_spy * 100 if prev_spy else None
+            )
+            if daily_pct is not None:
+                # Clamp absurd single-day moves from bad marks / missing prices
+                # rather than letting one day dominate the chain.
+                daily_pct = max(-50.0, min(50.0, daily_pct))
+                cum_factor *= 1 + daily_pct / 100
+            port_cum = (cum_factor - 1) * 100
+            spy_cum = (float(bar.close) - spy_base) / spy_base * 100
+
         prev_port = port_val
         prev_spy = float(bar.close)
 
@@ -485,14 +570,21 @@ async def _trades_performance_series(
             PerformancePoint(
                 date=d,
                 portfolio_nav=Decimal(str(round(port_val, 2))),
-                portfolio_pct_change=Decimal(str(round(daily_pct, 6))) if daily_pct is not None else None,
-                spy_pct_change=Decimal(str(round(spy_daily_pct, 6))) if spy_daily_pct is not None else None,
+                portfolio_pct_change=(
+                    Decimal(str(round(daily_pct, 6))) if daily_pct is not None else None
+                ),
+                spy_pct_change=(
+                    Decimal(str(round(spy_daily_pct, 6))) if spy_daily_pct is not None else None
+                ),
                 spy_cumulative_pct=Decimal(str(round(spy_cum, 4))),
                 portfolio_cumulative_pct=Decimal(str(round(port_cum, 4))),
             )
         )
 
-    logger.info("Built %d performance points from trade replay for %s", len(points), account_id)
+    logger.info(
+        "Built %d TWR performance points from trade replay for %s (lot_only=%s)",
+        len(points), account_id, lot_only,
+    )
     return points
 
 
@@ -636,7 +728,7 @@ def _blank_metrics(period: str) -> PortfolioMetrics:
 
 async def _metrics_from_points(
     pool: asyncpg.Pool,
-    account_id: str,
+    account_id: Optional[str],
     period: str,
     points: list[PerformancePoint],
 ) -> PortfolioMetrics:
@@ -697,146 +789,18 @@ async def _metrics_from_points(
     )
 
 
-async def _ibkr_period_metrics(pool: asyncpg.Pool, period: str) -> PortfolioMetrics:
-    """Estimate metrics from the same IBKR-live replay series the graph uses."""
-    from services.ibkr_client import ibkr_client
-
-    if not ibkr_client.is_connected:
-        return _blank_metrics(period)
-
-    start, end = _period_bounds(period)
-    loop = asyncio.get_event_loop()
-    points = await loop.run_in_executor(None, _ibkr_performance_series, start, end)
-    return await _metrics_from_points(pool, config.IBKR_ACCOUNT_ID, period, points)
-
-
-async def _replay_period_metrics(pool: asyncpg.Pool, account_id: str, period: str) -> PortfolioMetrics:
-    """
-    Non-IBKR fallback for when there's less than 2 days of snapshot history
-    (e.g. right after a fresh Fidelity upload): replay trades x historical
-    prices — the same data the performance graph uses — to compute the full
-    metric set via _metrics_from_points, instead of returning an all-blank
-    result.
-    """
-    start, end = _period_bounds(period)
-    points = await _trades_performance_series(pool, account_id, start, end)
-    return await _metrics_from_points(pool, account_id, period, points)
-
 
 async def calculate_metrics(
     pool: asyncpg.Pool,
     period: str = "ytd",
     account_id: Optional[str] = None,
 ) -> PortfolioMetrics:
+    """Metrics from the same PerformancePoint series the chart uses."""
     start, end = _period_bounds(period)
-    rows = await _fetch_snapshots(pool, start, end, account_id)
-
-    # Same reasoning as get_performance_series: a few recent snapshot rows
-    # that don't actually cover the requested window shouldn't win out over
-    # the richer trade-replay/IBKR-replay reconstruction below.
-    if len(rows) < 2 or (rows[0]["snapshot_date"] - start) > timedelta(days=3):
-        # Allow the IBKR live-estimate fallback both for the combined view
-        # (account_id=None) and when the IBKR account itself is requested —
-        # excluding the latter meant the IBKR tab always got an all-blank
-        # PortfolioMetrics whenever it asked for its own account_id explicitly.
-        if config.IBKR_ENABLED and config.IBKR_ACCOUNT_ID and (
-            not account_id or account_id == config.IBKR_ACCOUNT_ID
-        ):
-            ibkr_metrics = await _ibkr_period_metrics(pool, period)
-            if ibkr_metrics.total_return_pct is not None:
-                return ibkr_metrics
-        if account_id:
-            replay = await _replay_period_metrics(pool, account_id, period)
-            if replay.total_return_pct is not None:
-                return replay
-        # Nothing richer available — fall through and compute from whatever
-        # real snapshot rows exist rather than returning all-blank, unless
-        # there genuinely are none.
-        if not rows:
-            return PortfolioMetrics(
-                period=period,
-                beta=None,
-                std_dev_annualized=None,
-                sharpe_ratio=None,
-                total_return_pct=None,
-                spy_return_pct=None,
-                alpha=None,
-                max_drawdown_pct=None,
-                win_rate=None,
-                as_of=datetime.utcnow(),
-            )
-
-    port_daily_returns = [
-        float(r["daily_pnl_pct"]) / 100 for r in rows if r["daily_pnl_pct"] is not None
-    ]
-    spy_daily_returns = [
-        float(r["spy_daily_pct"]) / 100 for r in rows if r["spy_daily_pct"] is not None
-    ]
-
-    # Align lengths (in case some days missing spy data)
-    min_len = min(len(port_daily_returns), len(spy_daily_returns))
-    port_r = port_daily_returns[:min_len]
-    spy_r = spy_daily_returns[:min_len]
-
-    # Beta
-    beta_val = _beta(port_r, spy_r)
-
-    # Annualized std dev (assuming 252 trading days)
-    std_dev_daily = _std_dev(port_daily_returns)
-    std_dev_annual = std_dev_daily * math.sqrt(252) * 100 if std_dev_daily else None
-
-    # Total return — chain the already deposit/withdrawal-excluded daily
-    # returns rather than comparing raw end NAV to start NAV, otherwise a
-    # mid-period deposit reads as portfolio growth.
-    cum_factor = 1.0
-    cum_series = [1.0]
-    for r in port_daily_returns:
-        cum_factor *= (1 + r)
-        cum_series.append(cum_factor)
-    total_return = (cum_factor - 1) * 100 if port_daily_returns else 0.0
-    nav_series = [v * 100 for v in cum_series]  # index series for drawdown, not real dollars
-
-    # SPY total return
-    first_spy = float(rows[0]["spy_close"]) if rows[0]["spy_close"] else None
-    last_spy = float(rows[-1]["spy_close"]) if rows[-1]["spy_close"] else None
-    spy_return = (last_spy - first_spy) / first_spy * 100 if (first_spy and last_spy) else None
-
-    # Alpha = portfolio return - beta * spy return
-    alpha = None
-    if total_return is not None and beta_val is not None and spy_return is not None:
-        alpha = total_return - beta_val * spy_return
-
-    # Sharpe (annualized, risk-free = 0)
-    sharpe = None
-    if std_dev_annual and std_dev_annual != 0 and total_return is not None:
-        trading_days = len(port_daily_returns)
-        annual_factor = 252 / trading_days if trading_days else 1
-        annualized_return = total_return * annual_factor
-        sharpe = (annualized_return - RISK_FREE_RATE_ANNUAL * 100) / std_dev_annual
-
-    # Max drawdown
-    max_dd = _max_drawdown(nav_series)
-
-    # Win rate: % of profitable trades in the period
-    win_rate_val = await _calculate_win_rate(pool, start, end, account_id)
-
-    def _dec(v: Optional[float], places: int = 4) -> Optional[Decimal]:
-        if v is None:
-            return None
-        return Decimal(str(round(v, places)))
-
-    return PortfolioMetrics(
-        period=period,
-        beta=_dec(beta_val),
-        std_dev_annualized=_dec(std_dev_annual),
-        sharpe_ratio=_dec(sharpe),
-        total_return_pct=_dec(total_return),
-        spy_return_pct=_dec(spy_return),
-        alpha=_dec(alpha),
-        max_drawdown_pct=_dec(max_dd),
-        win_rate=_dec(win_rate_val),
-        as_of=datetime.utcnow(),
-    )
+    points = await get_performance_series(pool, start, end, account_id)
+    if points:
+        return await _metrics_from_points(pool, account_id, period, points)
+    return _blank_metrics(period)
 
 
 async def _calculate_win_rate(

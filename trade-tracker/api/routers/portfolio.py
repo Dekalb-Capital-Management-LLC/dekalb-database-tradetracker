@@ -49,11 +49,8 @@ def _extract_summary_amount(summary: dict, field: str) -> Optional[Decimal]:
 
 
 def _ibkr_realized_pnl(account_id: str) -> Optional[Decimal]:
-    """Realized P&L from IBKR account summary or sum of position realizedPnl."""
+    """Realized P&L from IBKR account summary (not position-level sums)."""
     if account_id != config.IBKR_ACCOUNT_ID:
-        # Don't hit IBKR's API for non-IBKR accounts (e.g. the Fidelity/PORTFOLIO
-        # account) — there's no such account on IBKR's side, so every call here
-        # was a guaranteed-failing real HTTP round trip.
         return None
 
     from services.ibkr_client import ibkr_client
@@ -66,22 +63,13 @@ def _ibkr_realized_pnl(account_id: str) -> Optional[Decimal]:
         entry = summary.get(key)
         if isinstance(entry, dict) and entry.get("amount") is not None:
             return Decimal(str(entry["amount"])).quantize(Decimal("0.01"))
-
-    total = sum(float(p.get("realizedPnl") or 0) for p in ibkr_client.get_positions(account_id))
-    return Decimal(str(total)).quantize(Decimal("0.01"))
+    return None
 
 
-async def _compute_realized_pnl_fifo(pool, account_id: str) -> Decimal:
-    """FIFO realized P&L from closed lots in the trades table."""
-    rows = await pool.fetch(
-        """
-        SELECT symbol, side, quantity, price, commission, trade_date, id
-        FROM trades
-        WHERE account_id = $1
-        ORDER BY trade_date, id
-        """,
-        account_id,
-    )
+def _fifo_process_trades(
+    rows,
+) -> tuple[dict[str, list[list[float]]], Decimal]:
+    """FIFO match all trades; return remaining open lots + total realized P&L."""
     lots: dict[str, list[list[float]]] = defaultdict(list)
     realized = Decimal(0)
 
@@ -109,13 +97,33 @@ async def _compute_realized_pnl_fifo(pool, account_id: str) -> Decimal:
                 else:
                     lots[sym][0][0] = lot_qty
 
+    return lots, realized
+
+
+async def _account_has_trades(pool, account_id: str) -> bool:
+    row = await pool.fetchrow("SELECT 1 FROM trades WHERE account_id=$1 LIMIT 1", account_id)
+    return row is not None
+
+
+async def _compute_realized_pnl_fifo(pool, account_id: str) -> Decimal:
+    """FIFO realized P&L from closed lots in the trades table."""
+    rows = await pool.fetch(
+        """
+        SELECT symbol, side, quantity, price, commission, trade_date, id
+        FROM trades
+        WHERE account_id = $1
+        ORDER BY trade_date, id
+        """,
+        account_id,
+    )
+    _, realized = _fifo_process_trades(rows)
     return realized.quantize(Decimal("0.01"))
 
 
 async def _resolve_realized_pnl(pool, account_id: str) -> Decimal:
-    """Prefer IBKR realized P&L when live; otherwise FIFO from trades."""
-    # _ibkr_realized_pnl is a blocking IBKR HTTP call (throttled with time.sleep) —
-    # run off the event loop so it doesn't stall every other concurrent request.
+    """Prefer local FIFO from trades when they exist; else IBKR account summary."""
+    if await _account_has_trades(pool, account_id):
+        return await _compute_realized_pnl_fifo(pool, account_id)
     ibkr_val = await asyncio.to_thread(_ibkr_realized_pnl, account_id)
     if ibkr_val is not None:
         return ibkr_val
@@ -207,6 +215,18 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
                 # so it doesn't stall every other concurrent request on this
                 # single-process event loop.
                 raw = await asyncio.to_thread(ibkr_client.get_positions, account_id)
+                # Overlay yfinance last prices so "Last" matches yfinance.com
+                # (IBKR mktPrice can lag or differ slightly). Keep IBKR qty/cost.
+                symbols = []
+                for p in raw:
+                    qty = p.get("position", 0)
+                    if not qty or abs(qty) < 0.00001:
+                        continue
+                    symbol = (p.get("ticker") or p.get("contractDesc") or "").upper().strip()
+                    if symbol and not market_data.is_cash_symbol(symbol):
+                        symbols.append(symbol)
+                await market_data.warm_yfinance_quote_cache(pool, symbols)
+
                 positions: list[PositionSummary] = []
                 for p in raw:
                     qty = p.get("position", 0)
@@ -222,14 +242,29 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
 
                     qty_d = Decimal(str(qty))
                     avg_d = Decimal(str(avg_cost)).quantize(Decimal("0.0001")) if avg_cost else None
-                    price_d = Decimal(str(mkt_price)).quantize(Decimal("0.0001")) if mkt_price else None
-                    mktval_d = Decimal(str(mkt_value)).quantize(Decimal("0.01")) if mkt_value else None
-                    unreal_d = Decimal(str(unreal)).quantize(Decimal("0.01")) if unreal is not None else None
 
-                    cost_basis = (qty_d * avg_d).quantize(Decimal("0.01")) if avg_d else None
-                    unreal_pct = None
-                    if unreal_d is not None and cost_basis and cost_basis != 0:
-                        unreal_pct = (unreal_d / abs(cost_basis) * 100).quantize(Decimal("0.0001"))
+                    yf_quote = await market_data.get_yfinance_quote(pool, symbol)
+                    if yf_quote and yf_quote.price > 0:
+                        price_d = yf_quote.price.quantize(Decimal("0.0001"))
+                        mktval_d = (qty_d * price_d).quantize(Decimal("0.01"))
+                        cost_basis = (qty_d * avg_d).quantize(Decimal("0.01")) if avg_d else None
+                        if cost_basis is not None:
+                            unreal_d = (mktval_d - cost_basis).quantize(Decimal("0.01"))
+                            unreal_pct = (
+                                (unreal_d / abs(cost_basis) * 100).quantize(Decimal("0.0001"))
+                                if cost_basis != 0 else None
+                            )
+                        else:
+                            unreal_d = None
+                            unreal_pct = None
+                    else:
+                        price_d = Decimal(str(mkt_price)).quantize(Decimal("0.0001")) if mkt_price else None
+                        mktval_d = Decimal(str(mkt_value)).quantize(Decimal("0.01")) if mkt_value else None
+                        unreal_d = Decimal(str(unreal)).quantize(Decimal("0.01")) if unreal is not None else None
+                        cost_basis = (qty_d * avg_d).quantize(Decimal("0.01")) if avg_d else None
+                        unreal_pct = None
+                        if unreal_d is not None and cost_basis and cost_basis != 0:
+                            unreal_pct = (unreal_d / abs(cost_basis) * 100).quantize(Decimal("0.0001"))
 
                     # pull label from trades table
                     label_row = await pool.fetchrow(
@@ -303,16 +338,27 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
     )
 
     if snap_rows:
+        symbols = [r["symbol"] for r in snap_rows]
+        await market_data.warm_yfinance_quote_cache(symbols)
         positions: list[PositionSummary] = []
         for r in snap_rows:
             qty = Decimal(str(r["quantity"])) if r["quantity"] else Decimal("0")
             if qty <= 0:
                 continue
+            stored_cost = Decimal(str(r["cost_basis_total"])).quantize(Decimal("0.01")) if r["cost_basis_total"] else None
             avg_cost = Decimal(str(r["avg_cost"])).quantize(Decimal("0.0001")) if r["avg_cost"] else None
-            current_price = Decimal(str(r["last_price"])).quantize(Decimal("0.0001")) if r["last_price"] else None
-            market_value = Decimal(str(r["current_value"])).quantize(Decimal("0.01")) if r["current_value"] else None
-            unreal = Decimal(str(r["total_gain_loss"])).quantize(Decimal("0.01")) if r["total_gain_loss"] else None
-            unreal_pct = Decimal(str(r["total_gl_pct"])).quantize(Decimal("0.0001")) if r["total_gl_pct"] else None
+            quote = await market_data.get_yfinance_quote(pool, r["symbol"])
+            if quote:
+                current_price = quote.price.quantize(Decimal("0.0001"))
+                market_value = (qty * current_price).quantize(Decimal("0.01"))
+                cost_basis = stored_cost or ((qty * avg_cost).quantize(Decimal("0.01")) if avg_cost else None)
+                unreal = (market_value - cost_basis).quantize(Decimal("0.01")) if cost_basis is not None else None
+                unreal_pct = (unreal / cost_basis * 100).quantize(Decimal("0.0001")) if unreal is not None and cost_basis and cost_basis != 0 else None
+            else:
+                current_price = Decimal(str(r["last_price"])).quantize(Decimal("0.0001")) if r["last_price"] else None
+                market_value = Decimal(str(r["current_value"])).quantize(Decimal("0.01")) if r["current_value"] else None
+                unreal = Decimal(str(r["total_gain_loss"])).quantize(Decimal("0.01")) if r["total_gain_loss"] else None
+                unreal_pct = Decimal(str(r["total_gl_pct"])).quantize(Decimal("0.0001")) if r["total_gl_pct"] else None
             positions.append(PositionSummary(
                 symbol=r["symbol"],
                 account_id=r["account_id"],
@@ -326,55 +372,74 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
             ))
         return positions
 
-    # --- Trades + IBKR price fallback ---
-    params = [account_id] if account_id else []
-    rows = await pool.fetch(
-        f"""
-        SELECT account_id, symbol,
-               SUM(CASE WHEN side='BUY' THEN quantity ELSE -quantity END) AS net_qty,
-               SUM(CASE WHEN side='BUY' THEN quantity*price ELSE 0 END) /
-                   NULLIF(SUM(CASE WHEN side='BUY' THEN quantity ELSE 0 END), 0) AS avg_cost,
-               MAX(label) AS label
+    # --- Trades + live price fallback (FIFO open lots) ---
+    trade_rows = await pool.fetch(
+        """
+        SELECT symbol, side, quantity, price, commission, trade_date, id, label
         FROM trades
-        {"WHERE account_id=$1" if account_id else ""}
-        GROUP BY account_id, symbol
-        HAVING SUM(CASE WHEN side='BUY' THEN quantity ELSE -quantity END) > 0.00001
-        ORDER BY symbol
+        WHERE account_id = $1
+        ORDER BY trade_date, id
+        """ if account_id else """
+        SELECT symbol, side, quantity, price, commission, trade_date, id, label
+        FROM trades
+        ORDER BY trade_date, id
         """,
-        *params,
+        *([account_id] if account_id else []),
     )
+    if not trade_rows:
+        return []
 
-    all_symbols = [row["symbol"] for row in rows]
-    await market_data.warm_quote_cache(pool, all_symbols)
+    # Group by account when computing combined view
+    by_account: dict[str, list] = defaultdict(list)
+    labels_by_acct_sym: dict[tuple[str, str], Optional[str]] = {}
+    for row in trade_rows:
+        acct = row["account_id"]
+        by_account[acct].append(row)
+        sym = row["symbol"].upper()
+        if row["label"]:
+            labels_by_acct_sym[(acct, sym)] = row["label"]
+
+    all_symbols: list[str] = []
+    open_by_acct: dict[str, dict[str, list[list[float]]]] = {}
+    for acct, rows in by_account.items():
+        lots, _ = _fifo_process_trades(rows)
+        open_by_acct[acct] = lots
+        all_symbols.extend(sym for sym, lot_list in lots.items() if sum(l[0] for l in lot_list) > 0.00001)
+
+    await market_data.warm_quote_cache(pool, list(set(all_symbols)))
 
     positions: list[PositionSummary] = []
-    for row in rows:
-        qty = Decimal(str(row["net_qty"]))
-        avg_cost = Decimal(str(row["avg_cost"])) if row["avg_cost"] else None
+    for acct, lots in open_by_acct.items():
+        for sym, lot_list in lots.items():
+            qty_f = sum(lot[0] for lot in lot_list)
+            if qty_f <= 0.00001:
+                continue
+            qty = Decimal(str(round(qty_f, 6)))
+            cost_basis_f = sum(lot[0] * lot[1] for lot in lot_list)
+            avg_cost = Decimal(str(round(cost_basis_f / qty_f, 4))) if qty_f else None
 
-        quote = await market_data.get_quote(pool, row["symbol"])
-        current_price = quote.price if quote else None
+            quote = await market_data.get_quote(pool, sym)
+            current_price = quote.price if quote else None
+            market_value = (qty * current_price).quantize(Decimal("0.01")) if current_price else None
+            cost_basis = Decimal(str(round(cost_basis_f, 2)))
 
-        market_value = (qty * current_price).quantize(Decimal("0.01")) if current_price else None
-        cost_basis = (qty * avg_cost).quantize(Decimal("0.01")) if avg_cost else None
+            unrealized_pnl = None
+            unrealized_pnl_pct = None
+            if market_value is not None and cost_basis != 0:
+                unrealized_pnl = (market_value - cost_basis).quantize(Decimal("0.01"))
+                unrealized_pnl_pct = (unrealized_pnl / cost_basis * 100).quantize(Decimal("0.0001"))
 
-        unrealized_pnl = None
-        unrealized_pnl_pct = None
-        if market_value is not None and cost_basis is not None and cost_basis != 0:
-            unrealized_pnl = (market_value - cost_basis).quantize(Decimal("0.01"))
-            unrealized_pnl_pct = (unrealized_pnl / cost_basis * 100).quantize(Decimal("0.0001"))
-
-        positions.append(PositionSummary(
-            symbol=row["symbol"],
-            account_id=row["account_id"],
-            quantity=qty,
-            avg_cost=avg_cost,
-            current_price=current_price,
-            market_value=market_value,
-            unrealized_pnl=unrealized_pnl,
-            unrealized_pnl_pct=unrealized_pnl_pct,
-            label=row["label"],
-        ))
+            positions.append(PositionSummary(
+                symbol=sym,
+                account_id=acct,
+                quantity=qty,
+                avg_cost=avg_cost,
+                current_price=current_price,
+                market_value=market_value,
+                unrealized_pnl=unrealized_pnl,
+                unrealized_pnl_pct=unrealized_pnl_pct,
+                label=labels_by_acct_sym.get((acct, sym)),
+            ))
     return positions
 
 
@@ -399,8 +464,14 @@ async def _account_summary(pool, account_id: str) -> AccountSummary:
                 positions = await _compute_positions(pool, account_id)
                 cash_balance  = _f("cashbalance")
                 total_nav     = _f("netliquidationvalue")
-                equity_value  = _f("stockmarketvalue") or sum(
-                    (p.market_value or Decimal(0)) for p in positions
+                # stockmarketvalue is equities-only; Portfolio Value should use NAV
+                # (stocks + cash). Fall back to positions sum (which includes the
+                # synthetic cash row) when ledger NAV is missing.
+                stock_value = _f("stockmarketvalue")
+                positions_sum = sum((p.market_value or Decimal(0)) for p in positions)
+                equity_value = total_nav or (
+                    (stock_value + (cash_balance or Decimal(0))) if stock_value is not None
+                    else positions_sum
                 )
                 unrealized    = _f("unrealizedpnl") or sum(
                     (p.unrealized_pnl or Decimal(0)) for p in positions
@@ -661,9 +732,9 @@ async def update_all(pool=Depends(get_pool)):
     # daily bar rather than the live price.
     MIN_SANE_PRICE = 0.05  # reject obviously-bad quotes (halted/unresolved tickers) instead of trusting any price > 0
     if market_syms:
-        await market_data.warm_quote_cache(pool, market_syms)
+        await market_data.warm_yfinance_quote_cache(pool, market_syms)
         for sym in market_syms:
-            quote = await market_data.get_quote(pool, sym)
+            quote = await market_data.get_yfinance_quote(pool, sym)
             if quote is None:
                 price_errors.append(f"{sym}: no quote available")
                 continue

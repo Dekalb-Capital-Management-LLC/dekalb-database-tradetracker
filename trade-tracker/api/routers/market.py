@@ -9,6 +9,7 @@ Endpoints:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date, timedelta
 
@@ -75,7 +76,7 @@ async def get_history(
     if start > end:
         raise HTTPException(status_code=400, detail="start must be before end")
 
-    bars = await market_data.get_historical_bars(pool, symbol.upper(), start, end)
+    bars = await asyncio.to_thread(market_data.get_historical_bars, symbol.upper(), start, end)
     if not bars:
         raise HTTPException(
             status_code=503,
@@ -93,7 +94,7 @@ async def get_spy(
     today = date.today()
     start = start or (today - timedelta(days=365))
     end = end or today
-    bars = await market_data.get_spy_history(pool, start, end)
+    bars = await asyncio.to_thread(market_data.get_spy_history, start, end)
     if not bars:
         raise HTTPException(status_code=503, detail="No SPY data available")
     return bars

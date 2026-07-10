@@ -37,6 +37,8 @@ export default function PerformanceChart({ data }: Props) {
     SPY: p.spy_cumulative_pct != null ? +Number(p.spy_cumulative_pct).toFixed(3) : null,
   }))
 
+  // Dual Y-axes so SPY (~±10%) isn't flattened to the zero line when the
+  // portfolio axis spans hundreds of percent.
   return (
     <ResponsiveContainer width="100%" height={260}>
       <LineChart data={chartData} margin={{ top: 5, right: 20, left: 5, bottom: 5 }}>
@@ -51,13 +53,23 @@ export default function PerformanceChart({ data }: Props) {
           minTickGap={60}
         />
         <YAxis
+          yAxisId="portfolio"
           tickFormatter={(v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`}
-          tick={{ fill: '#9ca3af', fontSize: 11 }}
+          tick={{ fill: '#2563eb', fontSize: 11 }}
           tickLine={false}
           axisLine={false}
           width={58}
         />
-        <ReferenceLine y={0} stroke="#d0dce8" strokeDasharray="4 2" />
+        <YAxis
+          yAxisId="spy"
+          orientation="right"
+          tickFormatter={(v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`}
+          tick={{ fill: '#f97316', fontSize: 11 }}
+          tickLine={false}
+          axisLine={false}
+          width={50}
+        />
+        <ReferenceLine yAxisId="portfolio" y={0} stroke="#d0dce8" strokeDasharray="4 2" />
         <Tooltip
           contentStyle={{
             backgroundColor: '#ffffff',
@@ -75,6 +87,7 @@ export default function PerformanceChart({ data }: Props) {
         />
         <Legend wrapperStyle={{ fontSize: 12, color: '#6b7a99', paddingTop: 12 }} />
         <Line
+          yAxisId="portfolio"
           type="monotone"
           dataKey="Portfolio"
           stroke="#2563eb"
@@ -83,6 +96,7 @@ export default function PerformanceChart({ data }: Props) {
           connectNulls
         />
         <Line
+          yAxisId="spy"
           type="monotone"
           dataKey="SPY"
           stroke="#f97316"
