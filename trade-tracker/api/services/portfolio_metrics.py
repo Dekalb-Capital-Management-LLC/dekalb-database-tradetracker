@@ -19,10 +19,16 @@ from decimal import Decimal
 from typing import Optional
 
 import asyncpg
+import numpy as np
 
 import config
 from models.schemas import PerformancePoint, PortfolioMetrics
-from services.market_data import get_historical_bars, get_historical_bars_batch, get_spy_history
+from services.market_data import (
+    get_historical_bars,
+    get_historical_bars_batch,
+    get_spy_history,
+    is_cash_symbol,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +67,25 @@ def _beta(portfolio_returns: list[float], benchmark_returns: list[float]) -> Opt
         return None
     cov = _covariance(portfolio_returns, benchmark_returns)
     return cov / var_bm
+
+
+def _regression_slope(x: list[float], y: list[float]) -> Optional[float]:
+    """
+    Least-squares linear-regression slope of y on x (beta = slope), via numpy.
+    Beta is the slope of portfolio returns (y) regressed on market returns (x):
+    how much the portfolio moves for a 1-unit move in the market. This is the
+    same quantity as Cov(y,x)/Var(x), computed with a vetted library instead of
+    by hand. Returns None when the market series is flat (slope undefined) or
+    there aren't enough aligned points.
+    """
+    if len(x) != len(y) or len(x) < 2:
+        return None
+    xa = np.asarray(x, dtype=float)
+    ya = np.asarray(y, dtype=float)
+    if np.std(xa) == 0:  # market didn't move over the window → slope undefined
+        return None
+    slope, _intercept = np.polyfit(xa, ya, 1)
+    return float(slope)
 
 
 def _max_drawdown(nav_series: list[float]) -> float:
@@ -726,6 +751,99 @@ def _blank_metrics(period: str) -> PortfolioMetrics:
     )
 
 
+async def _current_holdings(pool: asyncpg.Pool, account_id: Optional[str]) -> dict[str, float]:
+    """
+    Current net share count per (non-cash) symbol for an account, or aggregated
+    across all accounts when account_id is None. Netted from the trade ledger
+    (BUY - SELL); a fully-closed position nets to ~0 and is dropped. Cash /
+    money-market symbols are excluded — they have no market beta.
+    """
+    if account_id:
+        rows = await pool.fetch(
+            """
+            SELECT symbol, SUM(CASE WHEN side='BUY' THEN quantity ELSE -quantity END) AS qty
+            FROM trades WHERE account_id = $1 GROUP BY symbol
+            """,
+            account_id,
+        )
+    else:
+        rows = await pool.fetch(
+            """
+            SELECT symbol, SUM(CASE WHEN side='BUY' THEN quantity ELSE -quantity END) AS qty
+            FROM trades GROUP BY symbol
+            """
+        )
+    holdings: dict[str, float] = {}
+    for r in rows:
+        sym = r["symbol"].upper()
+        qty = float(r["qty"] or 0)
+        if qty > 0.00001 and not is_cash_symbol(sym):
+            holdings[sym] = qty
+    return holdings
+
+
+async def _calculate_portfolio_beta(
+    pool: asyncpg.Pool,
+    account_id: Optional[str],
+    start: date,
+    end: date,
+) -> Optional[float]:
+    """
+    Method A portfolio beta: value the *current* holdings across the window to
+    build one portfolio daily-return series, then regress it on SPY's daily
+    returns. The regression slope is the portfolio's beta vs the market.
+
+    Holdings are held constant at today's composition (trailing beta of the
+    current portfolio), so this is independent of the trade-replay NAV series.
+    Prices come from yfinance (no API key). Returns None if we can't build at
+    least a few aligned days.
+    """
+    holdings = await _current_holdings(pool, account_id)
+    if not holdings:
+        return None
+
+    symbols = sorted(holdings)
+    loop = asyncio.get_event_loop()
+    spy_bars = await loop.run_in_executor(None, get_spy_history, start, end)
+    if not spy_bars or len(spy_bars) < 3:
+        return None
+    batch = await loop.run_in_executor(None, get_historical_bars_batch, symbols, start, end)
+    closes: dict[str, dict[date, float]] = {
+        sym: {b.date: float(b.close) for b in batch.get(sym, [])} for sym in symbols
+    }
+
+    # Portfolio value on each SPY trading day, paired with the SPY close so the
+    # two series stay aligned. Forward-fill each holding's last known close.
+    port_vals: list[float] = []
+    spy_vals: list[float] = []
+    last_px: dict[str, float] = {}
+    for bar in spy_bars:
+        d = bar.date
+        val = 0.0
+        priced_any = False
+        for sym, qty in holdings.items():
+            px = closes.get(sym, {}).get(d)
+            if px is not None:
+                last_px[sym] = px
+            else:
+                px = last_px.get(sym)
+            if px is None:
+                continue
+            priced_any = True
+            val += qty * px
+        if not priced_any or val <= 0:
+            continue
+        port_vals.append(val)
+        spy_vals.append(float(bar.close))
+
+    if len(port_vals) < 3:
+        return None
+
+    port_ret = [port_vals[i] / port_vals[i - 1] - 1 for i in range(1, len(port_vals))]
+    spy_ret = [spy_vals[i] / spy_vals[i - 1] - 1 for i in range(1, len(spy_vals))]
+    return _regression_slope(spy_ret, port_ret)
+
+
 async def _metrics_from_points(
     pool: asyncpg.Pool,
     account_id: Optional[str],
@@ -749,7 +867,12 @@ async def _metrics_from_points(
     nav_series = [float(p.portfolio_nav) for p in points]
 
     min_len = min(len(port_daily), len(spy_daily))
-    beta_val = _beta(port_daily[:min_len], spy_daily[:min_len])
+    # Real portfolio beta (Method A): regression slope of the current holdings'
+    # daily returns vs SPY, over the same window. Falls back to the return-series
+    # covariance beta only when holdings/prices aren't available.
+    beta_val = await _calculate_portfolio_beta(pool, account_id, start, end)
+    if beta_val is None:
+        beta_val = _beta(port_daily[:min_len], spy_daily[:min_len])
 
     std_dev_daily = _std_dev(port_daily)
     std_dev_annual = std_dev_daily * math.sqrt(252) * 100 if std_dev_daily else None

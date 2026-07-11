@@ -6,6 +6,9 @@ python-multipart==0.0.9
 # Database
 asyncpg==0.31.0
 
+# Numerics (portfolio beta regression slope; also a pandas dependency)
+numpy>=1.26
+
 # Spreadsheet parsing (CSV, XLSX, XLSM, XLS)
 pandas==3.0.1
 openpyxl==3.1.5
