@@ -979,6 +979,54 @@ class IBKRClient:
 
         return out
 
+    def get_pa_performance(self, account_id: str, period: str) -> Optional[dict]:
+        """
+        Portfolio Analyst time-weighted return + NAV series.
+
+        period: IBKR codes like YTD, 1Y, 1M, MTD (6M/3M often empty).
+        Returns {dates: [date], cumulative_returns: [float], navs: [float]|None,
+                 start_nav: float|None} or None.
+        """
+        data = self._post(
+            "/v1/api/pa/performance",
+            json={"acctIds": [account_id], "period": period},
+        )
+        if not data or not isinstance(data, dict):
+            return None
+        cps = data.get("cps") or {}
+        rows = cps.get("data") or []
+        raw_dates = cps.get("dates") or []
+        if not rows or not raw_dates:
+            return None
+        acct = next((r for r in rows if r.get("id") == account_id), rows[0])
+        returns = acct.get("returns") or []
+        if len(returns) != len(raw_dates):
+            return None
+
+        def _d(s: str) -> date:
+            return date(int(s[0:4]), int(s[4:6]), int(s[6:8]))
+
+        dates = [_d(s) for s in raw_dates]
+        navs = None
+        start_nav = None
+        nav_block = data.get("nav") or {}
+        nav_rows = nav_block.get("data") or []
+        nav_acct = next((r for r in nav_rows if r.get("id") == account_id), nav_rows[0] if nav_rows else None)
+        if nav_acct:
+            sn = nav_acct.get("startNAV") or {}
+            if sn.get("val") is not None:
+                start_nav = float(sn["val"])
+            raw_navs = nav_acct.get("navs") or []
+            if len(raw_navs) == len(dates):
+                navs = [float(v) for v in raw_navs]
+
+        return {
+            "dates": dates,
+            "cumulative_returns": [float(r) for r in returns],
+            "navs": navs,
+            "start_nav": start_nav,
+        }
+
     def get_ledger(self, account_id: str) -> Optional[dict]:
         """Per-currency balances from /portfolio/{id}/ledger."""
         return self._get(f"/v1/api/portfolio/{account_id}/ledger")

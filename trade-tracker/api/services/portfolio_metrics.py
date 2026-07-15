@@ -333,14 +333,47 @@ async def _has_trades(pool: asyncpg.Pool, account_id: str) -> bool:
     return row is not None
 
 
+# Always pull YTD or 1Y from PA, then window with prior-close baseline.
+# Native 1M/6M/3M codes use IBKR's rolling windows and don't match calendar
+# period pickers (and 6M/3M often 400).
+_IBKR_PA_SOURCE = {
+    "ytd": "YTD",
+    "1y": "1Y",
+    "1m": "1Y",
+    "6m": "1Y",
+    "3m": "1Y",
+}
+
+
+def _is_ibkr_account(account_id: Optional[str]) -> bool:
+    ibkr = (config.IBKR_ACCOUNT_ID or "").strip()
+    return bool(account_id and ibkr and account_id == ibkr)
+
+
 async def get_performance_series(
     pool: asyncpg.Pool,
     start: date,
     end: date,
     account_id: Optional[str] = None,
+    period: Optional[str] = None,
 ) -> list[PerformancePoint]:
-    # Trade replay is the source of truth when synced trades exist — snapshots
-    # may be sparse/today-only and IBKR holdings replay ignores buys/sells.
+    # IBKR only: Portfolio Analyst TWR (real deposits/withdrawals). Never run
+    # PA for Fidelity/other accounts — they use trade-replay TWR below with the
+    # same prior-close windowing.
+    if (
+        _is_ibkr_account(account_id)
+        and config.IBKR_ENABLED
+        and period
+    ):
+        loop = asyncio.get_event_loop()
+        pa_pts = await loop.run_in_executor(
+            None, _ibkr_pa_performance_series, account_id, period.lower(), start, end
+        )
+        if pa_pts:
+            return pa_pts
+
+    # Fidelity (and IBKR fallback): trade replay TWR + cash_flows / implicit
+    # deposits, prior-close baseline matching PA period windows.
     if account_id and await _has_trades(pool, account_id):
         trade_pts = await _trades_performance_series(pool, account_id, start, end)
         if trade_pts:
@@ -430,9 +463,11 @@ async def _trades_performance_series(
     """
     Replay synced trades → daily holdings, mark-to-market, time-weighted return.
 
+    Used for Fidelity (primary) and as IBKR fallback when PA is unavailable.
     External cash (recorded cash_flows + implicit funding when a BUY would
     otherwise drive cash negative) is excluded from daily return so deposits
-    don't look like investment gains.
+    don't look like investment gains. Period windows use a prior-close
+    baseline — same convention as IBKR PA period pickers.
     """
     rows = await pool.fetch(
         """
@@ -528,21 +563,30 @@ async def _trades_performance_series(
         if port_val <= 0:
             continue
 
-        # Only publish points inside the requested window; still update state
-        # before `start` so the period opens with correct holdings/cash.
+        # Warm holdings/cash/prev before the window; do not publish yet.
         if d < start:
             prev_port = port_val
             prev_spy = float(bar.close)
             continue
 
         if spy_base is None:
+            # Prior-close baseline (same as IBKR PA period windows): first
+            # session in [start, end] earns return vs the last NAV before
+            # `start`, not a forced 0% open that drops that day's move.
             spy_base = float(bar.close)
-            # First published day: return starts at 0; don't treat opening NAV
-            # as a gain. Reset TWR chain here.
-            cum_factor = 1.0
-            daily_pct = None
-            spy_daily_pct = None
-            port_cum = 0.0
+            if prev_port and prev_port > 0:
+                daily_pct = (port_val - prev_port - flow_today) / prev_port * 100
+                daily_pct = max(-50.0, min(50.0, daily_pct))
+                cum_factor = 1 + daily_pct / 100
+                port_cum = (cum_factor - 1) * 100
+                spy_daily_pct = (
+                    (float(bar.close) - prev_spy) / prev_spy * 100 if prev_spy else None
+                )
+            else:
+                cum_factor = 1.0
+                daily_pct = None
+                port_cum = 0.0
+                spy_daily_pct = None
             spy_cum = 0.0
         else:
             # TWR: r_t = (V_t - V_{t-1} - flow_t) / V_{t-1}
@@ -697,21 +741,149 @@ def _ibkr_performance_series(start: date, end: date) -> list[PerformancePoint]:
     return points
 
 
+def _pa_window_indices(
+    dates: list[date],
+    start_label: date,
+    end: date,
+) -> Optional[tuple[int, int]]:
+    """
+    (first_idx, end_idx) for a period window.
+
+    TWR uses prior-close baseline: return from close of dates[first-1]
+    (or 0 if first==0) through close of dates[end_idx]. That matches
+    broker period pickers (6/10–7/10 baselines off 6/09 close).
+    """
+    if not dates:
+        return None
+    end_idxs = [i for i, d in enumerate(dates) if d <= end]
+    if not end_idxs:
+        return None
+    end_idx = end_idxs[-1]
+    first = next((i for i, d in enumerate(dates) if d >= start_label and i <= end_idx), None)
+    if first is None:
+        return None
+    return first, end_idx
+
+
+def _ibkr_pa_fetch(account_id: str, period: str) -> Optional[dict]:
+    """Fetch a PA series long enough to window the requested period."""
+    from services.ibkr_client import ibkr_client
+
+    if not ibkr_client.is_connected:
+        return None
+    code = _IBKR_PA_SOURCE.get(period, "1Y")
+    return ibkr_client.get_pa_performance(account_id, code)
+
+
+def _ibkr_pa_performance_series(
+    account_id: str,
+    period: str,
+    start: date,
+    end: date,
+) -> list[PerformancePoint]:
+    """
+    Build chart/metrics points from IBKR Portfolio Analyst TWR + NAV.
+
+    Windows the PA series to [start, end] with a prior-close baseline so
+    calendar 1M/3M/6M/YTD match the broker period-picker numbers.
+    """
+    raw = _ibkr_pa_fetch(account_id, period)
+    if not raw:
+        return []
+
+    dates: list[date] = raw["dates"]
+    cum: list[float] = raw["cumulative_returns"]
+    navs: Optional[list[float]] = raw.get("navs")
+    if not dates or len(dates) != len(cum):
+        return []
+
+    as_of = min(end, dates[-1])
+    win = _pa_window_indices(dates, start, as_of)
+    if win is None:
+        return []
+    first, end_idx = win
+    base_c = 0.0 if first == 0 else cum[first - 1]
+    if base_c <= -1:
+        return []
+
+    def _rebased(i: int) -> float:
+        return (1 + cum[i]) / (1 + base_c) - 1
+
+    spy_bars = get_spy_history(dates[first], dates[end_idx])
+    spy_by_d = {b.date: float(b.close) for b in spy_bars}
+    spy_ff: dict[date, float] = {}
+    last_px: Optional[float] = None
+    for d in dates[first : end_idx + 1]:
+        if d in spy_by_d:
+            last_px = spy_by_d[d]
+        if last_px is not None:
+            spy_ff[d] = last_px
+
+    spy_base = next((spy_ff[d] for d in dates[first : end_idx + 1] if d in spy_ff), None)
+    prev_spy: Optional[float] = None
+    points: list[PerformancePoint] = []
+
+    for i in range(first, end_idx + 1):
+        d = dates[i]
+        port_cum = _rebased(i) * 100
+        if i == first:
+            daily_pct = None if first == 0 else port_cum
+        else:
+            prev_r, cur_r = _rebased(i - 1), _rebased(i)
+            daily_pct = ((1 + cur_r) / (1 + prev_r) - 1) * 100 if prev_r > -1 else None
+
+        spy_px = spy_ff.get(d)
+        spy_daily = None
+        spy_cum_pct = None
+        if spy_px is not None and spy_base:
+            if prev_spy:
+                spy_daily = (spy_px - prev_spy) / prev_spy * 100
+            spy_cum_pct = (spy_px - spy_base) / spy_base * 100
+            prev_spy = spy_px
+
+        nav = navs[i] if navs else None
+        points.append(
+            PerformancePoint(
+                date=d,
+                portfolio_nav=Decimal(str(round(nav, 2))) if nav is not None else Decimal("0"),
+                portfolio_pct_change=(
+                    Decimal(str(round(daily_pct, 6))) if daily_pct is not None else None
+                ),
+                spy_pct_change=(
+                    Decimal(str(round(spy_daily, 6))) if spy_daily is not None else None
+                ),
+                spy_cumulative_pct=(
+                    Decimal(str(round(spy_cum_pct, 4))) if spy_cum_pct is not None else None
+                ),
+                portfolio_cumulative_pct=Decimal(str(round(port_cum, 4))),
+            )
+        )
+
+    logger.info(
+        "Built %d points from IBKR PA (%s) for %s — last TWR=%.2f%% (%s→%s)",
+        len(points), period, account_id,
+        float(points[-1].portfolio_cumulative_pct or 0),
+        points[0].date, points[-1].date,
+    )
+    return points
+
+
 # ---------------------------------------------------------------------------
 # Metrics calculation
 # ---------------------------------------------------------------------------
 
 def _period_bounds(period: str) -> tuple[date, date]:
     today = date.today()
-    if period == "ytd":
+    p = (period or "ytd").lower()
+    if p == "ytd":
         start = date(today.year, 1, 1)
-    elif period == "1y":
+    elif p == "1y":
         start = today - timedelta(days=365)
-    elif period == "6m":
+    elif p == "6m":
         start = today - timedelta(days=182)
-    elif period == "3m":
+    elif p == "3m":
         start = today - timedelta(days=91)
-    elif period == "1m":
+    elif p == "1m":
         start = today - timedelta(days=30)
     else:
         start = date(today.year, 1, 1)  # default ytd
@@ -797,7 +969,7 @@ async def calculate_metrics(
 ) -> PortfolioMetrics:
     """Metrics from the same PerformancePoint series the chart uses."""
     start, end = _period_bounds(period)
-    points = await get_performance_series(pool, start, end, account_id)
+    points = await get_performance_series(pool, start, end, account_id, period=period)
     if points:
         return await _metrics_from_points(pool, account_id, period, points)
     return _blank_metrics(period)

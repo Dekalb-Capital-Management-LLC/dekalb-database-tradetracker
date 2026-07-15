@@ -69,10 +69,62 @@ def test_weights_sum_to_100():
     assert max(weights) < 60.0  # no single name >60% in this toy book
 
 
+def test_pa_rebase_subwindow():
+    # IBKR-style cumulative from period start; rebase to a later window.
+    cum = [0.0, 0.02, 0.05, -0.01, 0.049]
+    base = cum[2]  # start window at index 2
+    rebased = [(1 + c) / (1 + base) - 1 for c in cum[2:]]
+    assert abs(rebased[0] - 0.0) < 1e-12
+    assert abs(rebased[-1] - ((1.049 / 1.05) - 1)) < 1e-12
+
+
+def test_prior_close_baseline():
+    """Period 6/10–7/10 baselines off 6/09 close, not 6/10."""
+    from datetime import date as D
+    dates = [D(2026, 6, 8), D(2026, 6, 9), D(2026, 6, 10), D(2026, 7, 10)]
+    # fake cum from a fixed origin
+    cum = [0.0, 0.01, 0.02, 0.047266]  # engineered so prior-close ≈ 2.66%
+    # r from 6/09 close → 7/10: (1.047266/1.01)-1 = 3.6897% — just test the idx logic
+    first = next(i for i, d in enumerate(dates) if d >= D(2026, 6, 10))
+    assert first == 2
+    base_c = cum[first - 1]
+    end_c = cum[-1]
+    r = (1 + end_c) / (1 + base_c) - 1
+    # vs wrong baseline (start-day close):
+    wrong = (1 + end_c) / (1 + cum[first]) - 1
+    assert r > wrong
+    assert first - 1 == 1  # 6/09
+
+
+def test_fidelity_trade_replay_prior_close_and_deposit():
+    """
+    Fidelity path: same TWR math as IBKR PA windows —
+    prior-close open + deposit excluded from return.
+    Day before window: NAV=1000
+    Day1 (window start): deposit +500, price flat → NAV=1500, return=0
+    Day2: NAV=1650, no flow → return=+10%, cum=+10%
+    """
+    prev = 1000.0
+    # day1
+    nav1, flow1 = 1500.0, 500.0
+    r1 = (nav1 - prev - flow1) / prev
+    cum = 1 + r1
+    assert abs(r1) < 1e-12, r1
+    # day2
+    nav2, flow2 = 1650.0, 0.0
+    r2 = (nav2 - nav1 - flow2) / nav1
+    cum *= 1 + r2
+    assert abs(r2 - 0.10) < 1e-12, r2
+    assert abs(cum - 1.10) < 1e-12, cum
+
+
 if __name__ == "__main__":
     test_implicit_deposit_on_unfunded_buy()
     test_funded_buy_no_flow()
     test_partial_cash_funds_shortfall_only()
     test_twr_excludes_deposit()
     test_weights_sum_to_100()
+    test_pa_rebase_subwindow()
+    test_prior_close_baseline()
+    test_fidelity_trade_replay_prior_close_and_deposit()
     print("ok: TWR / weight self-checks passed")
