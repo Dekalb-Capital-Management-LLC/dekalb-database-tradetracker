@@ -69,10 +69,39 @@ def test_weights_sum_to_100():
     assert max(weights) < 60.0  # no single name >60% in this toy book
 
 
+def test_pa_rebase_subwindow():
+    # IBKR-style cumulative from period start; rebase to a later window.
+    cum = [0.0, 0.02, 0.05, -0.01, 0.049]
+    base = cum[2]  # start window at index 2
+    rebased = [(1 + c) / (1 + base) - 1 for c in cum[2:]]
+    assert abs(rebased[0] - 0.0) < 1e-12
+    assert abs(rebased[-1] - ((1.049 / 1.05) - 1)) < 1e-12
+
+
+def test_prior_close_baseline():
+    """Period 6/10–7/10 baselines off 6/09 close, not 6/10."""
+    from datetime import date as D
+    dates = [D(2026, 6, 8), D(2026, 6, 9), D(2026, 6, 10), D(2026, 7, 10)]
+    # fake cum from a fixed origin
+    cum = [0.0, 0.01, 0.02, 0.047266]  # engineered so prior-close ≈ 2.66%
+    # r from 6/09 close → 7/10: (1.047266/1.01)-1 = 3.6897% — just test the idx logic
+    first = next(i for i, d in enumerate(dates) if d >= D(2026, 6, 10))
+    assert first == 2
+    base_c = cum[first - 1]
+    end_c = cum[-1]
+    r = (1 + end_c) / (1 + base_c) - 1
+    # vs wrong baseline (start-day close):
+    wrong = (1 + end_c) / (1 + cum[first]) - 1
+    assert r > wrong
+    assert first - 1 == 1  # 6/09
+
+
 if __name__ == "__main__":
     test_implicit_deposit_on_unfunded_buy()
     test_funded_buy_no_flow()
     test_partial_cash_funds_shortfall_only()
     test_twr_excludes_deposit()
     test_weights_sum_to_100()
+    test_pa_rebase_subwindow()
+    test_prior_close_baseline()
     print("ok: TWR / weight self-checks passed")

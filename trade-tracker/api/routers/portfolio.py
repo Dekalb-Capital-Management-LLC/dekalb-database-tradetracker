@@ -800,7 +800,7 @@ async def get_performance(
     from services.portfolio_metrics import _period_bounds, get_performance_series
     start, end = _period_bounds(period)
     try:
-        return await get_performance_series(pool, start, end, account_id)
+        return await get_performance_series(pool, start, end, account_id, period=period)
     except Exception as exc:
         logger.error("performance series error: %s", exc)
         raise HTTPException(status_code=500, detail="Error computing performance series")
