@@ -345,6 +345,11 @@ _IBKR_PA_SOURCE = {
 }
 
 
+def _is_ibkr_account(account_id: Optional[str]) -> bool:
+    ibkr = (config.IBKR_ACCOUNT_ID or "").strip()
+    return bool(account_id and ibkr and account_id == ibkr)
+
+
 async def get_performance_series(
     pool: asyncpg.Pool,
     start: date,
@@ -352,11 +357,11 @@ async def get_performance_series(
     account_id: Optional[str] = None,
     period: Optional[str] = None,
 ) -> list[PerformancePoint]:
-    # IBKR PA is ground truth for TWR when connected: it has real deposits/
-    # withdrawals. Trade replay invents buy-day funding and overstates YTD
-    # (~10% vs IBKR ~5% on U16303670).
+    # IBKR only: Portfolio Analyst TWR (real deposits/withdrawals). Never run
+    # PA for Fidelity/other accounts — they use trade-replay TWR below with the
+    # same prior-close windowing.
     if (
-        account_id
+        _is_ibkr_account(account_id)
         and config.IBKR_ENABLED
         and period
     ):
@@ -367,7 +372,8 @@ async def get_performance_series(
         if pa_pts:
             return pa_pts
 
-    # Trade replay when synced trades exist — snapshots may be sparse.
+    # Fidelity (and IBKR fallback): trade replay TWR + cash_flows / implicit
+    # deposits, prior-close baseline matching PA period windows.
     if account_id and await _has_trades(pool, account_id):
         trade_pts = await _trades_performance_series(pool, account_id, start, end)
         if trade_pts:
@@ -457,9 +463,11 @@ async def _trades_performance_series(
     """
     Replay synced trades → daily holdings, mark-to-market, time-weighted return.
 
+    Used for Fidelity (primary) and as IBKR fallback when PA is unavailable.
     External cash (recorded cash_flows + implicit funding when a BUY would
     otherwise drive cash negative) is excluded from daily return so deposits
-    don't look like investment gains.
+    don't look like investment gains. Period windows use a prior-close
+    baseline — same convention as IBKR PA period pickers.
     """
     rows = await pool.fetch(
         """
@@ -555,21 +563,30 @@ async def _trades_performance_series(
         if port_val <= 0:
             continue
 
-        # Only publish points inside the requested window; still update state
-        # before `start` so the period opens with correct holdings/cash.
+        # Warm holdings/cash/prev before the window; do not publish yet.
         if d < start:
             prev_port = port_val
             prev_spy = float(bar.close)
             continue
 
         if spy_base is None:
+            # Prior-close baseline (same as IBKR PA period windows): first
+            # session in [start, end] earns return vs the last NAV before
+            # `start`, not a forced 0% open that drops that day's move.
             spy_base = float(bar.close)
-            # First published day: return starts at 0; don't treat opening NAV
-            # as a gain. Reset TWR chain here.
-            cum_factor = 1.0
-            daily_pct = None
-            spy_daily_pct = None
-            port_cum = 0.0
+            if prev_port and prev_port > 0:
+                daily_pct = (port_val - prev_port - flow_today) / prev_port * 100
+                daily_pct = max(-50.0, min(50.0, daily_pct))
+                cum_factor = 1 + daily_pct / 100
+                port_cum = (cum_factor - 1) * 100
+                spy_daily_pct = (
+                    (float(bar.close) - prev_spy) / prev_spy * 100 if prev_spy else None
+                )
+            else:
+                cum_factor = 1.0
+                daily_pct = None
+                port_cum = 0.0
+                spy_daily_pct = None
             spy_cum = 0.0
         else:
             # TWR: r_t = (V_t - V_{t-1} - flow_t) / V_{t-1}

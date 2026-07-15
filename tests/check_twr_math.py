@@ -96,6 +96,28 @@ def test_prior_close_baseline():
     assert first - 1 == 1  # 6/09
 
 
+def test_fidelity_trade_replay_prior_close_and_deposit():
+    """
+    Fidelity path: same TWR math as IBKR PA windows —
+    prior-close open + deposit excluded from return.
+    Day before window: NAV=1000
+    Day1 (window start): deposit +500, price flat → NAV=1500, return=0
+    Day2: NAV=1650, no flow → return=+10%, cum=+10%
+    """
+    prev = 1000.0
+    # day1
+    nav1, flow1 = 1500.0, 500.0
+    r1 = (nav1 - prev - flow1) / prev
+    cum = 1 + r1
+    assert abs(r1) < 1e-12, r1
+    # day2
+    nav2, flow2 = 1650.0, 0.0
+    r2 = (nav2 - nav1 - flow2) / nav1
+    cum *= 1 + r2
+    assert abs(r2 - 0.10) < 1e-12, r2
+    assert abs(cum - 1.10) < 1e-12, cum
+
+
 if __name__ == "__main__":
     test_implicit_deposit_on_unfunded_buy()
     test_funded_buy_no_flow()
@@ -104,4 +126,5 @@ if __name__ == "__main__":
     test_weights_sum_to_100()
     test_pa_rebase_subwindow()
     test_prior_close_baseline()
+    test_fidelity_trade_replay_prior_close_and_deposit()
     print("ok: TWR / weight self-checks passed")
