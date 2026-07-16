@@ -3,7 +3,7 @@ Portfolio metrics calculations.
 
 Provides:
 - NAV-based return series from portfolio_snapshots
-- Beta (portfolio vs SPY) for rolling 12-month and YTD periods
+- Beta (portfolio vs configured benchmark) for supported periods
 - Annualized standard deviation
 - Sharpe ratio (risk-free rate = 0 for simplicity; can be updated)
 - Alpha, max drawdown, win rate
@@ -60,11 +60,13 @@ def _beta(portfolio_returns: list[float], benchmark_returns: list[float]) -> Opt
     """
     if len(portfolio_returns) != len(benchmark_returns) or len(portfolio_returns) < 2:
         return None
+    if not all(math.isfinite(value) for value in portfolio_returns + benchmark_returns):
+        return None
     try:
         regression = statistics.linear_regression(benchmark_returns, portfolio_returns)
     except statistics.StatisticsError:
         return None
-    return regression.slope
+    return regression.slope if math.isfinite(regression.slope) else None
 
 
 def _paired_beta_returns(
@@ -82,8 +84,12 @@ def _paired_beta_returns(
     for point in points:
         if point.portfolio_pct_change is None or point.spy_pct_change is None:
             continue
-        portfolio_returns.append(float(point.portfolio_pct_change) / 100)
-        benchmark_returns.append(float(point.spy_pct_change) / 100)
+        portfolio_return = float(point.portfolio_pct_change) / 100
+        benchmark_return = float(point.spy_pct_change) / 100
+        if not math.isfinite(portfolio_return) or not math.isfinite(benchmark_return):
+            continue
+        portfolio_returns.append(portfolio_return)
+        benchmark_returns.append(benchmark_return)
     return portfolio_returns, benchmark_returns
 
 
@@ -209,10 +215,10 @@ async def upsert_snapshot(
 ) -> None:
     """
     Upsert a portfolio NAV snapshot.
-    Also fetches SPY close for the date and stores it for overlay calculations.
+    Also fetches the benchmark close and stores it in the legacy spy_* columns.
     """
-    # Get SPY data for this date
-    spy_bars = get_historical_bars("SPY", snapshot_date, snapshot_date)
+    benchmark_symbol = config.BENCHMARK_SYMBOL
+    spy_bars = get_historical_bars(benchmark_symbol, snapshot_date, snapshot_date)
     spy_close = Decimal(str(spy_bars[0].close)) if spy_bars else None
 
     daily_pnl: Optional[Decimal] = None
@@ -224,11 +230,11 @@ async def upsert_snapshot(
         daily_pnl = total_nav - prev_nav - net_flow
         daily_pnl_pct = (daily_pnl / prev_nav * 100).quantize(Decimal("0.000001"))
 
-    # Fetch previous SPY close to calculate daily pct
+    # Fetch the previous benchmark close to calculate its daily return.
     spy_daily_pct: Optional[Decimal] = None
     if spy_close:
         prev_spy_bars = get_historical_bars(
-            "SPY",
+            benchmark_symbol,
             snapshot_date - timedelta(days=5),  # look back enough to find last trading day
             snapshot_date - timedelta(days=1),
         )
@@ -914,7 +920,9 @@ def _period_bounds(period: str) -> tuple[date, date]:
 
 def _blank_metrics(period: str) -> PortfolioMetrics:
     return PortfolioMetrics(
-        period=period, beta=None, std_dev_annualized=None, sharpe_ratio=None,
+        period=period, benchmark_symbol=config.BENCHMARK_SYMBOL,
+        beta=None, beta_observations=0,
+        std_dev_annualized=None, sharpe_ratio=None,
         total_return_pct=None, spy_return_pct=None, alpha=None,
         max_drawdown_pct=None, win_rate=None, as_of=datetime.utcnow(),
     )
@@ -928,7 +936,7 @@ async def _metrics_from_points(
 ) -> PortfolioMetrics:
     """
     Compute the full metric set (beta, std dev, sharpe, alpha, max drawdown,
-    win rate, total/SPY return) from a day-by-day PerformancePoint series —
+    win rate, and total/benchmark return from a PerformancePoint series —
     the same series the performance graph already builds via IBKR-live or
     trade replay. Shared by both fallbacks below so "the graph has the data,
     why are the other numbers blank" isn't true anymore once there's enough
@@ -975,7 +983,9 @@ async def _metrics_from_points(
 
     return PortfolioMetrics(
         period=period,
+        benchmark_symbol=config.BENCHMARK_SYMBOL,
         beta=_dec(beta_val),
+        beta_observations=len(paired_portfolio_returns),
         std_dev_annualized=_dec(std_dev_annual),
         sharpe_ratio=_dec(sharpe),
         total_return_pct=_dec(total_return),

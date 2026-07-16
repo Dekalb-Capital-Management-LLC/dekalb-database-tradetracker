@@ -48,7 +48,11 @@ service, not a Pages project. It runs the frontend build from
 Static Assets with SPA fallback. The root `.node-version` pins Cloudflare's
 build image to Node 22 because current Wrangler releases require Node 22+.
 The root `package.json` also makes a dashboard-configured `npm run build`
-work from the monorepo root by delegating to `trade-tracker/frontend`.
+work from the monorepo root. Its helper installs the locked frontend dependency
+tree only when it is absent, then builds the Vite app. This keeps normal local
+Windows/OneDrive builds from deleting an installed dependency tree while clean
+Cloudflare checkouts still use `npm ci`; `npm run build:ci` forces that clean
+install behavior when needed.
 If you want the simpler Pages flow instead, recreate/repoint Cloudflare as
 Pages with the root directory above.
 

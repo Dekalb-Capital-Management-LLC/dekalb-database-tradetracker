@@ -111,19 +111,21 @@ class PerformancePoint(BaseModel):
     date: date
     portfolio_nav: Decimal
     portfolio_pct_change: Optional[Decimal]   # daily % return
-    spy_pct_change: Optional[Decimal]         # SPY daily % return (for overlay)
-    spy_cumulative_pct: Optional[Decimal]     # cumulative SPY return from period start
+    spy_pct_change: Optional[Decimal]         # benchmark daily % return (legacy field name)
+    spy_cumulative_pct: Optional[Decimal]     # benchmark cumulative return (legacy field name)
     portfolio_cumulative_pct: Optional[Decimal]
 
 
 class PortfolioMetrics(BaseModel):
     period: str                               # e.g. 'ytd', '1y', '3m'
-    beta: Optional[Decimal]                   # vs SPY
+    benchmark_symbol: str
+    beta: Optional[Decimal]                   # OLS slope vs benchmark
+    beta_observations: int                    # paired daily returns used by regression
     std_dev_annualized: Optional[Decimal]     # annualized daily std dev
     sharpe_ratio: Optional[Decimal]           # simplified: (return - rf) / std_dev
     total_return_pct: Optional[Decimal]
     spy_return_pct: Optional[Decimal]         # benchmark return over same period
-    alpha: Optional[Decimal]                  # portfolio return - beta * spy return
+    alpha: Optional[Decimal]                  # portfolio return - beta * benchmark return
     max_drawdown_pct: Optional[Decimal]
     win_rate: Optional[Decimal]               # % of trades that were profitable
     as_of: datetime

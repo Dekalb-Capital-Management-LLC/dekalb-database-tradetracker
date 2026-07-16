@@ -440,7 +440,7 @@ Full interactive docs at `/docs` (Swagger UI). Endpoints have no path prefix.
 | `GET /portfolio/summary` | Combined + per-account P&L snapshot |
 | `GET /portfolio/positions` | Open positions with live pricing |
 | `GET /portfolio/performance?period=ytd` | NAV time series + SPY overlay |
-| `GET /portfolio/metrics?period=ytd` | Beta, std dev, Sharpe, alpha, drawdown, win rate |
+| `GET /portfolio/metrics?period=ytd` | Beta vs configured benchmark, sample count, std dev, Sharpe, alpha, drawdown, win rate |
 | `POST /portfolio/update-all` | Refresh prices + write a snapshot now |
 | `POST /portfolio/snapshots/generate` | Generate today's NAV snapshot |
 | `POST /portfolio/snapshots/backfill` | Backfill missing historical snapshots |

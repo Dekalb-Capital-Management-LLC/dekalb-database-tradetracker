@@ -45,7 +45,9 @@ export interface PerformancePoint {
 
 export interface PortfolioMetrics {
   period: string
+  benchmark_symbol: string
   beta: number | null
+  beta_observations: number
   std_dev_annualized: number | null
   sharpe_ratio: number | null
   total_return_pct: number | null

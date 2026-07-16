@@ -404,7 +404,11 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
     for acct, rows in by_account.items():
         lots, _ = _fifo_process_trades(rows)
         open_by_acct[acct] = lots
-        all_symbols.extend(sym for sym, lot_list in lots.items() if sum(l[0] for l in lot_list) > 0.00001)
+        all_symbols.extend(
+            symbol
+            for symbol, lot_list in lots.items()
+            if sum(lot[0] for lot in lot_list) > 0.00001
+        )
 
     await market_data.warm_quote_cache(pool, list(set(all_symbols)))
 

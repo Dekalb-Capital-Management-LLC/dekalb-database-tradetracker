@@ -572,5 +572,5 @@ async def get_latest_prices(pool, symbols: list[str]) -> tuple[dict[str, float],
 
 
 def get_spy_history(start: date, end: date) -> list[HistoricalBar]:
-    """Convenience wrapper for SPY benchmark data."""
+    """Compatibility wrapper for the configured benchmark's history."""
     return get_historical_bars(config.BENCHMARK_SYMBOL, start, end)

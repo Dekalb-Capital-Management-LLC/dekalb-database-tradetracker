@@ -593,7 +593,7 @@ export default function Dashboard() {
                 }
                 subValue={
                   metrics?.spy_return_pct != null
-                    ? `SPY: ${fmtPct(Number(metrics.spy_return_pct))}`
+                    ? `${metrics.benchmark_symbol}: ${fmtPct(Number(metrics.spy_return_pct))}`
                     : undefined
                 }
                 positive={metrics?.total_return_pct == null ? null : Number(metrics.total_return_pct) >= 0}
@@ -626,11 +626,16 @@ export default function Dashboard() {
                 positive={metrics?.win_rate == null ? null : Number(metrics.win_rate) >= 50}
               />
               <MetricCard
-                label="Beta (vs SPY)"
+                label={`Beta (vs ${metrics?.benchmark_symbol ?? 'SPY'})`}
                 value={
                   chartLoading
                     ? '...'
                     : fmtNum(metrics?.beta != null ? Number(metrics.beta) : null) ?? '—'
+                }
+                subValue={
+                  metrics?.beta_observations
+                    ? `${metrics.beta_observations} paired daily returns`
+                    : undefined
                 }
               />
               <MetricCard
@@ -647,7 +652,7 @@ export default function Dashboard() {
             <Card
               title="Performance Graph"
               delay={0}
-              action={<span className="text-xs" style={{ color: '#9ca3af' }}>Cumulative % vs SPY</span>}
+              action={<span className="text-xs" style={{ color: '#9ca3af' }}>Cumulative % vs {metrics?.benchmark_symbol ?? 'SPY'}</span>}
             >
               <div style={{ height: 360 }}>
                 {chartLoading ? (
@@ -655,7 +660,10 @@ export default function Dashboard() {
                     Loading...
                   </div>
                 ) : (
-                  <PerformanceChart data={performance} />
+                  <PerformanceChart
+                    data={performance}
+                    benchmarkSymbol={metrics?.benchmark_symbol}
+                  />
                 )}
               </div>
             </Card>

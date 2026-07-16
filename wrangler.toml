@@ -2,8 +2,7 @@ name = "dekalb-database-tradetracker"
 compatibility_date = "2026-07-05"
 
 [build]
-command = "npm install && npm run build"
-cwd = "trade-tracker/frontend"
+command = "node build-frontend.mjs"
 
 [assets]
 directory = "./trade-tracker/frontend/dist"
