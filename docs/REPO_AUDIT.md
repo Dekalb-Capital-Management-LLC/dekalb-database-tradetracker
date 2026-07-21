@@ -8,14 +8,19 @@ headings; bullets under them are the work. Priorities are inline (**Urgent /
 High / Medium / Low**). No milestone structure yet — keep it flat and easy to
 triage.
 
-> **Reality check:** this doc was last rewritten 2026-06-11, and a lot has
-> shipped since (IBKR integration, Fidelity CSV import wizard, Railway deploy,
-> dashboard UI fixes, cash-flow tracking, win-rate fix). Most of what used to
-> be "broken" below is now genuinely working — verified by reading the current
-> code, not just taken on faith. What's left is a shorter, more honest list:
-> mostly incomplete route-level coverage and a couple of configuration gaps.
-> The production deploy (Railway done; Google OAuth + Cloudflare
-> Pages in progress) is the active focus as of this update.
+> **Reality check:** the production deploy is done and verified end-to-end —
+> Railway (backend), Cloudflare (frontend, as a Worker with static assets, not
+> classic Pages), and Google OAuth are all live, wired together, and
+> smoke-tested with a real signed-in session showing real data (positions,
+> full YTD performance graph, populated Sharpe/Beta/drawdown). Railway was
+> rebuilt from scratch under new account ownership (now on the Pro plan) on
+> 2026-07-20 — see the Production Deployment project below for what changed.
+> Several real bugs were found and fixed while getting there (Cloudflare
+> Worker deploy config, a local-only Docker build-context bug, and a
+> significant metrics/performance-graph correctness bug) — documented below
+> for the record even though they're already fixed, since they're exactly the
+> kind of thing that'll recur if someone touches these areas again without
+> knowing the history.
 
 ---
 
@@ -33,10 +38,9 @@ triage.
   compatibility migrations upgrade existing databases and a parity test keeps
   Railway's bundled schema copy synchronized.
 - **Google SSO auth** — `AuthMiddleware` is registered and `routers/auth.py` is
-  included in `main.py`. `AUTH_ENABLED=true` genuinely enforces sign-in,
-  restricted to `@<ALLOWED_EMAIL_DOMAIN>`. (Currently set to `false` while
-  testing the dashboard without it — see Auth project below for what to check
-  before flipping it back on.)
+  included in `main.py`. `AUTH_ENABLED=true` in production, genuinely
+  enforcing sign-in restricted to `@<ALLOWED_EMAIL_DOMAIN>` — verified live,
+  `/trades` returns `401` with no token and a real domain account can sign in.
 - **IBKR integration** — the cloud Web API (RSA OAuth) connects *and* returns
   real positions, live pricing, and trade history. `services/ibkr_client.py`
   has retry logic for IBKR's first-call-empty quirk, a `portfolio2` fallback,
@@ -61,12 +65,17 @@ triage.
   Acquired`) still works as a secondary import path for the single
   `PORTFOLIO` account (`/import/trades`, legacy — the live UI uses the CSV
   wizard above for everything else).
-- Railway backend deploy is live (`docs/DEPLOY_RAILWAY.md`); Vercel has been
-  dropped in favor of Cloudflare Pages for the frontend.
+- **Full production deploy — done and verified.** Railway (backend +
+  Postgres), Cloudflare (frontend, deployed as a Worker with static assets —
+  see the Production Deployment project for why that's not the same as
+  classic Pages), and Google OAuth are all live and wired together. Smoke
+  tested end-to-end: sign-in works, dashboard loads real positions, full YTD
+  performance graph, populated metrics.
 
 **Still open / worth tracking (the rest of this document):**
-- Google OAuth Cloud Console setup + Cloudflare Pages deploy — in progress,
-  not yet smoke-tested end-to-end in production.
+- DB schema has drifted — three tables (`imported_positions`, `ibkr_tokens`,
+  `instrument_conids`) exist only as runtime migrations in `db.py`, not in the
+  schema file.
 - `RISK_FREE_RATE_ANNUAL` still hardcoded to `0.0` in `portfolio_metrics.py`.
 - No token-refresh flow for Google ID tokens (expire ~1h, hard-redirect to
   `/login` on expiry instead of silent re-auth).
@@ -86,17 +95,11 @@ progress on IBKR, Fidelity import, and the production deploy.)_
 ## Project: Trade Tracker — Auth (working, finishing touches)
 
 The frontend has a full Google SSO flow (`AuthContext`, `Login.tsx`,
-`client.ts` bearer headers + `handle401`), and the backend now enforces it —
+`client.ts` bearer headers + `handle401`), and the backend enforces it —
 `main.py` registers `AuthMiddleware` and includes the auth router.
-`AUTH_ENABLED` is currently set to `false` on Railway for dashboard testing
-without sign-in friction.
+`AUTH_ENABLED=true` in production with real `GOOGLE_CLIENT_ID` /
+`ALLOWED_EMAIL_DOMAIN` values, verified end-to-end.
 
-- **Before flipping `AUTH_ENABLED=true` in production** — **Urgent.** Confirm
-  `GOOGLE_CLIENT_ID` and `ALLOWED_EMAIL_DOMAIN` are set to real values (not
-  placeholders) on Railway — `verify_google_id_token` raises immediately if
-  `GOOGLE_CLIENT_ID` is empty, which would 401 every request. Also confirm the
-  Google Cloud Console OAuth client's Authorized JavaScript origins include
-  the live Cloudflare Pages URL (see `docs/DEPLOY_GOOGLE_OAUTH.md`).
 - **Hardcoded `/api/...` fetches bypassing `BASE`** — **Fixed 2026-06-28.**
   `AuthContext.tsx` and `Login.tsx` used to call `fetch('/api/auth/config')` /
   `fetch('/api/auth/verify')` directly instead of routing through `client.ts`'s
@@ -126,11 +129,17 @@ is handled: retries + `portfolio2` fallback for positions, polling for
 `field 31` (with status-character stripping like `"C"` for stale closes) for
 snapshots, US-listed conid preference for symbol resolution.
 
-- **Keep an eye on `IBKR_SERVER_IP`** — **Medium.** IBKR ties the OAuth session
-  to an outbound IP. On Railway this is the static outbound IP (Pro plan
-  feature); `config.validate_ibkr_oauth_config` logs a warning if the detected
-  IP doesn't match what's configured. Re-verify after any Railway plan/region
-  change.
+- **Finalize `IBKR_SERVER_IP` on the rebuilt Railway project** — **Medium,
+  still open as of 2026-07-20.** IBKR ties the OAuth session to an outbound
+  IP; `config.validate_ibkr_oauth_config` only logs a warning on mismatch, it
+  doesn't block the connection (verified: a stale/wrong `IBKR_SERVER_IP`
+  still let a session establish successfully in testing) — so this isn't
+  blocking, but it's unfinished. Railway's Pro-plan Static Outbound IPs
+  feature assigns **3** IPs, not one, and it's not confirmed whether egress
+  consistently uses a single one of them or can vary — register whichever
+  IP(s) IBKR's portal will accept, then set `IBKR_SERVER_IP` to match. Re-do
+  this any time the Railway project is rebuilt (as it was on 2026-07-20 —
+  same underlying task, new IPs).
 - **`ibkr_parser.py` (CSV import) is dead code** — **Low, not a bug.**
   Unreferenced by any router. Superseded by the live API integration, which
   gets the same data without a manual IBKR Activity Statement export. Fine to
@@ -166,31 +175,61 @@ unsupported instrument type for now.
   actually calls — but worth deciding whether to keep the legacy endpoint
   around or retire it in favor of routing XLSX uploads through the wizard too.
 
-## Project: Trade Tracker — Production Deployment (Railway done, finishing the rest)
+## Project: Trade Tracker — Production Deployment (done, verified 2026-07-20)
 
-Backend is deployed and running on Railway. Vercel has been dropped — the
-frontend deploy target is Cloudflare Pages (free tier, no new vendor to
-evaluate). Step-by-step docs: `docs/DEPLOY_RAILWAY.md` →
-`docs/DEPLOY_GOOGLE_OAUTH.md` → `docs/DEPLOY_CLOUDFLARE_PAGES.md`.
+Full stack is live: Railway (backend + Postgres), Cloudflare (frontend),
+Google OAuth. All wired together and smoke-tested with a real signed-in
+session. Step-by-step docs: `docs/DEPLOY_RAILWAY.md` →
+`docs/DEPLOY_GOOGLE_OAUTH.md` → `docs/DEPLOY_CLOUDFLARE_PAGES.md` (filename
+is legacy — see the Cloudflare bug below).
 
-- **Finish the Google OAuth Cloud Console setup** — **Urgent.** Create/confirm
-  the OAuth client, set Authorized JavaScript origins (localhost + the
-  Cloudflare Pages URL once live), set `GOOGLE_CLIENT_ID` and
-  `ALLOWED_EMAIL_DOMAIN` on Railway with real values.
-- **Deploy the frontend to Cloudflare Pages** — **Urgent.** Root directory
-  `trade-tracker/frontend`, build command `npm run build`, output `dist`, env
-  var `VITE_API_BASE_URL` = the Railway API URL (set before the first build —
-  it's baked in at build time).
-- **Wire `FRONTEND_URL` + Google OAuth origins together** — **Urgent.** Set
-  `FRONTEND_URL` on Railway to the Cloudflare Pages URL and redeploy; add the
-  same URL to the Google OAuth client's Authorized JavaScript origins.
-  `main.py` already splits `FRONTEND_URL` on commas, so a custom domain can be
-  added alongside the `.pages.dev` URL later without code changes.
-- **Production smoke test** — **High.** On the live URLs, with
-  `AUTH_ENABLED=true`: sign in with a `@dekalbcapitalmanagement.com` account,
-  confirm Dashboard loads (summary + chart), Trades tab works, a Fidelity CSV
-  imports via the wizard, IBKR tab shows live positions, `/health`/`/docs`
-  reachable without auth, a non-domain Google account is rejected.
+Railway was **rebuilt from scratch under new account ownership** on
+2026-07-20 (now on the Pro plan, after the original account's trial expired
+mid-project and took the backend offline — not a code issue, a billing one).
+Rebuilding meant redoing all Railway env vars and the Cloudflare
+`VITE_API_BASE_URL` build variable to point at the new Railway domain; Google
+OAuth needed zero changes since the Client ID and authorized origins didn't
+change. If this happens again, that's the checklist: full Railway env var
+rebuild, one Cloudflare build-variable update, no Google changes.
+
+**Bugs found and fixed getting here — worth knowing if you touch deploy
+config again:**
+
+- **Cloudflare deploys this as a Worker with static assets, not classic
+  Pages — Fixed 2026-07-09/10.** Even going through what looks like a Pages
+  creation flow, Cloudflare's dashboard now creates a Worker. This mattered
+  twice: (1) without a `wrangler.jsonc` telling `wrangler` where the built
+  `dist/` files are, the build succeeded but the deploy step failed with
+  `Missing entry-point to Worker script or to assets directory`; (2) the old
+  Pages-style `public/_redirects` SPA-fallback file actively conflicts with
+  Workers' `not_found_handling` config and fails deploys with `Invalid
+  _redirects configuration: Infinite loop detected`. Fixed by adding
+  `trade-tracker/frontend/wrangler.jsonc` (assets directory + `"not_found_handling":
+  "single-page-application"`) and deleting `public/_redirects` entirely — see
+  `docs/DEPLOY_CLOUDFLARE_PAGES.md` for the full explanation. The practical
+  upshot: the production URL is `*.workers.dev`, not `*.pages.dev`, and it's
+  disabled by default (Domains & Routes tab) unlike classic Pages.
+- **`VITE_API_BASE_URL` set in the wrong Cloudflare panel — Fixed 2026-07-10.**
+  Cloudflare has two different "variables" surfaces: Settings → Variables and
+  secrets (Worker *runtime* env, irrelevant for a static-assets-only Worker)
+  vs. Settings → Build → Variables and secrets (actually injected into `npm
+  run build`, which is what Vite needs to bake in `import.meta.env.VITE_*`).
+  Setting it in the wrong one meant the frontend silently fell back to
+  same-origin `/api/...` calls, which the Workers SPA fallback answered with
+  `index.html` instead of JSON (`Unexpected token '<'` in the console).
+- **Local `docker compose up --build` crashed the API on every run — Fixed
+  2026-07-10.** `docker-compose.yml`'s `trade-tracker` service used
+  `context: .` (repo root) while `trade-tracker/api/Dockerfile` was written
+  assuming the context is `trade-tracker/api` itself (same as Railway's root
+  directory — there's a duplicated `trade-tracker/api/schemas/` copy that only
+  makes sense under that assumption). With the repo-root context, `COPY . .`
+  preserved the full monorepo tree, so `main.py` landed at
+  `/app/trade-tracker/api/main.py` instead of `/app/main.py`, and
+  `uvicorn main:app` failed with `Could not import module "main"` — every
+  request 502'd. Fixed by changing the compose service to `build:
+  ./trade-tracker/api`, matching the other two services' style and Railway's
+  actual build. Pre-existing bug, unrelated to any of the above — just hadn't
+  been hit recently before this.
 
 ## Project: Trade Tracker — Frontend / UI (mostly fixed)
 
@@ -212,10 +251,29 @@ evaluate). Step-by-step docs: `docs/DEPLOY_RAILWAY.md` →
 
 ## Project: Trade Tracker — Data Model & Metrics correctness
 
-- **Schema drift — fixed.** `schemas/trade_tracker_schema.sql` is the canonical
-  definition of all seven application tables, including `imported_positions`,
-  `ibkr_tokens`, and `instrument_conids`. The Railway-bundled copy is covered
-  by a parity test; runtime migrations remain only for existing databases.
+- **Performance graph / metrics went flat once an account had 2+ real
+  snapshot rows — Fixed 2026-07-10.** `get_performance_series` and
+  `calculate_metrics` in `portfolio_metrics.py` both had the same bug: they
+  trusted the real `portfolio_snapshots` table the moment it had **2 or
+  more** rows, even if those rows only covered the last couple weeks — instead
+  of falling back to the much richer trade-replay reconstruction
+  (`_trades_performance_series`, which replays actual trade history ×
+  historical prices and can cover months). Symptom: a brand-new or
+  recently-rebuilt account (e.g. right after a Railway rebuild) would show a
+  flat/near-empty performance graph and blank Sharpe/Beta/Std Dev, even
+  though full trade history existed to reconstruct a real graph from. Fixed
+  by only trusting the snapshot rows when they actually cover the requested
+  date range (earliest row within ~3 days of the requested start), with a
+  fallback to the snapshot rows anyway if the richer reconstructions come back
+  empty. Worth remembering if this ever regresses — it's an easy trap to
+  reintroduce by "simplifying" that condition back to a bare row-count check.
+- **Schema drift — `imported_positions` / `ibkr_tokens` / `instrument_conids`**
+  — **High, still open.** These three tables exist **only** as runtime
+  migrations in `db.py` (`_apply_migrations`), not in
+  `schemas/trade_tracker_schema.sql`. The entire portfolio/positions path
+  depends on `imported_positions`. Decide the source of truth (fold migrations
+  into the schema file, or adopt a real migration tool) and update the schema
+  file to list the actual 7 tables.
 - **Cash flow tracking — fixed.** `/portfolio/cash-flows` CRUD + excluded from
   the return calc in `portfolio_metrics.py`.
 - **Make the risk-free rate configurable** — **Medium, still open.**
