@@ -339,7 +339,7 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
 
     if snap_rows:
         symbols = [r["symbol"] for r in snap_rows]
-        await market_data.warm_yfinance_quote_cache(symbols)
+        await market_data.warm_yfinance_quote_cache(pool, symbols)
         positions: list[PositionSummary] = []
         for r in snap_rows:
             qty = Decimal(str(r["quantity"])) if r["quantity"] else Decimal("0")
