@@ -58,6 +58,28 @@ export interface PortfolioMetrics {
   as_of: string
 }
 
+export interface FactorSeries {
+  symbol: string
+  label: string
+  kind: 'portfolio' | 'benchmark' | 'position'
+  portfolio_weight_pct: number | null
+}
+
+export interface FactorAnalysis {
+  period: string
+  start_date: string
+  end_date: string
+  benchmark_symbol: string
+  calculation_method: 'ols_slope'
+  return_frequency: 'daily'
+  beta: number | null
+  beta_observations: number
+  series: FactorSeries[]
+  correlations: (number | null)[][]
+  correlation_observations: number[][]
+  as_of: string
+}
+
 export interface Trade {
   id: number
   source: 'ibkr' | 'fidelity'

@@ -131,6 +131,28 @@ class PortfolioMetrics(BaseModel):
     as_of: datetime
 
 
+class FactorSeries(BaseModel):
+    symbol: str
+    label: str
+    kind: Literal["portfolio", "benchmark", "position"]
+    portfolio_weight_pct: Optional[Decimal] = None
+
+
+class FactorAnalysis(BaseModel):
+    period: str
+    start_date: date
+    end_date: date
+    benchmark_symbol: str
+    calculation_method: Literal["ols_slope"] = "ols_slope"
+    return_frequency: Literal["daily"] = "daily"
+    beta: Optional[Decimal]
+    beta_observations: int
+    series: list[FactorSeries]
+    correlations: list[list[Optional[Decimal]]]
+    correlation_observations: list[list[int]]
+    as_of: datetime
+
+
 # ---------------------------------------------------------------------------
 # Snapshot model
 # ---------------------------------------------------------------------------

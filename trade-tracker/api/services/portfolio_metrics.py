@@ -15,15 +15,26 @@ import logging
 import math
 import statistics
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
 import asyncpg
 
 import config
-from models.schemas import PerformancePoint, PortfolioMetrics
-from services.market_data import get_historical_bars, get_historical_bars_batch, get_spy_history
+from models.schemas import (
+    FactorAnalysis,
+    FactorSeries,
+    PerformancePoint,
+    PortfolioMetrics,
+    PositionSummary,
+)
+from services.market_data import (
+    get_historical_bars,
+    get_historical_bars_batch,
+    get_spy_history,
+    is_cash_symbol,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +102,56 @@ def _paired_beta_returns(
         portfolio_returns.append(portfolio_return)
         benchmark_returns.append(benchmark_return)
     return portfolio_returns, benchmark_returns
+
+
+def _daily_returns_by_date(bars, start: date, end: date) -> dict[date, float]:
+    """Convert sorted close bars into finite decimal returns keyed by trading date."""
+    returns: dict[date, float] = {}
+    previous_close: Optional[float] = None
+    for bar in sorted(bars, key=lambda item: item.date):
+        close = float(bar.close)
+        if not math.isfinite(close) or close <= 0:
+            continue
+        if previous_close is not None and start <= bar.date <= end:
+            value = close / previous_close - 1
+            if math.isfinite(value):
+                returns[bar.date] = value
+        previous_close = close
+    return returns
+
+
+def _portfolio_returns_by_date(points: list[PerformancePoint]) -> dict[date, float]:
+    returns: dict[date, float] = {}
+    for point in points:
+        if point.portfolio_pct_change is None:
+            continue
+        value = float(point.portfolio_pct_change) / 100
+        if math.isfinite(value):
+            returns[point.date] = value
+    return returns
+
+
+def _paired_series(
+    left: dict[date, float],
+    right: dict[date, float],
+) -> tuple[list[float], list[float]]:
+    dates = sorted(left.keys() & right.keys())
+    return [left[item] for item in dates], [right[item] for item in dates]
+
+
+def _correlation(
+    left: dict[date, float],
+    right: dict[date, float],
+) -> tuple[Optional[float], int]:
+    left_values, right_values = _paired_series(left, right)
+    observations = len(left_values)
+    if observations < 2:
+        return None, observations
+    try:
+        value = statistics.correlation(left_values, right_values)
+    except statistics.StatisticsError:
+        return None, observations
+    return (value if math.isfinite(value) else None), observations
 
 
 def _max_drawdown(nav_series: list[float]) -> float:
@@ -1009,6 +1070,128 @@ async def calculate_metrics(
     if points:
         return await _metrics_from_points(pool, account_id, period, points)
     return _blank_metrics(period)
+
+
+async def calculate_factor_analysis(
+    pool: asyncpg.Pool,
+    period: str,
+    account_id: Optional[str],
+    positions: list[PositionSummary],
+    benchmark_symbol: str,
+    max_positions: int = 6,
+) -> FactorAnalysis:
+    """Build a dashboard-ready beta and pairwise daily-return correlation contract."""
+    start, end = _period_bounds(period)
+    benchmark = benchmark_symbol.upper().strip()
+    max_positions = max(1, min(max_positions, 10))
+
+    points = await get_performance_series(pool, start, end, account_id, period=period)
+    portfolio_returns = _portfolio_returns_by_date(points)
+
+    exposure_by_symbol: dict[str, float] = defaultdict(float)
+    for position in positions:
+        symbol = position.symbol.upper().strip().rstrip("*")
+        if not symbol or " " in symbol or is_cash_symbol(symbol):
+            continue
+        market_value = position.market_value
+        if market_value is None and position.current_price is not None:
+            market_value = position.quantity * position.current_price
+        if market_value is None:
+            continue
+        value = float(market_value)
+        if math.isfinite(value) and value != 0:
+            exposure_by_symbol[symbol] += value
+
+    ranked_symbols = sorted(
+        exposure_by_symbol,
+        key=lambda symbol: abs(exposure_by_symbol[symbol]),
+        reverse=True,
+    )[:max_positions]
+    gross_exposure = sum(abs(value) for value in exposure_by_symbol.values())
+
+    requested_symbols = list(dict.fromkeys([benchmark, *ranked_symbols]))
+    history_start = start - timedelta(days=14)
+    batch = await asyncio.to_thread(
+        get_historical_bars_batch,
+        requested_symbols,
+        history_start,
+        end,
+    )
+    returns_by_symbol = {
+        symbol: _daily_returns_by_date(batch.get(symbol, []), start, end)
+        for symbol in requested_symbols
+    }
+
+    def _weight(symbol: str) -> Optional[Decimal]:
+        if not gross_exposure or symbol not in exposure_by_symbol:
+            return None
+        value = exposure_by_symbol[symbol] / gross_exposure * 100
+        return Decimal(str(round(value, 2)))
+
+    series = [
+        FactorSeries(
+            symbol="PORTFOLIO",
+            label="Portfolio",
+            kind="portfolio",
+            portfolio_weight_pct=Decimal("100"),
+        ),
+        FactorSeries(
+            symbol=benchmark,
+            label=benchmark,
+            kind="benchmark",
+            portfolio_weight_pct=_weight(benchmark),
+        ),
+    ]
+    series.extend(
+        FactorSeries(
+            symbol=symbol,
+            label=symbol,
+            kind="position",
+            portfolio_weight_pct=_weight(symbol),
+        )
+        for symbol in ranked_symbols
+        if symbol != benchmark
+    )
+
+    return_series: dict[str, dict[date, float]] = {
+        "PORTFOLIO": portfolio_returns,
+        **returns_by_symbol,
+    }
+    correlations: list[list[Optional[Decimal]]] = []
+    correlation_observations: list[list[int]] = []
+    for row in series:
+        correlation_row: list[Optional[Decimal]] = []
+        observation_row: list[int] = []
+        for column in series:
+            value, observations = _correlation(
+                return_series.get(row.symbol, {}),
+                return_series.get(column.symbol, {}),
+            )
+            correlation_row.append(
+                Decimal(str(round(value, 4))) if value is not None else None
+            )
+            observation_row.append(observations)
+        correlations.append(correlation_row)
+        correlation_observations.append(observation_row)
+
+    paired_portfolio, paired_benchmark = _paired_series(
+        portfolio_returns,
+        returns_by_symbol.get(benchmark, {}),
+    )
+    beta_value = _beta(paired_portfolio, paired_benchmark)
+
+    return FactorAnalysis(
+        period=period,
+        start_date=start,
+        end_date=end,
+        benchmark_symbol=benchmark,
+        beta=(Decimal(str(round(beta_value, 4))) if beta_value is not None else None),
+        beta_observations=len(paired_portfolio),
+        series=series,
+        correlations=correlations,
+        correlation_observations=correlation_observations,
+        as_of=datetime.now(timezone.utc),
+    )
 
 
 

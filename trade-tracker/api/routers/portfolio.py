@@ -6,6 +6,7 @@ Portfolio router.
   POST /portfolio/refresh-prices - fetch live prices via market data, update P&L, write snapshot
   GET  /portfolio/performance   - NAV time series (+ SPY overlay)
   GET  /portfolio/metrics       - beta, sharpe, alpha, max drawdown
+  GET  /portfolio/factor-analysis - configurable beta + correlation matrix
   GET  /portfolio/snapshots     - raw daily NAV snapshot rows
 """
 from __future__ import annotations
@@ -25,6 +26,7 @@ from models.schemas import (
     AccountSummary,
     CashFlowCreate,
     CashFlowResponse,
+    FactorAnalysis,
     PerformancePoint,
     PortfolioMetrics,
     PortfolioSnapshotResponse,
@@ -799,6 +801,34 @@ async def get_metrics(
     except Exception as exc:
         logger.error("metrics error: %s", exc)
         raise HTTPException(status_code=500, detail="Error computing portfolio metrics")
+
+
+@router.get("/factor-analysis", response_model=FactorAnalysis)
+async def get_factor_analysis(
+    period: str = Query("ytd"),
+    account_id: Optional[str] = Query(None),
+    benchmark: Optional[str] = Query(
+        None,
+        min_length=1,
+        max_length=15,
+        pattern=r"^[A-Za-z0-9.^_-]+$",
+    ),
+    max_positions: int = Query(6, ge=1, le=10),
+    pool=Depends(get_pool),
+):
+    try:
+        positions = await _compute_positions(pool, account_id)
+        return await portfolio_metrics.calculate_factor_analysis(
+            pool=pool,
+            period=period,
+            account_id=account_id,
+            positions=positions,
+            benchmark_symbol=benchmark or config.BENCHMARK_SYMBOL,
+            max_positions=max_positions,
+        )
+    except Exception as exc:
+        logger.error("factor analysis error: %s", exc)
+        raise HTTPException(status_code=500, detail="Error computing factor analysis")
 
 
 @router.get("/snapshots", response_model=list[PortfolioSnapshotResponse])

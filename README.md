@@ -265,7 +265,7 @@ python tests/fake_zmq_sender.py   # sends 5 batches of 3 events; check Adminer
 
 ## Trade Tracker (Equities Team)
 
-A web dashboard for tracking positions, P&L, and portfolio metrics vs SPY.
+A web dashboard for tracking positions, P&L, and portfolio risk analytics.
 
 ### How data gets in
 
@@ -441,6 +441,7 @@ Full interactive docs at `/docs` (Swagger UI). Endpoints have no path prefix.
 | `GET /portfolio/positions` | Open positions with live pricing |
 | `GET /portfolio/performance?period=ytd` | NAV time series + SPY overlay |
 | `GET /portfolio/metrics?period=ytd` | Beta vs configured benchmark, sample count, std dev, Sharpe, alpha, drawdown, win rate |
+| `GET /portfolio/factor-analysis?period=ytd&benchmark=SPY` | Regression beta and pairwise correlation matrix for the portfolio and largest positions |
 | `POST /portfolio/update-all` | Refresh prices + write a snapshot now |
 | `POST /portfolio/snapshots/generate` | Generate today's NAV snapshot |
 | `POST /portfolio/snapshots/backfill` | Backfill missing historical snapshots |

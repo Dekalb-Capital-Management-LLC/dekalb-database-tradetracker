@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import config
 from services import market_data
 
-SCHEMA_VERSION = "2026-07-05"
+SCHEMA_VERSION = "2026-07-21"
 
 
 def _now_iso() -> datetime:
@@ -60,6 +60,22 @@ def get_dashboard_capabilities() -> dict:
                 ],
             },
             {
+                "key": "factor-analysis",
+                "label": "Factor Analysis",
+                "owner": "shared",
+                "status": "active",
+                "description": (
+                    "Configurable benchmark beta and pairwise daily-return correlations "
+                    "for the portfolio and its largest positions."
+                ),
+                "endpoints": ["/portfolio/factor-analysis"],
+                "data_contracts": [
+                    "FactorAnalysis",
+                    "method:ols_slope",
+                    "frequency:daily",
+                ],
+            },
+            {
                 "key": "quant-ingestion",
                 "label": "Quant Ingestion",
                 "owner": "quant",
@@ -87,6 +103,7 @@ def get_dashboard_capabilities() -> dict:
             "Add quant-facing FastAPI routers under /quant/* without changing existing portfolio endpoints.",
             "Keep dashboard modules keyed by stable module keys instead of broker/provider names.",
             "Expose new quant data through typed API responses before adding visible dashboard panels.",
+            "Consume /portfolio/factor-analysis for shared equities and quant risk views.",
         ],
         "quant_config": {
             "compat_enabled": config.QUANT_DASHBOARD_COMPAT_ENABLED,

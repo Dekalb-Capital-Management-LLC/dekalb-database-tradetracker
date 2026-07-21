@@ -20,6 +20,7 @@ import PerformanceChart from '../components/PerformanceChart'
 import PositionsTable from '../components/PositionsTable'
 import FidelityUpdateWizard from '../components/FidelityUpdateWizard'
 import CashFlowModal from '../components/CashFlowModal'
+import FactorAnalysisPanel from '../components/FactorAnalysisPanel'
 import Trades from './Trades'
 
 const FIDELITY_WIZARD_SESSION_KEY = 'fidelity_wizard_prompted'
@@ -108,11 +109,11 @@ function Card({
 }) {
   return (
     <div
-      className={`flex flex-col animate-fade-in-up transition-all duration-200 hover:shadow-lg hover:-translate-y-0.5 ${className}`}
+      className={`flex flex-col animate-fade-in-up ${className}`}
       style={{
         backgroundColor: '#ffffff',
         border: '1px solid #d0dce8',
-        borderRadius: 12,
+        borderRadius: 8,
         overflow: 'hidden',
         animationDelay: `${delay}ms`,
         boxShadow: '0 1px 2px rgba(16,24,40,0.04)',
@@ -330,7 +331,7 @@ export default function Dashboard() {
     <div className="flex flex-col min-h-screen" style={{ backgroundColor: '#e8edf5' }}>
       {/* Top white bar — logo, title/timestamp, IBKR dot, update action, account, settings */}
       <header
-        className="flex items-center justify-between px-6 shrink-0 gap-4"
+        className="flex items-center justify-between px-3 sm:px-6 shrink-0 gap-2 sm:gap-4"
         style={{ backgroundColor: '#ffffff', borderBottom: '1px solid #e2e8f0', height: 64, zIndex: 10 }}
       >
         <div className="flex items-center gap-4 min-w-0">
@@ -338,7 +339,7 @@ export default function Dashboard() {
             <img
               src="/logo.png"
               alt="DeKalb Capital"
-              style={{ height: 36, maxWidth: 160, objectFit: 'contain' }}
+              className="h-7 sm:h-9 w-auto max-w-[100px] sm:max-w-[160px] object-contain"
               onError={() => setLogoError(true)}
             />
           ) : (
@@ -357,7 +358,7 @@ export default function Dashboard() {
           </div>
         </div>
 
-        <div className="flex items-center gap-3 shrink-0">
+        <div className="flex items-center gap-1 sm:gap-3 shrink-0">
           {updateMsg && <span className="text-xs hidden lg:inline" style={{ color: '#9ca3af' }}>{updateMsg}</span>}
           {marketDataStatus && (
             <span
@@ -388,24 +389,26 @@ export default function Dashboard() {
           )}
           <button
             onClick={() => setShowCashFlowModal(true)}
-            className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium border transition-colors hover:bg-gray-50"
+            aria-label="Log deposit or withdrawal"
+            className="flex items-center gap-1.5 p-2 lg:px-3 lg:py-2 rounded-lg text-sm font-medium border transition-colors hover:bg-gray-50"
             style={{ borderColor: '#d0dce8', color: '#374151' }}
             title="Log a deposit or withdrawal so it doesn't get counted as gain/loss"
           >
             <Wallet size={15} />
-            Deposit/Withdrawal
+            <span className="hidden lg:inline">Deposit/Withdrawal</span>
           </button>
           <button
             onClick={handleUpdateClick}
             disabled={updating}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold shadow-sm hover:shadow-md disabled:opacity-50 disabled:shadow-none transition-all"
+            aria-label={updating ? 'Updating portfolio' : 'Update portfolio'}
+            className="flex items-center gap-2 p-2 sm:px-4 sm:py-2 rounded-lg text-sm font-semibold shadow-sm hover:shadow-md disabled:opacity-50 disabled:shadow-none transition-all"
             style={{ backgroundColor: '#1a2744', color: '#ffffff' }}
           >
             <RefreshCw size={15} className={updating ? 'animate-spin' : ''} />
-            {updating ? 'Updating…' : 'Update Portfolio'}
+            <span className="hidden sm:inline">{updating ? 'Updating…' : 'Update Portfolio'}</span>
           </button>
 
-          <div className="flex items-center" style={{ borderLeft: '1px solid #e2e8f0', paddingLeft: 12, gap: 6 }}>
+          <div className="hidden sm:flex items-center" style={{ borderLeft: '1px solid #e2e8f0', paddingLeft: 12, gap: 6 }}>
             <div
               className="flex items-center justify-center rounded-full transition-transform duration-150 hover:scale-105 cursor-pointer"
               style={{ width: 34, height: 34, backgroundColor: '#d1dce8' }}
@@ -423,10 +426,18 @@ export default function Dashboard() {
               <LogOut size={16} color="#9ca3af" strokeWidth={1.8} />
             </button>
           </div>
+          <button
+            onClick={signOut}
+            className="sm:hidden p-2 rounded-lg hover:bg-gray-50 transition-colors"
+            title="Sign out"
+            aria-label="Sign out"
+          >
+            <LogOut size={16} color="#9ca3af" strokeWidth={1.8} />
+          </button>
         </div>
       </header>
 
-      <div className="flex-1 p-6 pb-0 flex flex-col">
+      <div className="flex-1 p-4 sm:p-6 pb-0 flex flex-col min-w-0">
         {/* Tab row + period selector & search */}
         <div className="flex items-center justify-between flex-wrap gap-3 mb-4">
           <div className="flex items-end gap-1" style={{ borderBottom: '1px solid #e2e8f0' }}>
@@ -466,7 +477,7 @@ export default function Dashboard() {
           </div>
 
           {selectedTab !== 'trades' && (
-            <div className="flex items-center gap-3">
+            <div className="flex w-full sm:w-auto items-center gap-3 flex-wrap sm:flex-nowrap">
               <div className="flex bg-white border rounded-lg p-1 gap-0.5" style={{ borderColor: '#d0dce8' }}>
                 {PERIODS.map((p) => (
                   <button
@@ -485,8 +496,8 @@ export default function Dashboard() {
               </div>
 
               <div
-                className="flex items-center gap-2 px-3 py-1.5 rounded-lg transition-all focus-within:shadow-md"
-                style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8', minWidth: 180 }}
+                className="flex flex-1 sm:flex-none min-w-[140px] sm:min-w-[180px] items-center gap-2 px-3 py-1.5 rounded-lg transition-all focus-within:shadow-md"
+                style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8' }}
               >
                 <Search size={13} color="#9ca3af" />
                 <input
@@ -626,19 +637,6 @@ export default function Dashboard() {
                 positive={metrics?.win_rate == null ? null : Number(metrics.win_rate) >= 50}
               />
               <MetricCard
-                label={`Beta (vs ${metrics?.benchmark_symbol ?? 'SPY'})`}
-                value={
-                  chartLoading
-                    ? '...'
-                    : fmtNum(metrics?.beta != null ? Number(metrics.beta) : null) ?? '—'
-                }
-                subValue={
-                  metrics?.beta_observations
-                    ? `${metrics.beta_observations} paired daily returns`
-                    : undefined
-                }
-              />
-              <MetricCard
                 label="Std Dev (Annual)"
                 value={
                   chartLoading
@@ -666,6 +664,23 @@ export default function Dashboard() {
                   />
                 )}
               </div>
+            </Card>
+
+            <Card
+              title="Factor Analysis"
+              delay={80}
+              action={
+                <span className="text-xs" style={{ color: '#9ca3af' }}>
+                  Regression beta · top holdings
+                </span>
+              }
+            >
+              <FactorAnalysisPanel
+                period={period}
+                accountId={brokerAccountId}
+                defaultBenchmark={metrics?.benchmark_symbol ?? 'SPY'}
+                refreshSignal={summary?.as_of}
+              />
             </Card>
 
             {/* Current positions, full width, cash pinned + highlighted inside PositionsTable */}

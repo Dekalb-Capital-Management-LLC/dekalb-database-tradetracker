@@ -32,11 +32,16 @@ class DashboardCapabilitiesTests(unittest.TestCase):
         manifest = get_dashboard_capabilities()
         modules = {module["key"]: module for module in manifest["modules"]}
 
-        self.assertEqual(manifest["schema_version"], "2026-07-05")
+        self.assertEqual(manifest["schema_version"], "2026-07-21")
         self.assertEqual(manifest["dashboard"], "trade-tracker")
         self.assertIn("portfolio", modules)
         self.assertIn("market-data", modules)
+        self.assertIn("factor-analysis", modules)
         self.assertIn("quant-ingestion", modules)
+        self.assertEqual(
+            modules["factor-analysis"]["endpoints"],
+            ["/portfolio/factor-analysis"],
+        )
         self.assertEqual(modules["quant-ingestion"]["status"], "planned")
         self.assertIn("postgres:trading.positions", modules["quant-ingestion"]["data_contracts"])
 
