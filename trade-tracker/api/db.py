@@ -1,73 +1,95 @@
-import asyncpg
+import asyncio
 import logging
-import os
-import ssl
+from collections.abc import Iterable
+from pathlib import Path
+
+import asyncpg
 
 import config
 
 logger = logging.getLogger(__name__)
 _pool: asyncpg.Pool | None = None
-_SCHEMA_FILE = "/etc/schemas/trade_tracker_schema.sql"
-
-
-def _pool_kwargs() -> dict:
-    kwargs: dict = {
-        "host": config.DB_HOST,
-        "port": config.POSTGRES_PORT,
-        "database": config.POSTGRES_DB,
-        "user": config.POSTGRES_USER,
-        "password": config.POSTGRES_PASSWORD,
+_SCHEMA_FILES = (
+    Path("/etc/schemas/trade_tracker_schema.sql"),
+    Path(__file__).resolve().parent / "schemas" / "trade_tracker_schema.sql",
+)
+REQUIRED_TABLES = frozenset(
+    {
+        "cash_flows",
+        "fidelity_imports",
+        "ibkr_tokens",
+        "imported_positions",
+        "instrument_conids",
+        "portfolio_snapshots",
+        "trades",
     }
-    if config.DB_SSL != "disable":
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        kwargs["ssl"] = ctx
+)
+
+
+def _pool_kwargs(database: str | None = None) -> dict:
+    if config.DATABASE_URL:
+        # Preserve the DSN so asyncpg handles URL-escaped credentials and any
+        # supported connection parameters supplied by Railway.
+        kwargs: dict = {"dsn": config.DATABASE_URL}
+    else:
+        kwargs = {
+            "host": config.DB_HOST,
+            "port": config.POSTGRES_PORT,
+            "database": config.POSTGRES_DB,
+            "user": config.POSTGRES_USER,
+            "password": config.POSTGRES_PASSWORD,
+        }
+    if database is not None:
+        kwargs["database"] = database
+    kwargs["ssl"] = config.DB_SSL
     return kwargs
 
 
+def _schema_file() -> Path:
+    for path in _SCHEMA_FILES:
+        if path.exists():
+            return path
+    searched = ", ".join(str(path) for path in _SCHEMA_FILES)
+    raise RuntimeError(f"Trade Tracker schema file not found; searched: {searched}")
+
+
 async def _ensure_db_exists() -> None:
-    logger.warning("Database '%s' not found — creating it now...", config.POSTGRES_DB)
-    conn = await asyncpg.connect(**{**_pool_kwargs(), "database": "postgres"})
+    logger.warning("Database '%s' not found; creating it now...", config.POSTGRES_DB)
+    conn = await asyncpg.connect(**_pool_kwargs(database="postgres"))
     try:
-        await conn.execute(f'CREATE DATABASE "{config.POSTGRES_DB}"')
+        database_name = config.POSTGRES_DB.replace('"', '""')
+        await conn.execute(f'CREATE DATABASE "{database_name}"')
         logger.info("Created database '%s'", config.POSTGRES_DB)
     finally:
         await conn.close()
-    if os.path.exists(_SCHEMA_FILE):
-        schema_conn = await asyncpg.connect(**_pool_kwargs())
-        try:
-            with open(_SCHEMA_FILE) as f:
-                ddl = f.read()
-            await schema_conn.execute(ddl)
-            logger.info("Schema applied to '%s'", config.POSTGRES_DB)
-        finally:
-            await schema_conn.close()
-    else:
-        logger.warning("Schema file not found at %s", _SCHEMA_FILE)
 
 
-async def _apply_schema_if_empty(conn: asyncpg.Connection) -> None:
-    # Check for the "trades" table specifically, not "any tables at all" — a
-    # prior crashed startup can leave stray tables behind (e.g. _apply_migrations
-    # creates ibkr_tokens via CREATE TABLE IF NOT EXISTS before failing on a
-    # later statement), which would otherwise permanently wedge this check into
-    # thinking the schema is already applied when it isn't.
-    has_core_table = await conn.fetchval("SELECT to_regclass('public.trades') IS NOT NULL")
-    if not has_core_table and os.path.exists(_SCHEMA_FILE):
-        logger.warning("Database '%s' is missing the base schema — applying it...", config.POSTGRES_DB)
-        with open(_SCHEMA_FILE) as f:
-            ddl = f.read()
-        await conn.execute(ddl)
-        logger.info("Schema applied to '%s'", config.POSTGRES_DB)
+async def _apply_canonical_schema_if_needed(conn: asyncpg.Connection) -> None:
+    rows = await conn.fetch(
+        """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = ANY($1::text[])
+        """,
+        sorted(REQUIRED_TABLES),
+    )
+    missing = missing_required_tables(row["table_name"] for row in rows)
+    if not missing:
+        return
+
+    logger.warning(
+        "Database '%s' is missing required tables (%s); applying the canonical schema...",
+        config.POSTGRES_DB,
+        ", ".join(missing),
+    )
+    with _schema_file().open(encoding="utf-8") as schema_file:
+        await conn.execute(schema_file.read())
+    logger.info("Schema applied to '%s'", config.POSTGRES_DB)
 
 
 async def _apply_migrations(conn: asyncpg.Connection) -> None:
-    """
-    Idempotent migrations for schema changes added after initial deployment.
-    Safe to run on every startup.
-    """
-    # ibkr_tokens: stores OAuth 2.0 tokens for IBKR Web API (added for hosted deployment)
+    """Apply idempotent compatibility migrations on every startup."""
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS ibkr_tokens (
             id            INTEGER      PRIMARY KEY DEFAULT 1,
@@ -82,13 +104,11 @@ async def _apply_migrations(conn: asyncpg.Connection) -> None:
         )
     """)
 
-    # fidelity_imports.source: distinguish Fidelity vs IBKR history CSV uploads
     await conn.execute("""
         ALTER TABLE fidelity_imports
         ADD COLUMN IF NOT EXISTS source VARCHAR(20) NOT NULL DEFAULT 'fidelity'
     """)
 
-    # instrument_conids: persistent symbol → IBKR contract ID cache
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS instrument_conids (
             symbol       VARCHAR(20) PRIMARY KEY,
@@ -102,9 +122,6 @@ async def _apply_migrations(conn: asyncpg.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_instrument_conids_conid ON instrument_conids(conid)"
     )
 
-    # imported_positions: direct position snapshot from Fidelity/IBKR files.
-    # Stores the exact values from the file so portfolio view doesn't need to
-    # recompute from trades × live prices.
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS imported_positions (
             id               SERIAL PRIMARY KEY,
@@ -127,16 +144,14 @@ async def _apply_migrations(conn: asyncpg.Connection) -> None:
         )
     """)
 
-    # Widen daily_pnl_pct and spy_daily_pct from DECIMAL(10,6) to NUMERIC so
-    # large % swings (first snapshot vs tiny prev_nav) don't overflow the column.
-    for col in ("daily_pnl_pct", "spy_daily_pct"):
+    # NUMERIC avoids overflow when a first snapshot follows a very small NAV.
+    for column in ("daily_pnl_pct", "spy_daily_pct"):
         await conn.execute(f"""
             ALTER TABLE portfolio_snapshots
-            ALTER COLUMN {col} TYPE NUMERIC
+            ALTER COLUMN {column} TYPE NUMERIC
         """)
 
-    # Partial unique indexes for portfolio_snapshots ON CONFLICT upserts.
-    # These must exist for upsert_snapshot to work correctly. Safe to re-run.
+    # Partial indexes make combined and per-account snapshot upserts reliable.
     await conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_snapshots_uq_combined
         ON portfolio_snapshots (snapshot_date)
@@ -149,23 +164,116 @@ async def _apply_migrations(conn: asyncpg.Connection) -> None:
     """)
 
 
+def missing_required_tables(existing_tables: Iterable[str]) -> list[str]:
+    return sorted(REQUIRED_TABLES.difference(existing_tables))
+
+
+async def database_readiness(pool: asyncpg.Pool | None = None) -> dict:
+    """Return a credential-safe connectivity and schema readiness snapshot."""
+    try:
+        active_pool = pool or get_pool()
+    except RuntimeError as exc:
+        return {
+            "ready": False,
+            "connected": False,
+            "schema": "unknown",
+            "missing_tables": [],
+            "error": type(exc).__name__,
+        }
+
+    try:
+        await active_pool.fetchval("SELECT 1")
+        rows = await active_pool.fetch(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name = ANY($1::text[])
+            """,
+            sorted(REQUIRED_TABLES),
+        )
+    except Exception as exc:
+        return {
+            "ready": False,
+            "connected": False,
+            "schema": "unknown",
+            "missing_tables": [],
+            "error": type(exc).__name__,
+        }
+
+    missing = missing_required_tables(row["table_name"] for row in rows)
+    return {
+        "ready": not missing,
+        "connected": True,
+        "schema": "ready" if not missing else "incomplete",
+        "missing_tables": missing,
+    }
+
+
+async def _create_pool_with_retry(pool_kwargs: dict) -> asyncpg.Pool:
+    for attempt in range(1, config.DB_CONNECT_RETRIES + 1):
+        try:
+            try:
+                return await asyncpg.create_pool(**pool_kwargs)
+            except asyncpg.InvalidCatalogNameError:
+                await _ensure_db_exists()
+                return await asyncpg.create_pool(**pool_kwargs)
+        except Exception as exc:
+            if attempt == config.DB_CONNECT_RETRIES:
+                logger.error(
+                    "Database connection failed after %s attempts (%s)",
+                    attempt,
+                    type(exc).__name__,
+                )
+                raise
+            logger.warning(
+                "Database connection attempt %s/%s failed (%s); retrying in %.1fs",
+                attempt,
+                config.DB_CONNECT_RETRIES,
+                type(exc).__name__,
+                config.DB_CONNECT_RETRY_SECONDS,
+            )
+            await asyncio.sleep(config.DB_CONNECT_RETRY_SECONDS)
+
+    raise RuntimeError("Database connection retry loop exited unexpectedly")
+
+
 async def init_pool() -> None:
     global _pool
-    pool_kwargs = {**_pool_kwargs(), "min_size": config.DB_MIN_CONNECTIONS, "max_size": config.DB_MAX_CONNECTIONS}
+    if _pool is not None:
+        return
+
+    pool_kwargs = {
+        **_pool_kwargs(),
+        "min_size": config.DB_MIN_CONNECTIONS,
+        "max_size": config.DB_MAX_CONNECTIONS,
+    }
+    new_pool = await _create_pool_with_retry(pool_kwargs)
     try:
-        _pool = await asyncpg.create_pool(**pool_kwargs)
-    except asyncpg.InvalidCatalogNameError:
-        await _ensure_db_exists()
-        _pool = await asyncpg.create_pool(**pool_kwargs)
-    async with _pool.acquire() as conn:
-        await _apply_schema_if_empty(conn)
-        await _apply_migrations(conn)
+        async with new_pool.acquire() as conn:
+            await _apply_canonical_schema_if_needed(conn)
+            await _apply_migrations(conn)
+        readiness = await database_readiness(new_pool)
+        if not readiness["ready"]:
+            missing = ", ".join(readiness["missing_tables"]) or "unknown"
+            raise RuntimeError(f"Database schema is incomplete; missing tables: {missing}")
+    except Exception:
+        await new_pool.close()
+        raise
+
+    _pool = new_pool
+    logger.info(
+        "PostgreSQL pool ready for database '%s' (%s required tables)",
+        config.POSTGRES_DB,
+        len(REQUIRED_TABLES),
+    )
 
 
 async def close_pool() -> None:
     global _pool
-    if _pool:
-        await _pool.close()
+    active_pool, _pool = _pool, None
+    if active_pool:
+        await active_pool.close()
         logger.info("PostgreSQL pool closed")
 
 

@@ -1,17 +1,17 @@
 import base64 as _b64
 import os
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
-_DATABASE_URL = os.getenv("DATABASE_URL", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-if _DATABASE_URL:
-    _url = _DATABASE_URL.replace("postgres://", "postgresql://", 1)
+if DATABASE_URL:
+    _url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
     _parsed = urlparse(_url)
     DB_HOST = _parsed.hostname or "localhost"
     POSTGRES_PORT = _parsed.port or 5432
-    POSTGRES_DB = (_parsed.path or "/trade_tracker").lstrip("/") or "trade_tracker"
-    POSTGRES_USER = _parsed.username or "postgres"
-    POSTGRES_PASSWORD = _parsed.password or "postgres"
+    POSTGRES_DB = unquote((_parsed.path or "/trade_tracker").lstrip("/")) or "trade_tracker"
+    POSTGRES_USER = unquote(_parsed.username) if _parsed.username else "postgres"
+    POSTGRES_PASSWORD = unquote(_parsed.password) if _parsed.password else "postgres"
 else:
     DB_HOST = os.getenv("DB_HOST", "localhost")
     POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
@@ -19,9 +19,11 @@ else:
     POSTGRES_USER = os.getenv("POSTGRES_USER", "postgres")
     POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "postgres")
 
-DB_SSL = os.getenv("DB_SSL", "require" if _DATABASE_URL else "disable")
+DB_SSL = os.getenv("DB_SSL", "require" if DATABASE_URL else "disable").strip().lower()
 DB_MIN_CONNECTIONS = int(os.getenv("DB_MIN_CONNECTIONS", "2"))
 DB_MAX_CONNECTIONS = int(os.getenv("DB_MAX_CONNECTIONS", "10"))
+DB_CONNECT_RETRIES = max(1, int(os.getenv("DB_CONNECT_RETRIES", "12")))
+DB_CONNECT_RETRY_SECONDS = max(0.0, float(os.getenv("DB_CONNECT_RETRY_SECONDS", "5")))
 
 # ---------------------------------------------------------------------------
 # IBKR OAuth Cloud API (api.ibkr.com) — primary integration

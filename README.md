@@ -4,15 +4,15 @@ Backend infrastructure for DeKalb Capital. Handles live trading-event ingestion
 (quant team) and the equities team's trade-tracker dashboard. Two
 mostly-independent halves share one Postgres instance.
 
-> **⚠️ Status (2026-07-09):** The ingestion service is solid. The **Trade
+> **⚠️ Status (2026-07-21):** The ingestion service is solid. The **Trade
 > Tracker's equities half is largely working now** — Google SSO auth is fully
 > wired and enforced (gated by `AUTH_ENABLED`), IBKR pulls real
 > positions/pricing/trade history, Fidelity CSV import is live via a
-> preview/commit wizard, and the production deploy is in progress (Railway
-> backend is live; Google OAuth + Cloudflare frontend are being finished now).
+> preview/commit wizard, and the production deploy is in progress (the Railway
+> backend is live; feature-branch deployment still needs an end-to-end smoke test).
 > **[`docs/REPO_AUDIT.md`](docs/REPO_AUDIT.md) is the source of truth for
-> what's still outstanding** (schema drift, no automated tests, a couple of
-> approximate metrics) — read it before assuming something is finished, but
+> what's still outstanding** (refresh cadence, route-level coverage, and the
+> hardcoded risk-free rate) — read it before assuming something is finished, but
 > don't assume it's broken either. [`docs/FEATURES.md`](docs/FEATURES.md) has
 > the per-feature status table.
 
@@ -157,20 +157,20 @@ low-priority item in `docs/REPO_AUDIT.md`.)
 ### PostgreSQL — `trade_tracker` database (equities team)
 
 `schemas/trade_tracker_schema.sql` is applied on first boot **and** `db.py`'s
-`_apply_migrations` adds more tables at startup. **The schema file and the real
-schema have drifted** — the file defines only the first four tables below; the
-last three exist *only* as runtime migrations in `db.py`. (Reconciling this is
-an issue in `docs/REPO_AUDIT.md`.)
+idempotent `_apply_migrations` upgrades databases created by older releases.
+The schema file is the canonical definition of all seven application tables;
+the copy bundled under `trade-tracker/api/schemas` is kept byte-for-byte in
+sync for Railway's Docker build context.
 
-| Table | What it holds | Defined in |
-|---|---|---|
-| `trades` | Unified trade ledger | schema file |
-| `portfolio_snapshots` | Daily NAV history for the performance chart | schema file |
-| `fidelity_imports` | Audit log of all uploads | schema file |
-| `cash_flows` | Deposits/withdrawals (intended to be excluded from perf — currently unused) | schema file |
-| `imported_positions` | Current holdings (the portfolio/positions path depends on this) | `db.py` migration |
-| `ibkr_tokens` | OAuth tokens for IBKR Web API | `db.py` migration |
-| `instrument_conids` | Cached symbol → IBKR conid lookups | `db.py` migration |
+| Table | What it holds |
+|---|---|
+| `trades` | Unified trade ledger |
+| `portfolio_snapshots` | Daily NAV history for the performance chart |
+| `fidelity_imports` | Audit log of all uploads |
+| `cash_flows` | Deposits/withdrawals excluded from performance returns |
+| `imported_positions` | Current holdings used by portfolio and factor analysis |
+| `ibkr_tokens` | OAuth tokens for IBKR Web API |
+| `instrument_conids` | Cached symbol-to-IBKR conid lookups |
 
 Note the partial unique indexes on `portfolio_snapshots` for `account_id IS NULL`
 (combined portfolio) vs per-account snapshots.
@@ -286,9 +286,9 @@ A web dashboard for tracking positions, P&L, and portfolio risk analytics.
   otherwise, refreshed automatically in the background.
 
 
-> **Known gaps (tracked in `docs/REPO_AUDIT.md`):** schema drift (three tables
-> only exist as runtime migrations, not in the schema file), no automated
-> tests, `RISK_FREE_RATE_ANNUAL` hardcoded to `0.0`, no token-refresh flow for
+> **Known gaps (tracked in `docs/REPO_AUDIT.md`):** route-level test coverage
+> remains incomplete, `RISK_FREE_RATE_ANNUAL` is hardcoded to `0.0`, and there
+> is no token-refresh flow for
 > Google sign-in (expires ~1h, hard-redirects to `/login` on expiry). Don't
 > assume something's broken just because an older doc said so — check
 > `docs/REPO_AUDIT.md` for the current list.
@@ -353,15 +353,19 @@ Quick commands for checking the live Railway backend without needing the
 frontend deployed yet.
 
 ```bash
-# 1. Basic health + DB connectivity check
+# 1. Deployment readiness (DB connected and all seven tables present)
+curl -f https://<your-railway-domain>/health/ready
+# expect: {"status":"ok","database":"connected","schema":"ready",...}
+
+# 2. Operational health details
 curl https://<your-railway-domain>/health
 # expect: {"status":"ok","database":"connected",...}
 
-# 2. Confirm auth is actually enforced (should reject with no token)
+# 3. Confirm auth is actually enforced (should reject with no token)
 curl https://<your-railway-domain>/trades
 # expect: {"detail":"Not authenticated"} with a 401, if AUTH_ENABLED=true
 
-# 3. Run the dashboard locally against the live Railway backend, instead of
+# 4. Run the dashboard locally against the live Railway backend, instead of
 #    a local Docker stack — useful before the frontend itself is deployed
 cd trade-tracker/frontend
 VITE_API_BASE_URL=https://<your-railway-domain> npm run dev
@@ -425,7 +429,8 @@ Full interactive docs at `/docs` (Swagger UI). Endpoints have no path prefix.
 | Endpoint | What it does |
 |---|---|
 | `GET /health` | Health check (DB, IBKR flag, trade count, latest snapshot) |
-| **Auth** | Registered in `main.py`; `AuthMiddleware` enforces it on every request except `/health`, `/docs`, `/auth/*` when `AUTH_ENABLED=true` |
+| `GET /health/ready` | Railway readiness check; returns 503 unless Postgres and all seven tables are ready |
+| **Auth** | Registered in `main.py`; `AuthMiddleware` enforces it on every request except health/docs and `/auth/*` when `AUTH_ENABLED=true` |
 | `GET /auth/config` | Auth config for the frontend |
 | `POST /auth/verify` | Verify a Google ID token |
 | `GET /auth/me` | Current authenticated user |

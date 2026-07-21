@@ -1,6 +1,6 @@
 # Repo Audit & Roadmap
 
-_Last updated: 2026-06-28_
+_Last updated: 2026-07-21_
 
 Single source of truth for outstanding work across the repo. This is the input
 for Linear — each bullet below is roughly one issue. Projects are the top-level
@@ -13,8 +13,8 @@ triage.
 > dashboard UI fixes, cash-flow tracking, win-rate fix). Most of what used to
 > be "broken" below is now genuinely working — verified by reading the current
 > code, not just taken on faith. What's left is a shorter, more honest list:
-> mostly schema drift, missing automated tests, and a couple of approximate
-> metrics. The production deploy (Railway done; Google OAuth + Cloudflare
+> mostly incomplete route-level coverage and a couple of configuration gaps.
+> The production deploy (Railway done; Google OAuth + Cloudflare
 > Pages in progress) is the active focus as of this update.
 
 ---
@@ -26,8 +26,12 @@ triage.
   quant-team owned. Not the focus of this audit.
 - `docker compose up --build` provisions both Postgres DBs and starts all
   services.
-- Trade Tracker API boots, serves `/health`, `/docs`, and the portfolio / trades
-  / import / market / ibkr endpoints against the `trade_tracker` DB.
+- Trade Tracker API boots, serves `/health`, schema-aware `/health/ready`,
+  `/docs`, and the portfolio / trades / import / market / ibkr endpoints
+  against the `trade_tracker` DB.
+- The canonical Trade Tracker schema defines all seven application tables;
+  compatibility migrations upgrade existing databases and a parity test keeps
+  Railway's bundled schema copy synchronized.
 - **Google SSO auth** — `AuthMiddleware` is registered and `routers/auth.py` is
   included in `main.py`. `AUTH_ENABLED=true` genuinely enforces sign-in,
   restricted to `@<ALLOWED_EMAIL_DOMAIN>`. (Currently set to `false` while
@@ -63,9 +67,6 @@ triage.
 **Still open / worth tracking (the rest of this document):**
 - Google OAuth Cloud Console setup + Cloudflare Pages deploy — in progress,
   not yet smoke-tested end-to-end in production.
-- DB schema has drifted — three tables (`imported_positions`, `ibkr_tokens`,
-  `instrument_conids`) exist only as runtime migrations in `db.py`, not in the
-  schema file.
 - `RISK_FREE_RATE_ANNUAL` still hardcoded to `0.0` in `portfolio_metrics.py`.
 - No token-refresh flow for Google ID tokens (expire ~1h, hard-redirect to
   `/login` on expiry instead of silent re-auth).
@@ -211,13 +212,10 @@ evaluate). Step-by-step docs: `docs/DEPLOY_RAILWAY.md` →
 
 ## Project: Trade Tracker — Data Model & Metrics correctness
 
-- **Schema drift — `imported_positions` / `ibkr_tokens` / `instrument_conids`**
-  — **High, still open.** These three tables exist **only** as runtime
-  migrations in `db.py` (`_apply_migrations`), not in
-  `schemas/trade_tracker_schema.sql`. The entire portfolio/positions path
-  depends on `imported_positions`. Decide the source of truth (fold migrations
-  into the schema file, or adopt a real migration tool) and update the schema
-  file to list the actual 7 tables.
+- **Schema drift — fixed.** `schemas/trade_tracker_schema.sql` is the canonical
+  definition of all seven application tables, including `imported_positions`,
+  `ibkr_tokens`, and `instrument_conids`. The Railway-bundled copy is covered
+  by a parity test; runtime migrations remain only for existing databases.
 - **Cash flow tracking — fixed.** `/portfolio/cash-flows` CRUD + excluded from
   the return calc in `portfolio_metrics.py`.
 - **Make the risk-free rate configurable** — **Medium, still open.**

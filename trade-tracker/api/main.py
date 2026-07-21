@@ -46,7 +46,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
     requests before they ever reach here.
     """
 
-    _BYPASS_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
+    _BYPASS_PATHS = {"/health", "/health/ready", "/docs", "/redoc", "/openapi.json"}
 
     async def dispatch(self, request: Request, call_next):
         if not config.AUTH_ENABLED:
@@ -255,19 +255,13 @@ async def shutdown():
     await db.close_pool()
 
 
-@app.get("/health", tags=["health"])
-async def health():
-    pool = db.get_pool()
-    try:
-        await pool.fetchval("SELECT 1")
-        db_ok = True
-    except Exception:
-        db_ok = False
-
+async def _health_payload() -> dict:
+    database = await db.database_readiness()
     snap_date = None
     trade_count = 0
-    if db_ok:
+    if database["ready"]:
         try:
+            pool = db.get_pool()
             snap_date = await pool.fetchval(
                 "SELECT MAX(snapshot_date) FROM portfolio_snapshots WHERE account_id IS NULL"
             )
@@ -276,11 +270,31 @@ async def health():
             pass
 
     return {
-        "status": "ok" if db_ok else "degraded",
-        "database": "connected" if db_ok else "unreachable",
+        "status": "ok" if database["ready"] else "degraded",
+        "database": "connected" if database["connected"] else "unreachable",
+        "schema": database["schema"],
+        "missing_tables": database["missing_tables"],
         "ibkr": "enabled" if config.IBKR_ENABLED else "disabled",
         "market_data": market_data_service.provider_status(),
         "trades": trade_count,
         "latest_snapshot": str(snap_date) if snap_date else "none",
         "version": "0.1.0",
     }
+
+
+@app.get("/health", tags=["health"])
+async def health():
+    return await _health_payload()
+
+
+@app.get("/health/ready", tags=["health"])
+async def readiness():
+    database = await db.database_readiness()
+    payload = {
+        "status": "ok" if database["ready"] else "degraded",
+        "database": "connected" if database["connected"] else "unreachable",
+        "schema": database["schema"],
+        "missing_tables": database["missing_tables"],
+        "version": "0.1.0",
+    }
+    return JSONResponse(payload, status_code=200 if payload["status"] == "ok" else 503)
