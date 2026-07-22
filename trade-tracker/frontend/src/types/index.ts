@@ -45,7 +45,9 @@ export interface PerformancePoint {
 
 export interface PortfolioMetrics {
   period: string
+  benchmark_symbol: string
   beta: number | null
+  beta_observations: number
   std_dev_annualized: number | null
   sharpe_ratio: number | null
   total_return_pct: number | null
@@ -53,6 +55,28 @@ export interface PortfolioMetrics {
   alpha: number | null
   max_drawdown_pct: number | null
   win_rate: number | null
+  as_of: string
+}
+
+export interface FactorSeries {
+  symbol: string
+  label: string
+  kind: 'portfolio' | 'benchmark' | 'position'
+  portfolio_weight_pct: number | null
+}
+
+export interface FactorAnalysis {
+  period: string
+  start_date: string
+  end_date: string
+  benchmark_symbol: string
+  calculation_method: 'ols_slope'
+  return_frequency: 'daily'
+  beta: number | null
+  beta_observations: number
+  series: FactorSeries[]
+  correlations: (number | null)[][]
+  correlation_observations: number[][]
   as_of: string
 }
 
@@ -145,6 +169,48 @@ export interface IBKRStatus {
   account_id?: string
   positions_count?: number
   message?: string
+}
+
+export interface MarketDataStatus {
+  mode: string
+  active_provider: string
+  provider_order: string[]
+  firstrate_configured: boolean
+  firstrate_path: string | null
+  ibkr_enabled: boolean
+  cache_ttl_seconds: number
+  historical_cache_ttl_seconds: number
+}
+
+export type DashboardModuleStatus = 'active' | 'configured' | 'planned' | 'disabled'
+export type DashboardModuleOwner = 'equities' | 'quant' | 'shared'
+
+export interface DashboardCapability {
+  key: string
+  label: string
+  owner: DashboardModuleOwner
+  status: DashboardModuleStatus
+  description: string
+  endpoints: string[]
+  data_contracts: string[]
+  notes?: string | null
+}
+
+export interface QuantDashboardConfig {
+  compat_enabled: boolean
+  event_source: string
+  postgres_db: string
+  questdb_http_url: string
+  questdb_ilp_host: string
+}
+
+export interface DashboardCompatibilityStatus {
+  schema_version: string
+  dashboard: string
+  generated_at: string
+  modules: DashboardCapability[]
+  extension_points: string[]
+  quant_config: QuantDashboardConfig
 }
 
 export interface IBKRAccount {

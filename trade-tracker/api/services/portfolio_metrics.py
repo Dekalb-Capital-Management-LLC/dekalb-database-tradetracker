@@ -3,7 +3,7 @@ Portfolio metrics calculations.
 
 Provides:
 - NAV-based return series from portfolio_snapshots
-- Beta (portfolio vs SPY) for rolling 12-month and YTD periods
+- Beta (portfolio vs configured benchmark) for supported periods
 - Annualized standard deviation
 - Sharpe ratio (risk-free rate = 0 for simplicity; can be updated)
 - Alpha, max drawdown, win rate
@@ -13,16 +13,28 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import statistics
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
 import asyncpg
 
 import config
-from models.schemas import PerformancePoint, PortfolioMetrics
-from services.market_data import get_historical_bars, get_historical_bars_batch, get_spy_history
+from models.schemas import (
+    FactorAnalysis,
+    FactorSeries,
+    PerformancePoint,
+    PortfolioMetrics,
+    PositionSummary,
+)
+from services.market_data import (
+    get_historical_bars,
+    get_historical_bars_batch,
+    get_spy_history,
+    is_cash_symbol,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,19 +60,98 @@ def _std_dev(values: list[float]) -> float:
     return math.sqrt(_variance(values))
 
 
-def _covariance(x: list[float], y: list[float]) -> float:
-    if len(x) != len(y) or len(x) < 2:
-        return 0.0
-    mx, my = _mean(x), _mean(y)
-    return sum((xi - mx) * (yi - my) for xi, yi in zip(x, y)) / (len(x) - 1)
-
-
 def _beta(portfolio_returns: list[float], benchmark_returns: list[float]) -> Optional[float]:
-    var_bm = _variance(benchmark_returns)
-    if var_bm == 0:
+    """
+    Beta is the regression slope of portfolio returns on benchmark returns.
+
+    This is equivalent to Excel SLOPE(portfolio_returns, benchmark_returns)
+    and to covariance(portfolio, benchmark) / variance(benchmark), but using
+    the standard-library regression helper makes the intended calculation
+    explicit.
+    """
+    if len(portfolio_returns) != len(benchmark_returns) or len(portfolio_returns) < 2:
         return None
-    cov = _covariance(portfolio_returns, benchmark_returns)
-    return cov / var_bm
+    if not all(math.isfinite(value) for value in portfolio_returns + benchmark_returns):
+        return None
+    try:
+        regression = statistics.linear_regression(benchmark_returns, portfolio_returns)
+    except statistics.StatisticsError:
+        return None
+    return regression.slope if math.isfinite(regression.slope) else None
+
+
+def _paired_beta_returns(
+    points: list[PerformancePoint],
+) -> tuple[list[float], list[float]]:
+    """
+    Return date-aligned portfolio/benchmark daily returns for beta.
+
+    Missing benchmark values are common around market holidays or data outages.
+    Pairing values from the same performance point prevents returns from
+    different dates from being regressed against one another.
+    """
+    portfolio_returns: list[float] = []
+    benchmark_returns: list[float] = []
+    for point in points:
+        if point.portfolio_pct_change is None or point.spy_pct_change is None:
+            continue
+        portfolio_return = float(point.portfolio_pct_change) / 100
+        benchmark_return = float(point.spy_pct_change) / 100
+        if not math.isfinite(portfolio_return) or not math.isfinite(benchmark_return):
+            continue
+        portfolio_returns.append(portfolio_return)
+        benchmark_returns.append(benchmark_return)
+    return portfolio_returns, benchmark_returns
+
+
+def _daily_returns_by_date(bars, start: date, end: date) -> dict[date, float]:
+    """Convert sorted close bars into finite decimal returns keyed by trading date."""
+    returns: dict[date, float] = {}
+    previous_close: Optional[float] = None
+    for bar in sorted(bars, key=lambda item: item.date):
+        close = float(bar.close)
+        if not math.isfinite(close) or close <= 0:
+            continue
+        if previous_close is not None and start <= bar.date <= end:
+            value = close / previous_close - 1
+            if math.isfinite(value):
+                returns[bar.date] = value
+        previous_close = close
+    return returns
+
+
+def _portfolio_returns_by_date(points: list[PerformancePoint]) -> dict[date, float]:
+    returns: dict[date, float] = {}
+    for point in points:
+        if point.portfolio_pct_change is None:
+            continue
+        value = float(point.portfolio_pct_change) / 100
+        if math.isfinite(value):
+            returns[point.date] = value
+    return returns
+
+
+def _paired_series(
+    left: dict[date, float],
+    right: dict[date, float],
+) -> tuple[list[float], list[float]]:
+    dates = sorted(left.keys() & right.keys())
+    return [left[item] for item in dates], [right[item] for item in dates]
+
+
+def _correlation(
+    left: dict[date, float],
+    right: dict[date, float],
+) -> tuple[Optional[float], int]:
+    left_values, right_values = _paired_series(left, right)
+    observations = len(left_values)
+    if observations < 2:
+        return None, observations
+    try:
+        value = statistics.correlation(left_values, right_values)
+    except statistics.StatisticsError:
+        return None, observations
+    return (value if math.isfinite(value) else None), observations
 
 
 def _max_drawdown(nav_series: list[float]) -> float:
@@ -185,12 +276,13 @@ async def upsert_snapshot(
 ) -> None:
     """
     Upsert a portfolio NAV snapshot.
-    Also fetches SPY close for the date and stores it for overlay calculations.
+    Also fetches the benchmark close and stores it in the legacy spy_* columns.
     """
-    from services.market_data import get_historical_bars
-
-    # Get SPY data for this date
-    spy_bars = get_historical_bars("SPY", snapshot_date, snapshot_date)
+    benchmark_symbol = config.BENCHMARK_SYMBOL
+    # get_historical_bars can fall back to a blocking IBKR request; keep it off
+    # the event loop so a slow/degraded IBKR session doesn't stall every other
+    # concurrent request while this snapshot job (run every 5 min) is waiting.
+    spy_bars = await asyncio.to_thread(get_historical_bars, benchmark_symbol, snapshot_date, snapshot_date)
     spy_close = Decimal(str(spy_bars[0].close)) if spy_bars else None
 
     daily_pnl: Optional[Decimal] = None
@@ -202,11 +294,12 @@ async def upsert_snapshot(
         daily_pnl = total_nav - prev_nav - net_flow
         daily_pnl_pct = (daily_pnl / prev_nav * 100).quantize(Decimal("0.000001"))
 
-    # Fetch previous SPY close to calculate daily pct
+    # Fetch the previous benchmark close to calculate its daily return.
     spy_daily_pct: Optional[Decimal] = None
     if spy_close:
-        prev_spy_bars = get_historical_bars(
-            "SPY",
+        prev_spy_bars = await asyncio.to_thread(
+            get_historical_bars,
+            benchmark_symbol,
             snapshot_date - timedelta(days=5),  # look back enough to find last trading day
             snapshot_date - timedelta(days=1),
         )
@@ -892,7 +985,9 @@ def _period_bounds(period: str) -> tuple[date, date]:
 
 def _blank_metrics(period: str) -> PortfolioMetrics:
     return PortfolioMetrics(
-        period=period, beta=None, std_dev_annualized=None, sharpe_ratio=None,
+        period=period, benchmark_symbol=config.BENCHMARK_SYMBOL,
+        beta=None, beta_observations=0,
+        std_dev_annualized=None, sharpe_ratio=None,
         total_return_pct=None, spy_return_pct=None, alpha=None,
         max_drawdown_pct=None, win_rate=None, as_of=datetime.utcnow(),
     )
@@ -906,7 +1001,7 @@ async def _metrics_from_points(
 ) -> PortfolioMetrics:
     """
     Compute the full metric set (beta, std dev, sharpe, alpha, max drawdown,
-    win rate, total/SPY return) from a day-by-day PerformancePoint series —
+    win rate, and total/benchmark return from a PerformancePoint series —
     the same series the performance graph already builds via IBKR-live or
     trade replay. Shared by both fallbacks below so "the graph has the data,
     why are the other numbers blank" isn't true anymore once there's enough
@@ -916,12 +1011,16 @@ async def _metrics_from_points(
         return _blank_metrics(period)
 
     start, end = _period_bounds(period)
-    port_daily = [float(p.portfolio_pct_change) / 100 for p in points if p.portfolio_pct_change is not None]
-    spy_daily = [float(p.spy_pct_change) / 100 for p in points if p.spy_pct_change is not None]
+    port_daily = [
+        float(point.portfolio_pct_change) / 100
+        for point in points
+        if point.portfolio_pct_change is not None
+    ]
     nav_series = [float(p.portfolio_nav) for p in points]
 
-    min_len = min(len(port_daily), len(spy_daily))
-    beta_val = _beta(port_daily[:min_len], spy_daily[:min_len])
+    paired_portfolio_returns, paired_benchmark_returns = _paired_beta_returns(points)
+    beta_val = _beta(paired_portfolio_returns, paired_benchmark_returns)
+
 
     std_dev_daily = _std_dev(port_daily)
     std_dev_annual = std_dev_daily * math.sqrt(252) * 100 if std_dev_daily else None
@@ -949,7 +1048,9 @@ async def _metrics_from_points(
 
     return PortfolioMetrics(
         period=period,
+        benchmark_symbol=config.BENCHMARK_SYMBOL,
         beta=_dec(beta_val),
+        beta_observations=len(paired_portfolio_returns),
         std_dev_annualized=_dec(std_dev_annual),
         sharpe_ratio=_dec(sharpe),
         total_return_pct=_dec(total_return),
@@ -973,6 +1074,129 @@ async def calculate_metrics(
     if points:
         return await _metrics_from_points(pool, account_id, period, points)
     return _blank_metrics(period)
+
+
+async def calculate_factor_analysis(
+    pool: asyncpg.Pool,
+    period: str,
+    account_id: Optional[str],
+    positions: list[PositionSummary],
+    benchmark_symbol: str,
+    max_positions: int = 6,
+) -> FactorAnalysis:
+    """Build a dashboard-ready beta and pairwise daily-return correlation contract."""
+    start, end = _period_bounds(period)
+    benchmark = benchmark_symbol.upper().strip()
+    max_positions = max(1, min(max_positions, 10))
+
+    points = await get_performance_series(pool, start, end, account_id, period=period)
+    portfolio_returns = _portfolio_returns_by_date(points)
+
+    exposure_by_symbol: dict[str, float] = defaultdict(float)
+    for position in positions:
+        symbol = position.symbol.upper().strip().rstrip("*")
+        if not symbol or " " in symbol or is_cash_symbol(symbol):
+            continue
+        market_value = position.market_value
+        if market_value is None and position.current_price is not None:
+            market_value = position.quantity * position.current_price
+        if market_value is None:
+            continue
+        value = float(market_value)
+        if math.isfinite(value) and value != 0:
+            exposure_by_symbol[symbol] += value
+
+    ranked_symbols = sorted(
+        exposure_by_symbol,
+        key=lambda symbol: abs(exposure_by_symbol[symbol]),
+        reverse=True,
+    )[:max_positions]
+    gross_exposure = sum(abs(value) for value in exposure_by_symbol.values())
+
+    requested_symbols = list(dict.fromkeys([benchmark, *ranked_symbols]))
+    history_start = start - timedelta(days=14)
+    batch = await asyncio.to_thread(
+        get_historical_bars_batch,
+        requested_symbols,
+        history_start,
+        end,
+    )
+    returns_by_symbol = {
+        symbol: _daily_returns_by_date(batch.get(symbol, []), start, end)
+        for symbol in requested_symbols
+    }
+
+    def _weight(symbol: str) -> Optional[Decimal]:
+        if not gross_exposure or symbol not in exposure_by_symbol:
+            return None
+        value = exposure_by_symbol[symbol] / gross_exposure * 100
+        return Decimal(str(round(value, 2)))
+
+    series = [
+        FactorSeries(
+            symbol="PORTFOLIO",
+            label="Portfolio",
+            kind="portfolio",
+            portfolio_weight_pct=Decimal("100"),
+        ),
+        FactorSeries(
+            symbol=benchmark,
+            label=benchmark,
+            kind="benchmark",
+            portfolio_weight_pct=_weight(benchmark),
+        ),
+    ]
+    series.extend(
+        FactorSeries(
+            symbol=symbol,
+            label=symbol,
+            kind="position",
+            portfolio_weight_pct=_weight(symbol),
+        )
+        for symbol in ranked_symbols
+        if symbol != benchmark
+    )
+
+    return_series: dict[str, dict[date, float]] = {
+        "PORTFOLIO": portfolio_returns,
+        **returns_by_symbol,
+    }
+    correlations: list[list[Optional[Decimal]]] = []
+    correlation_observations: list[list[int]] = []
+    for row in series:
+        correlation_row: list[Optional[Decimal]] = []
+        observation_row: list[int] = []
+        for column in series:
+            value, observations = _correlation(
+                return_series.get(row.symbol, {}),
+                return_series.get(column.symbol, {}),
+            )
+            correlation_row.append(
+                Decimal(str(round(value, 4))) if value is not None else None
+            )
+            observation_row.append(observations)
+        correlations.append(correlation_row)
+        correlation_observations.append(observation_row)
+
+    paired_portfolio, paired_benchmark = _paired_series(
+        portfolio_returns,
+        returns_by_symbol.get(benchmark, {}),
+    )
+    beta_value = _beta(paired_portfolio, paired_benchmark)
+
+    return FactorAnalysis(
+        period=period,
+        start_date=start,
+        end_date=end,
+        benchmark_symbol=benchmark,
+        beta=(Decimal(str(round(beta_value, 4))) if beta_value is not None else None),
+        beta_observations=len(paired_portfolio),
+        series=series,
+        correlations=correlations,
+        correlation_observations=correlation_observations,
+        as_of=datetime.now(timezone.utc),
+    )
+
 
 
 async def _calculate_win_rate(

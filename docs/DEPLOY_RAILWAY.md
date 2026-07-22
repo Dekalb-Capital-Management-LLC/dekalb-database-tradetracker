@@ -16,7 +16,8 @@ Source of truth for env vars is `config.py` (always `os.getenv`).
   fails with `"requirements.txt": not found` — that's the exact failure we hit
   the first time through this.
 - `railway.toml` (already in that directory) tells Railway to use the
-  Dockerfile build and the `/health` healthcheck — nothing to configure here.
+  Dockerfile build and the database-aware `/health/ready` healthcheck —
+  nothing to configure here.
 
 ## 2. Add Postgres
 
@@ -43,8 +44,20 @@ Post-deploy, all green) and not "no active deployment":
 - Name: `DATABASE_URL`. Value: type `${{` and pick `Postgres` → `DATABASE_URL`
   from the autocomplete. This creates a live reference (`${{Postgres.DATABASE_URL}}`),
   not a copy-pasted secret — it survives password rotation.
-- `config.py` parses `DATABASE_URL` and turns on `DB_SSL=require` automatically
-  when it's set — no separate `DB_SSL` var needed for Railway's own Postgres.
+- The API passes this DSN directly to `asyncpg`, preserving URL-escaped
+  credentials and Railway connection parameters. It turns on
+  `DB_SSL=require` automatically, so no separate `DB_SSL` variable is needed
+  for Railway's Postgres template.
+- Startup makes up to 12 database connection attempts with five seconds
+  between failures, then applies the canonical seven-table schema or
+  idempotently upgrades an existing database. Override this only when needed with
+  `DB_CONNECT_RETRIES` and `DB_CONNECT_RETRY_SECONDS`.
+
+The Trade Tracker owns the seven tables in the connected database's `public`
+schema. Keep its `DATABASE_URL` pointed at the equities Postgres service (or a
+dedicated equities database). The `QUANT_*` variables advertise future
+dashboard contracts; they do not make this API write into the quant division's
+`trading` database.
 
 ## 4. Set the remaining env vars
 
@@ -71,11 +84,17 @@ Post-deploy, all green) and not "no active deployment":
 ## 6. Verify
 
 ```
-curl https://<your-railway-domain>/health
+curl -f https://<your-railway-domain>/health/ready
 ```
 
-Expect `{"status": "ok", "database": "connected", ...}`. If `"database"` says
-`"unreachable"`, re-check step 3 (the `DATABASE_URL` reference).
+Expect `{"status": "ok", "database": "connected", "schema": "ready", ...}`.
+Railway uses this endpoint as the deployment gate and receives a 503 while the
+database is unreachable or any required table is missing. `/health` returns
+the same diagnostics with HTTP 200 for operational inspection.
+
+If `"database"` says `"unreachable"`, re-check step 3 (the `DATABASE_URL`
+reference). If `"schema"` says `"incomplete"`, inspect `missing_tables` and the
+API startup logs; do not route production traffic until it reports `"ready"`.
 
 ## 7. Test on a branch before touching `main`
 

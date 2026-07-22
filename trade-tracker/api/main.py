@@ -15,10 +15,13 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
-import config, db
+
+import config
+import db
 from routers import auth as auth_router
-from routers import ibkr, imports, market, portfolio, trades
+from routers import dashboard, ibkr, imports, market, portfolio, trades
 from routers.ibkr import sync_ibkr_trades
+from services import market_data as market_data_service
 from services.auth import AuthError, verify_google_id_token
 from services.ibkr_client import ibkr_client
 
@@ -43,7 +46,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
     requests before they ever reach here.
     """
 
-    _BYPASS_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
+    _BYPASS_PATHS = {"/health", "/health/ready", "/docs", "/redoc", "/openapi.json"}
 
     async def dispatch(self, request: Request, call_next):
         if not config.AUTH_ENABLED:
@@ -96,11 +99,13 @@ app.include_router(portfolio.router)
 app.include_router(trades.router)
 app.include_router(imports.router)
 app.include_router(market.router)
+app.include_router(dashboard.router)
 app.include_router(ibkr.router)
 
 
 async def _auto_refresh_loop():
-    """Refresh yfinance prices + write snapshot every 5 minutes for non-IBKR imported positions."""
+    """Refresh provider prices and write snapshots for non-IBKR positions."""
+
     from decimal import Decimal
     from services import market_data
     from services.portfolio_metrics import upsert_snapshot
@@ -117,21 +122,14 @@ async def _auto_refresh_loop():
             )
             if rows:
                 symbols = list({r["symbol"] for r in rows})
-                prices: dict[str, float] = {}
-                cash_syms = {s for s in symbols if market_data.is_cash_symbol(s)}
-                market_syms = [s for s in symbols if s not in cash_syms]
-                for s in cash_syms:
-                    prices[s] = 1.0
-                if market_syms:
-                    await market_data.warm_yfinance_quote_cache(pool, market_syms)
-                    for sym in market_syms:
-                        quote = await market_data.get_yfinance_quote(pool, sym)
-                        if quote and quote.price > 0:
-                            prices[sym] = float(quote.price)
+                prices, price_errors = await market_data.get_latest_prices(pool, symbols)
+                if price_errors:
+                    logger.warning("Auto-refresh price errors: %s", price_errors[:5])
 
                 updated = 0
                 for r in rows:
-                    price = prices.get(r["symbol"])
+                    symbol = r["symbol"].upper()
+                    price = prices.get(symbol)
                     if price is None:
                         continue
                     qty = float(r["quantity"] or 0)
@@ -151,7 +149,7 @@ async def _auto_refresh_loop():
                         total_gl,
                         total_gl_pct,
                         r["account_id"],
-                        r["symbol"],
+                        symbol,
                     )
                     updated += 1
 
@@ -209,6 +207,19 @@ async def _auto_refresh_loop():
         await asyncio.sleep(INTERVAL)
 
 
+async def _ibkr_keepalive_loop():
+    """Keep the IBKR OAuth session alive; see IBKRClient.ensure_session for why."""
+    INTERVAL = 60
+    while True:
+        await asyncio.sleep(INTERVAL)
+        try:
+            healthy = await ibkr_client.ensure_session()
+            if not healthy:
+                logger.warning("IBKR keepalive: session unhealthy, will retry in %ss", INTERVAL)
+        except Exception as exc:
+            logger.warning("IBKR keepalive error: %s", exc)
+
+
 @app.on_event("startup")
 async def startup():
     await db.init_pool()
@@ -227,6 +238,7 @@ async def startup():
             )
             if ok:
                 asyncio.create_task(_startup_ibkr_trade_sync())
+            asyncio.create_task(_ibkr_keepalive_loop())
         else:
             logger.info(
                 "IBKR ENABLED — gateway at %s (account: %s)",
@@ -234,7 +246,7 @@ async def startup():
                 config.IBKR_ACCOUNT_ID,
             )
     else:
-        logger.warning("IBKR disabled — yfinance fallback for market data.")
+        logger.warning("IBKR disabled — market data will use FirstRateData if configured, then yfinance.")
 
 
 async def _startup_ibkr_trade_sync() -> None:
@@ -257,19 +269,13 @@ async def shutdown():
     await db.close_pool()
 
 
-@app.get("/health", tags=["health"])
-async def health():
-    pool = db.get_pool()
-    try:
-        await pool.fetchval("SELECT 1")
-        db_ok = True
-    except Exception:
-        db_ok = False
-
+async def _health_payload() -> dict:
+    database = await db.database_readiness()
     snap_date = None
     trade_count = 0
-    if db_ok:
+    if database["ready"]:
         try:
+            pool = db.get_pool()
             snap_date = await pool.fetchval(
                 "SELECT MAX(snapshot_date) FROM portfolio_snapshots WHERE account_id IS NULL"
             )
@@ -278,10 +284,31 @@ async def health():
             pass
 
     return {
-        "status": "ok" if db_ok else "degraded",
-        "database": "connected" if db_ok else "unreachable",
-        "ibkr": "enabled" if config.IBKR_ENABLED else "disabled (yfinance fallback)",
+        "status": "ok" if database["ready"] else "degraded",
+        "database": "connected" if database["connected"] else "unreachable",
+        "schema": database["schema"],
+        "missing_tables": database["missing_tables"],
+        "ibkr": "enabled" if config.IBKR_ENABLED else "disabled",
+        "market_data": market_data_service.provider_status(),
         "trades": trade_count,
         "latest_snapshot": str(snap_date) if snap_date else "none",
         "version": "0.1.0",
     }
+
+
+@app.get("/health", tags=["health"])
+async def health():
+    return await _health_payload()
+
+
+@app.get("/health/ready", tags=["health"])
+async def readiness():
+    database = await db.database_readiness()
+    payload = {
+        "status": "ok" if database["ready"] else "degraded",
+        "database": "connected" if database["connected"] else "unreachable",
+        "schema": database["schema"],
+        "missing_tables": database["missing_tables"],
+        "version": "0.1.0",
+    }
+    return JSONResponse(payload, status_code=200 if payload["status"] == "ok" else 503)

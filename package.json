@@ -1,0 +1,10 @@
+{
+  "name": "dekalb-database-tradetracker",
+  "private": true,
+  "scripts": {
+    "build": "node build-frontend.mjs",
+    "build:ci": "node build-frontend.mjs --clean",
+    "deploy": "wrangler deploy",
+    "deploy:preview": "wrangler versions upload"
+  }
+}

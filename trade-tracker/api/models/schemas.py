@@ -111,21 +111,45 @@ class PerformancePoint(BaseModel):
     date: date
     portfolio_nav: Decimal
     portfolio_pct_change: Optional[Decimal]   # daily % return
-    spy_pct_change: Optional[Decimal]         # SPY daily % return (for overlay)
-    spy_cumulative_pct: Optional[Decimal]     # cumulative SPY return from period start
+    spy_pct_change: Optional[Decimal]         # benchmark daily % return (legacy field name)
+    spy_cumulative_pct: Optional[Decimal]     # benchmark cumulative return (legacy field name)
     portfolio_cumulative_pct: Optional[Decimal]
 
 
 class PortfolioMetrics(BaseModel):
     period: str                               # e.g. 'ytd', '1y', '3m'
-    beta: Optional[Decimal]                   # vs SPY
+    benchmark_symbol: str
+    beta: Optional[Decimal]                   # OLS slope vs benchmark
+    beta_observations: int                    # paired daily returns used by regression
     std_dev_annualized: Optional[Decimal]     # annualized daily std dev
     sharpe_ratio: Optional[Decimal]           # simplified: (return - rf) / std_dev
     total_return_pct: Optional[Decimal]
     spy_return_pct: Optional[Decimal]         # benchmark return over same period
-    alpha: Optional[Decimal]                  # portfolio return - beta * spy return
+    alpha: Optional[Decimal]                  # portfolio return - beta * benchmark return
     max_drawdown_pct: Optional[Decimal]
     win_rate: Optional[Decimal]               # % of trades that were profitable
+    as_of: datetime
+
+
+class FactorSeries(BaseModel):
+    symbol: str
+    label: str
+    kind: Literal["portfolio", "benchmark", "position"]
+    portfolio_weight_pct: Optional[Decimal] = None
+
+
+class FactorAnalysis(BaseModel):
+    period: str
+    start_date: date
+    end_date: date
+    benchmark_symbol: str
+    calculation_method: Literal["ols_slope"] = "ols_slope"
+    return_frequency: Literal["daily"] = "daily"
+    beta: Optional[Decimal]
+    beta_observations: int
+    series: list[FactorSeries]
+    correlations: list[list[Optional[Decimal]]]
+    correlation_observations: list[list[int]]
     as_of: datetime
 
 
@@ -168,6 +192,42 @@ class HistoricalBar(BaseModel):
     low: Decimal
     close: Decimal
     volume: int
+
+
+# ---------------------------------------------------------------------------
+# Dashboard compatibility models
+# ---------------------------------------------------------------------------
+
+DashboardModuleStatus = Literal["active", "configured", "planned", "disabled"]
+DashboardModuleOwner = Literal["equities", "quant", "shared"]
+
+
+class DashboardCapability(BaseModel):
+    key: str
+    label: str
+    owner: DashboardModuleOwner
+    status: DashboardModuleStatus
+    description: str
+    endpoints: list[str] = Field(default_factory=list)
+    data_contracts: list[str] = Field(default_factory=list)
+    notes: Optional[str] = None
+
+
+class QuantDashboardConfig(BaseModel):
+    compat_enabled: bool
+    event_source: str
+    postgres_db: str
+    questdb_http_url: str
+    questdb_ilp_host: str
+
+
+class DashboardCompatibilityResponse(BaseModel):
+    schema_version: str
+    dashboard: str
+    generated_at: datetime
+    modules: list[DashboardCapability]
+    extension_points: list[str] = Field(default_factory=list)
+    quant_config: QuantDashboardConfig
 
 
 # ---------------------------------------------------------------------------

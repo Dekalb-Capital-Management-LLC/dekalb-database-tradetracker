@@ -1,6 +1,6 @@
 # Repo Audit & Roadmap
 
-_Last updated: 2026-07-20_
+_Last updated: 2026-07-21_
 
 Single source of truth for outstanding work across the repo. This is the input
 for Linear — each bullet below is roughly one issue. Projects are the top-level
@@ -31,8 +31,12 @@ triage.
   quant-team owned. Not the focus of this audit.
 - `docker compose up --build` provisions both Postgres DBs and starts all
   services.
-- Trade Tracker API boots, serves `/health`, `/docs`, and the portfolio / trades
-  / import / market / ibkr endpoints against the `trade_tracker` DB.
+- Trade Tracker API boots, serves `/health`, schema-aware `/health/ready`,
+  `/docs`, and the portfolio / trades / import / market / ibkr endpoints
+  against the `trade_tracker` DB.
+- The canonical Trade Tracker schema defines all seven application tables;
+  compatibility migrations upgrade existing databases and a parity test keeps
+  Railway's bundled schema copy synchronized.
 - **Google SSO auth** — `AuthMiddleware` is registered and `routers/auth.py` is
   included in `main.py`. `AUTH_ENABLED=true` in production, genuinely
   enforcing sign-in restricted to `@<ALLOWED_EMAIL_DOMAIN>` — verified live,
@@ -41,7 +45,8 @@ triage.
   real positions, live pricing, and trade history. `services/ibkr_client.py`
   has retry logic for IBKR's first-call-empty quirk, a `portfolio2` fallback,
   US-listed conid disambiguation, and 429-rate-limit backoff. `market_data.py`
-  routes quotes/history through IBKR first, yfinance as fallback.
+  now prefers FirstRateData when `FIRST_RATE_DATA_PATH` is configured, then
+  routes through IBKR and yfinance fallback.
 - **Fidelity CSV import** — real Fidelity Activity and Portfolio Positions CSV
   exports parse correctly (`services/fidelity_parser.py`), via a
   preview/diff/commit wizard (`/import/preview` → `/import/commit`,
@@ -54,8 +59,8 @@ triage.
   "positive cash proceeds" approximation that read ~100% unconditionally.
 - Dashboard header/theme is consistent (no more invisible white-on-light
   text or mixed dark-theme classes); Sign-out button is wired to `signOut()`.
-- yfinance price fetching + in-process auto-refresh loop (every 5 min) writing
-  NAV snapshots.
+- Shared market-data price fetching + in-process auto-refresh loop (every 5 min)
+  writing NAV snapshots.
 - A custom XLSX portfolio upload (`Ticker | Date Acquired | Amount | Price
   Acquired`) still works as a secondary import path for the single
   `PORTFOLIO` account (`/import/trades`, legacy — the live UI uses the CSV

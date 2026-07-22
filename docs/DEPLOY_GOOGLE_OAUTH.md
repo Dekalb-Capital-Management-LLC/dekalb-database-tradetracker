@@ -12,8 +12,8 @@ can reach the URL.
 ## How enforcement works (already implemented in code)
 
 - `trade-tracker/api/main.py` has an `AuthMiddleware` that runs on every
-  request when `AUTH_ENABLED=true`, except `/health`, `/docs`, `/redoc`,
-  `/openapi.json`, and `/auth/*`.
+  request when `AUTH_ENABLED=true`, except `/health`, `/health/ready`, `/docs`,
+  `/redoc`, `/openapi.json`, and `/auth/*`.
 - It reads the `Authorization: Bearer <id_token>` header, verifies the token
   against Google's JWKS (`services/auth.py`), checks the issuer is Google,
   and checks the email's domain (`hd` claim or `@domain` suffix) matches
@@ -97,9 +97,9 @@ Redeploy after setting these.
 - Sign in with a `@dekalbcapitalmanagement.com` Google account → should
   succeed, `/auth/me` should return your email/name.
 - Try a personal Gmail (or any non-domain) account → should be rejected.
-- Confirm `/health`, `/docs`, `/redoc` are still reachable **without** signing
-  in (they're intentionally bypassed — schema/health info only, no trade
-  data).
+- Confirm `/health`, `/health/ready`, `/docs`, `/redoc` are still reachable
+  **without** signing in (they're intentionally bypassed — schema/health info
+  only, no trade data).
 - Confirm a protected endpoint (e.g. `/trades`) returns `401` with no token.
 
 If you'd rather lock down `/docs` and `/redoc` too instead of leaving them

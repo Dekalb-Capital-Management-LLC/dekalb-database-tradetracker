@@ -149,7 +149,7 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
       # IBKR Web API (RSA key-based, server-to-server — no login page)
-      # Values come from your .env file. Defaults to disabled (yfinance fallback).
+      # Values come from your .env file. Defaults to disabled (market-data fallback).
       - IBKR_ENABLED=${IBKR_ENABLED:-false}
       - IBKR_CLIENT_ID=${IBKR_CLIENT_ID:-}
       - IBKR_CLIENT_KEY_ID=${IBKR_CLIENT_KEY_ID:-}
@@ -158,6 +158,16 @@ services:
       - IBKR_SERVER_IP=${IBKR_SERVER_IP:-}
       - IBKR_PRIVATE_KEY=${IBKR_PRIVATE_KEY:-}
       - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
+      - MARKET_DATA_PROVIDER=${MARKET_DATA_PROVIDER:-auto}
+      - FIRST_RATE_DATA_PATH=${FIRST_RATE_DATA_PATH:-}
+      - FIRST_RATE_DATA_DOWNLOAD_URL=${FIRST_RATE_DATA_DOWNLOAD_URL:-}
+      - FIRST_RATE_DATA_API_KEY=${FIRST_RATE_DATA_API_KEY:-}
+      - FIRST_RATE_DATA_TIMEOUT_SECONDS=${FIRST_RATE_DATA_TIMEOUT_SECONDS:-120}
+      - QUANT_DASHBOARD_COMPAT_ENABLED=${QUANT_DASHBOARD_COMPAT_ENABLED:-false}
+      - QUANT_POSTGRES_DB=${QUANT_POSTGRES_DB:-trading}
+      - QUANT_QUESTDB_HTTP_URL=${QUANT_QUESTDB_HTTP_URL:-http://questdb:9000}
+      - QUANT_QUESTDB_ILP_HOST=${QUANT_QUESTDB_ILP_HOST:-questdb}
+      - QUANT_EVENT_SOURCE=${QUANT_EVENT_SOURCE:-ingestion-service}
       # Tune as needed
       - PRICE_CACHE_TTL_SECONDS=60
       - DEBUG=false

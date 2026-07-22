@@ -170,6 +170,8 @@ class IBKRClient:
 
         self._last_account_nav: Optional[float] = None
 
+        self._session_healthy: bool = False
+
 
 
     @property
@@ -182,7 +184,7 @@ class IBKRClient:
 
         if self.use_oauth:
 
-            return bool(self._oauth_headers)
+            return bool(self._oauth_headers) and self._session_healthy
 
         return self.auth_status() is not None
 
@@ -208,13 +210,15 @@ class IBKRClient:
 
 
 
-        pk = config.IBKR_PRIVATE_KEY.replace("\\n", "\n")
+        if self._key_path is None:
 
-        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as f:
+            pk = config.IBKR_PRIVATE_KEY.replace("\\n", "\n")
 
-            f.write(pk)
+            with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as f:
 
-            self._key_path = f.name
+                f.write(pk)
+
+                self._key_path = f.name
 
 
 
@@ -257,6 +261,8 @@ class IBKRClient:
         self._validate_account_ids()
 
         self._bootstrap_iserver()
+
+        self._session_healthy = True
 
         return True
 
@@ -327,13 +333,109 @@ class IBKRClient:
         except Exception as exc:
             logger.warning("IBKR iserver bootstrap failed (non-fatal): %s", exc)
 
-    def tickle(self) -> None:
+    def tickle(self) -> Optional[dict]:
 
         data = self._get("/v1/api/tickle")
 
         if data:
 
             logger.debug("IBKR tickle OK")
+
+        return data
+
+
+
+    @staticmethod
+
+    def _tickle_authenticated(tickle_data: Optional[dict]) -> bool:
+
+        if not tickle_data:
+
+            return False
+
+        auth_status = (tickle_data.get("iserver") or {}).get("authStatus") or {}
+
+        return bool(auth_status.get("authenticated"))
+
+
+
+    async def ensure_session(self) -> bool:
+
+        """
+
+        Keep-alive + self-heal for the IBKR OAuth session, called on a loop
+
+        from main.py. IBKR's iserver session dies after roughly a minute of
+
+        inactivity (a plain /tickle every 60s prevents that), and the
+
+        SSO/bearer session can also expire outright and need a fresh OAuth
+
+        handshake. Previously nothing did either after the one-time startup
+
+        handshake, so a session that died mid-day stayed dead — every
+
+        IBKR-backed request would silently fail — until someone redeployed
+
+        and re-ran the startup handshake. Escalates tickle -> reauthenticate
+
+        -> full reconnect so it heals on its own instead.
+
+        """
+
+        if not self.enabled or not self.use_oauth:
+
+            return False
+
+
+
+        if not self._oauth_headers:
+
+            return await self._reconnect()
+
+
+
+        if self._tickle_authenticated(self.tickle()):
+
+            self._session_healthy = True
+
+            return True
+
+
+
+        logger.warning("IBKR session not authenticated — attempting reauthenticate")
+
+        self.reauthenticate()
+
+        if self._tickle_authenticated(self.tickle()):
+
+            self._session_healthy = True
+
+            return True
+
+
+
+        logger.warning("IBKR reauthenticate did not restore the session — reconnecting")
+
+        return await self._reconnect()
+
+
+
+    async def _reconnect(self) -> bool:
+
+        self._oauth_headers = {}
+
+        self._session_healthy = False
+
+        try:
+
+            return await self.connect_oauth()
+
+        except Exception as exc:
+
+            logger.error("IBKR reconnect failed: %s", exc)
+
+            return False
 
 
 

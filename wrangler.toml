@@ -1,0 +1,9 @@
+name = "dekalb-database-tradetracker"
+compatibility_date = "2026-07-05"
+
+[build]
+command = "node build-frontend.mjs"
+
+[assets]
+directory = "./trade-tracker/frontend/dist"
+not_found_handling = "single-page-application"

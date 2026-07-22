@@ -1,9 +1,12 @@
 import { useState, useEffect, useCallback, type ReactNode } from 'react'
-import { Search, Construction, RefreshCw, Settings, Bell, LogOut, User, Wallet } from 'lucide-react'
+import { Search, Construction, Database, RefreshCw, Settings, Bell, LogOut, User, Wallet } from 'lucide-react'
+
 import type {
   AccountSummary,
+  DashboardCompatibilityStatus,
   IBKRAccount,
   IBKRStatus,
+  MarketDataStatus,
   PerformancePoint,
   Period,
   PortfolioMetrics,
@@ -17,6 +20,8 @@ import PerformanceChart from '../components/PerformanceChart'
 import PositionsTable from '../components/PositionsTable'
 import FidelityUpdateWizard from '../components/FidelityUpdateWizard'
 import CashFlowModal from '../components/CashFlowModal'
+import FactorAnalysisPanel from '../components/FactorAnalysisPanel'
+import ErrorBoundary from '../components/ErrorBoundary'
 import Trades from './Trades'
 
 const FIDELITY_WIZARD_SESSION_KEY = 'fidelity_wizard_prompted'
@@ -64,6 +69,31 @@ function fmtNum(n: number | null | undefined, decimals = 2, suffix = '') {
   return `${Number(n).toFixed(decimals)}${suffix}`
 }
 
+function marketProviderLabel(provider: string | null | undefined) {
+  switch ((provider ?? '').toLowerCase()) {
+    case 'firstrate':
+      return 'FirstRateData'
+    case 'ibkr':
+      return 'IBKR'
+    case 'yfinance':
+      return 'yfinance'
+    default:
+      return provider || 'market data'
+  }
+}
+
+function quantCompatLabel(status: string | null | undefined) {
+  switch ((status ?? '').toLowerCase()) {
+    case 'active':
+    case 'configured':
+      return 'Quant ready'
+    case 'planned':
+      return 'Quant hooks'
+    default:
+      return 'Quant'
+  }
+}
+
 /* ── card shell ── */
 function Card({
   title,
@@ -80,11 +110,11 @@ function Card({
 }) {
   return (
     <div
-      className={`flex flex-col animate-fade-in-up transition-all duration-200 hover:shadow-lg hover:-translate-y-0.5 ${className}`}
+      className={`flex flex-col animate-fade-in-up ${className}`}
       style={{
         backgroundColor: '#ffffff',
         border: '1px solid #d0dce8',
-        borderRadius: 12,
+        borderRadius: 8,
         overflow: 'hidden',
         animationDelay: `${delay}ms`,
         boxShadow: '0 1px 2px rgba(16,24,40,0.04)',
@@ -121,6 +151,8 @@ export default function Dashboard() {
   const [updateMsg, setUpdateMsg] = useState<string | null>(null)
   const [ibkrStatus, setIbkrStatus] = useState<IBKRStatus | null>(null)
   const [ibkrAccount, setIbkrAccount] = useState<IBKRAccount | null>(null)
+  const [marketDataStatus, setMarketDataStatus] = useState<MarketDataStatus | null>(null)
+  const [dashboardCompat, setDashboardCompat] = useState<DashboardCompatibilityStatus | null>(null)
   const [showFidelityWizard, setShowFidelityWizard] = useState(false)
   const [showCashFlowModal, setShowCashFlowModal] = useState(false)
 
@@ -163,15 +195,19 @@ export default function Dashboard() {
       const res = await post<{
         ibkr_positions: number
         ibkr_trades_synced: number
-        yfinance_updated: number
-        yfinance_total: number
+        market_data_updated?: number
+        market_data_total?: number
+        yfinance_updated?: number
+        yfinance_total?: number
         snapshot_written: boolean
         portfolio_nav: number | null
       }>('/portfolio/update-all')
+      const marketUpdated = res.market_data_updated ?? res.yfinance_updated ?? 0
+      const marketTotal = res.market_data_total ?? res.yfinance_total ?? 0
       const parts: string[] = []
       if (res.ibkr_positions > 0) parts.push(`IBKR: ${res.ibkr_positions} pos`)
       if (res.ibkr_trades_synced > 0) parts.push(`${res.ibkr_trades_synced} new trades`)
-      parts.push(`yf: ${res.yfinance_updated}/${res.yfinance_total}`)
+      parts.push(`market: ${marketUpdated}/${marketTotal}`)
       parts.push(`snapshot ${res.snapshot_written ? '✓' : '✗'}`)
       if (res.portfolio_nav != null)
         parts.push(`NAV $${res.portfolio_nav.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`)
@@ -186,7 +222,7 @@ export default function Dashboard() {
 
   // The single "Update Portfolio" action is contextual: on Fidelity it opens
   // the upload wizard (there's no live feed to refresh), everywhere else it
-  // triggers the real IBKR/yfinance update.
+  // triggers the real IBKR/market-data update.
   function handleUpdateClick() {
     if (selectedTab === 'fidelity') {
       setShowFidelityWizard(true)
@@ -226,6 +262,18 @@ export default function Dashboard() {
       .catch(() => setIbkrStatus(null))
   }, [])
 
+  useEffect(() => {
+    get<MarketDataStatus>('/market/provider/status')
+      .then(setMarketDataStatus)
+      .catch(() => setMarketDataStatus(null))
+  }, [])
+
+  useEffect(() => {
+    get<DashboardCompatibilityStatus>('/dashboard/capabilities')
+      .then(setDashboardCompat)
+      .catch(() => setDashboardCompat(null))
+  }, [])
+
   // Wait for summary before analytics on broker tabs so account_id is known.
   useEffect(() => {
     if (selectedTab === 'trades') return
@@ -237,6 +285,7 @@ export default function Dashboard() {
       setChartLoading(false)
       return
     }
+
     loadAnalytics()
   }, [period, selectedTab, brokerAccountId, loading, loadAnalytics])
 
@@ -277,12 +326,13 @@ export default function Dashboard() {
     : ibkrStatus.connected && ibkrStatus.authenticated
     ? '#16a34a'
     : '#d97706'
+  const quantModule = dashboardCompat?.modules.find((module) => module.key === 'quant-ingestion')
 
   return (
     <div className="flex flex-col min-h-screen" style={{ backgroundColor: '#e8edf5' }}>
       {/* Top white bar — logo, title/timestamp, IBKR dot, update action, account, settings */}
       <header
-        className="flex items-center justify-between px-6 shrink-0 gap-4"
+        className="flex items-center justify-between px-3 sm:px-6 shrink-0 gap-2 sm:gap-4"
         style={{ backgroundColor: '#ffffff', borderBottom: '1px solid #e2e8f0', height: 64, zIndex: 10 }}
       >
         <div className="flex items-center gap-4 min-w-0">
@@ -290,7 +340,7 @@ export default function Dashboard() {
             <img
               src="/logo.png"
               alt="DeKalb Capital"
-              style={{ height: 36, maxWidth: 160, objectFit: 'contain' }}
+              className="h-7 sm:h-9 w-auto max-w-[100px] sm:max-w-[160px] object-contain"
               onError={() => setLogoError(true)}
             />
           ) : (
@@ -309,8 +359,28 @@ export default function Dashboard() {
           </div>
         </div>
 
-        <div className="flex items-center gap-3 shrink-0">
+        <div className="flex items-center gap-1 sm:gap-3 shrink-0">
           {updateMsg && <span className="text-xs hidden lg:inline" style={{ color: '#9ca3af' }}>{updateMsg}</span>}
+          {marketDataStatus && (
+            <span
+              className="hidden md:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium"
+              style={{ borderColor: '#d0dce8', color: '#374151', backgroundColor: '#f8fafc' }}
+              title={`Market data provider: ${marketProviderLabel(marketDataStatus.active_provider)}`}
+            >
+              <Database size={14} color="#6b7a99" strokeWidth={1.8} />
+              {marketProviderLabel(marketDataStatus.active_provider)}
+            </span>
+          )}
+          {quantModule && (
+            <span
+              className="hidden xl:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium"
+              style={{ borderColor: '#d0dce8', color: '#374151', backgroundColor: '#f8fafc' }}
+              title={`Quant dashboard compatibility: ${quantModule.status}`}
+            >
+              <Construction size={14} color="#6b7a99" strokeWidth={1.8} />
+              {quantCompatLabel(quantModule.status)}
+            </span>
+          )}
           {ibkrStatus?.enabled && (
             <span
               title={ibkrStatus.connected && ibkrStatus.authenticated ? 'IBKR connected' : 'IBKR connecting'}
@@ -320,24 +390,26 @@ export default function Dashboard() {
           )}
           <button
             onClick={() => setShowCashFlowModal(true)}
-            className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium border transition-colors hover:bg-gray-50"
+            aria-label="Log deposit or withdrawal"
+            className="flex items-center gap-1.5 p-2 lg:px-3 lg:py-2 rounded-lg text-sm font-medium border transition-colors hover:bg-gray-50"
             style={{ borderColor: '#d0dce8', color: '#374151' }}
             title="Log a deposit or withdrawal so it doesn't get counted as gain/loss"
           >
             <Wallet size={15} />
-            Deposit/Withdrawal
+            <span className="hidden lg:inline">Deposit/Withdrawal</span>
           </button>
           <button
             onClick={handleUpdateClick}
             disabled={updating}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold shadow-sm hover:shadow-md disabled:opacity-50 disabled:shadow-none transition-all"
+            aria-label={updating ? 'Updating portfolio' : 'Update portfolio'}
+            className="flex items-center gap-2 p-2 sm:px-4 sm:py-2 rounded-lg text-sm font-semibold shadow-sm hover:shadow-md disabled:opacity-50 disabled:shadow-none transition-all"
             style={{ backgroundColor: '#1a2744', color: '#ffffff' }}
           >
             <RefreshCw size={15} className={updating ? 'animate-spin' : ''} />
-            {updating ? 'Updating…' : 'Update Portfolio'}
+            <span className="hidden sm:inline">{updating ? 'Updating…' : 'Update Portfolio'}</span>
           </button>
 
-          <div className="flex items-center" style={{ borderLeft: '1px solid #e2e8f0', paddingLeft: 12, gap: 6 }}>
+          <div className="hidden sm:flex items-center" style={{ borderLeft: '1px solid #e2e8f0', paddingLeft: 12, gap: 6 }}>
             <div
               className="flex items-center justify-center rounded-full transition-transform duration-150 hover:scale-105 cursor-pointer"
               style={{ width: 34, height: 34, backgroundColor: '#d1dce8' }}
@@ -355,10 +427,18 @@ export default function Dashboard() {
               <LogOut size={16} color="#9ca3af" strokeWidth={1.8} />
             </button>
           </div>
+          <button
+            onClick={signOut}
+            className="sm:hidden p-2 rounded-lg hover:bg-gray-50 transition-colors"
+            title="Sign out"
+            aria-label="Sign out"
+          >
+            <LogOut size={16} color="#9ca3af" strokeWidth={1.8} />
+          </button>
         </div>
       </header>
 
-      <div className="flex-1 p-6 pb-0 flex flex-col">
+      <div className="flex-1 p-4 sm:p-6 pb-0 flex flex-col min-w-0">
         {/* Tab row + period selector & search */}
         <div className="flex items-center justify-between flex-wrap gap-3 mb-4">
           <div className="flex items-end gap-1" style={{ borderBottom: '1px solid #e2e8f0' }}>
@@ -398,7 +478,7 @@ export default function Dashboard() {
           </div>
 
           {selectedTab !== 'trades' && (
-            <div className="flex items-center gap-3">
+            <div className="flex w-full sm:w-auto items-center gap-3 flex-wrap sm:flex-nowrap">
               <div className="flex bg-white border rounded-lg p-1 gap-0.5" style={{ borderColor: '#d0dce8' }}>
                 {PERIODS.map((p) => (
                   <button
@@ -417,8 +497,8 @@ export default function Dashboard() {
               </div>
 
               <div
-                className="flex items-center gap-2 px-3 py-1.5 rounded-lg transition-all focus-within:shadow-md"
-                style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8', minWidth: 180 }}
+                className="flex flex-1 sm:flex-none min-w-[140px] sm:min-w-[180px] items-center gap-2 px-3 py-1.5 rounded-lg transition-all focus-within:shadow-md"
+                style={{ backgroundColor: '#ffffff', border: '1px solid #d0dce8' }}
               >
                 <Search size={13} color="#9ca3af" />
                 <input
@@ -525,7 +605,7 @@ export default function Dashboard() {
                 }
                 subValue={
                   metrics?.spy_return_pct != null
-                    ? `SPY: ${fmtPct(Number(metrics.spy_return_pct))}`
+                    ? `${metrics.benchmark_symbol}: ${fmtPct(Number(metrics.spy_return_pct))}`
                     : undefined
                 }
                 positive={metrics?.total_return_pct == null ? null : Number(metrics.total_return_pct) >= 0}
@@ -558,14 +638,6 @@ export default function Dashboard() {
                 positive={metrics?.win_rate == null ? null : Number(metrics.win_rate) >= 50}
               />
               <MetricCard
-                label="Beta (vs SPY)"
-                value={
-                  chartLoading
-                    ? '...'
-                    : fmtNum(metrics?.beta != null ? Number(metrics.beta) : null) ?? '—'
-                }
-              />
-              <MetricCard
                 label="Std Dev (Annual)"
                 value={
                   chartLoading
@@ -579,7 +651,7 @@ export default function Dashboard() {
             <Card
               title="Performance Graph"
               delay={0}
-              action={<span className="text-xs" style={{ color: '#9ca3af' }}>Cumulative % vs SPY</span>}
+              action={<span className="text-xs" style={{ color: '#9ca3af' }}>Cumulative % vs {metrics?.benchmark_symbol ?? 'SPY'}</span>}
             >
               <div style={{ height: 360 }}>
                 {chartLoading ? (
@@ -587,9 +659,31 @@ export default function Dashboard() {
                     Loading...
                   </div>
                 ) : (
-                  <PerformanceChart data={performance} />
+                  <PerformanceChart
+                    data={performance}
+                    benchmarkSymbol={metrics?.benchmark_symbol}
+                  />
                 )}
               </div>
+            </Card>
+
+            <Card
+              title="Factor Analysis"
+              delay={80}
+              action={
+                <span className="text-xs" style={{ color: '#9ca3af' }}>
+                  Regression beta · top holdings
+                </span>
+              }
+            >
+              <ErrorBoundary label="Factor analysis">
+                <FactorAnalysisPanel
+                  period={period}
+                  accountId={brokerAccountId}
+                  defaultBenchmark={metrics?.benchmark_symbol ?? 'SPY'}
+                  refreshSignal={summary?.as_of}
+                />
+              </ErrorBoundary>
             </Card>
 
             {/* Current positions, full width, cash pinned + highlighted inside PositionsTable */}

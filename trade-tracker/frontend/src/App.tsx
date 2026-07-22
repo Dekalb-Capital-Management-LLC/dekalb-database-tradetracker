@@ -1,6 +1,7 @@
 import { AuthProvider, useAuth } from './auth/AuthContext'
 import Dashboard from './pages/Dashboard'
 import Login from './pages/Login'
+import ErrorBoundary from './components/ErrorBoundary'
 
 function AppRoutes() {
   const { config, user, loading } = useAuth()
@@ -10,5 +11,9 @@ function AppRoutes() {
 }
 
 export default function App() {
-  return <AuthProvider><AppRoutes /></AuthProvider>
+  return (
+    <ErrorBoundary label="Dashboard">
+      <AuthProvider><AppRoutes /></AuthProvider>
+    </ErrorBoundary>
+  )
 }

@@ -38,6 +38,24 @@ assets directory`.
   Workers static assets — see the SPA routing note below, it replaces the
   old `_redirects`-file approach.
 
+The frontend also includes `wrangler.toml` with `pages_build_output_dir = "./dist"`
+for Pages-compatible repo configuration.
+
+The repo root includes a separate `wrangler.toml` for Cloudflare Workers Builds.
+That file exists because the current GitHub check is attached to a Workers
+service, not a Pages project. It runs the frontend build from
+`trade-tracker/frontend` and deploys `trade-tracker/frontend/dist` as Workers
+Static Assets with SPA fallback. The root `.node-version` pins Cloudflare's
+build image to Node 22 because current Wrangler releases require Node 22+.
+The root `package.json` also makes a dashboard-configured `npm run build`
+work from the monorepo root. Its helper installs the locked frontend dependency
+tree only when it is absent, then builds the Vite app. This keeps normal local
+Windows/OneDrive builds from deleting an installed dependency tree while clean
+Cloudflare checkouts still use `npm ci`; `npm run build:ci` forces that clean
+install behavior when needed.
+If you want the simpler Pages flow instead, recreate/repoint Cloudflare as
+Pages with the root directory above.
+
 ## 2. Set the build-time env var
 
 - `VITE_API_BASE_URL` = your Railway API URL (no trailing slash, no `/api`

@@ -13,13 +13,14 @@ import type { PerformancePoint } from '../types'
 
 interface Props {
   data: PerformancePoint[]
+  benchmarkSymbol?: string
 }
 
 function fmtDate(d: string) {
   return new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
 }
 
-export default function PerformanceChart({ data }: Props) {
+export default function PerformanceChart({ data, benchmarkSymbol = 'SPY' }: Props) {
   if (!data.length) {
     return (
       <div className="flex flex-col items-center justify-center h-64 gap-2" style={{ color: '#9ca3af' }}>
@@ -34,11 +35,11 @@ export default function PerformanceChart({ data }: Props) {
   const chartData = data.map((p) => ({
     date: p.date,
     Portfolio: p.portfolio_cumulative_pct != null ? +Number(p.portfolio_cumulative_pct).toFixed(3) : null,
-    SPY: p.spy_cumulative_pct != null ? +Number(p.spy_cumulative_pct).toFixed(3) : null,
+    Benchmark: p.spy_cumulative_pct != null ? +Number(p.spy_cumulative_pct).toFixed(3) : null,
   }))
 
-  // Dual Y-axes so SPY (~±10%) isn't flattened to the zero line when the
-  // portfolio axis spans hundreds of percent.
+  // Dual Y-axes keep the benchmark visible when the portfolio has a much
+  // wider return range.
   return (
     <ResponsiveContainer width="100%" height={260}>
       <LineChart data={chartData} margin={{ top: 5, right: 20, left: 5, bottom: 5 }}>
@@ -61,7 +62,7 @@ export default function PerformanceChart({ data }: Props) {
           width={58}
         />
         <YAxis
-          yAxisId="spy"
+          yAxisId="benchmark"
           orientation="right"
           tickFormatter={(v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`}
           tick={{ fill: '#f97316', fontSize: 11 }}
@@ -96,9 +97,10 @@ export default function PerformanceChart({ data }: Props) {
           connectNulls
         />
         <Line
-          yAxisId="spy"
+          yAxisId="benchmark"
           type="monotone"
-          dataKey="SPY"
+          dataKey="Benchmark"
+          name={benchmarkSymbol}
           stroke="#f97316"
           dot={false}
           strokeWidth={1.5}
