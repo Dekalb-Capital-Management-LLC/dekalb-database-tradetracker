@@ -275,7 +275,8 @@ export default function FactorAnalysisPanel({
                           )}
                         </th>
                         {analysis.series.map((column, columnIndex) => {
-                          const value = analysis.correlations[rowIndex]?.[columnIndex] ?? null
+                          const rawValue = analysis.correlations[rowIndex]?.[columnIndex] ?? null
+                          const value = rawValue == null ? null : Number(rawValue)
                           const observations = analysis.correlation_observations[rowIndex]?.[columnIndex] ?? 0
                           return (
                             <td

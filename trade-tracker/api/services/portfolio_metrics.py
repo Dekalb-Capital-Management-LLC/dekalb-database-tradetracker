@@ -279,7 +279,10 @@ async def upsert_snapshot(
     Also fetches the benchmark close and stores it in the legacy spy_* columns.
     """
     benchmark_symbol = config.BENCHMARK_SYMBOL
-    spy_bars = get_historical_bars(benchmark_symbol, snapshot_date, snapshot_date)
+    # get_historical_bars can fall back to a blocking IBKR request; keep it off
+    # the event loop so a slow/degraded IBKR session doesn't stall every other
+    # concurrent request while this snapshot job (run every 5 min) is waiting.
+    spy_bars = await asyncio.to_thread(get_historical_bars, benchmark_symbol, snapshot_date, snapshot_date)
     spy_close = Decimal(str(spy_bars[0].close)) if spy_bars else None
 
     daily_pnl: Optional[Decimal] = None
@@ -294,7 +297,8 @@ async def upsert_snapshot(
     # Fetch the previous benchmark close to calculate its daily return.
     spy_daily_pct: Optional[Decimal] = None
     if spy_close:
-        prev_spy_bars = get_historical_bars(
+        prev_spy_bars = await asyncio.to_thread(
+            get_historical_bars,
             benchmark_symbol,
             snapshot_date - timedelta(days=5),  # look back enough to find last trading day
             snapshot_date - timedelta(days=1),

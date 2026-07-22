@@ -207,6 +207,19 @@ async def _auto_refresh_loop():
         await asyncio.sleep(INTERVAL)
 
 
+async def _ibkr_keepalive_loop():
+    """Keep the IBKR OAuth session alive; see IBKRClient.ensure_session for why."""
+    INTERVAL = 60
+    while True:
+        await asyncio.sleep(INTERVAL)
+        try:
+            healthy = await ibkr_client.ensure_session()
+            if not healthy:
+                logger.warning("IBKR keepalive: session unhealthy, will retry in %ss", INTERVAL)
+        except Exception as exc:
+            logger.warning("IBKR keepalive error: %s", exc)
+
+
 @app.on_event("startup")
 async def startup():
     await db.init_pool()
@@ -225,6 +238,7 @@ async def startup():
             )
             if ok:
                 asyncio.create_task(_startup_ibkr_trade_sync())
+            asyncio.create_task(_ibkr_keepalive_loop())
         else:
             logger.info(
                 "IBKR ENABLED — gateway at %s (account: %s)",

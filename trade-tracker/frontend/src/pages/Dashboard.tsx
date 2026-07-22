@@ -21,6 +21,7 @@ import PositionsTable from '../components/PositionsTable'
 import FidelityUpdateWizard from '../components/FidelityUpdateWizard'
 import CashFlowModal from '../components/CashFlowModal'
 import FactorAnalysisPanel from '../components/FactorAnalysisPanel'
+import ErrorBoundary from '../components/ErrorBoundary'
 import Trades from './Trades'
 
 const FIDELITY_WIZARD_SESSION_KEY = 'fidelity_wizard_prompted'
@@ -675,12 +676,14 @@ export default function Dashboard() {
                 </span>
               }
             >
-              <FactorAnalysisPanel
-                period={period}
-                accountId={brokerAccountId}
-                defaultBenchmark={metrics?.benchmark_symbol ?? 'SPY'}
-                refreshSignal={summary?.as_of}
-              />
+              <ErrorBoundary label="Factor analysis">
+                <FactorAnalysisPanel
+                  period={period}
+                  accountId={brokerAccountId}
+                  defaultBenchmark={metrics?.benchmark_symbol ?? 'SPY'}
+                  refreshSignal={summary?.as_of}
+                />
+              </ErrorBoundary>
             </Card>
 
             {/* Current positions, full width, cash pinned + highlighted inside PositionsTable */}
