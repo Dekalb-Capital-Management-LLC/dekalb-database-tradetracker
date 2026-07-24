@@ -989,7 +989,7 @@ def _blank_metrics(period: str) -> PortfolioMetrics:
         beta=None, beta_observations=0,
         std_dev_annualized=None, sharpe_ratio=None,
         total_return_pct=None, spy_return_pct=None, alpha=None,
-        max_drawdown_pct=None, win_rate=None, as_of=datetime.utcnow(),
+        max_drawdown_pct=None, win_rate=None, as_of=datetime.now(timezone.utc),
     )
 
 
@@ -1058,7 +1058,7 @@ async def _metrics_from_points(
         alpha=_dec(alpha),
         max_drawdown_pct=_dec(max_dd),
         win_rate=_dec(win_rate_val),
-        as_of=datetime.utcnow(),
+        as_of=datetime.now(timezone.utc),
     )
 
 

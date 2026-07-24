@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -169,7 +169,7 @@ async def _ibkr_portfolio_summary(pool) -> PortfolioSummary:
         total_realized_pnl=realized,
         total_unrealized_pnl=unrealized.quantize(Decimal("0.01")),
         positions=positions,
-        as_of=datetime.utcnow(),
+        as_of=datetime.now(timezone.utc),
     )
 
 
@@ -608,7 +608,7 @@ async def get_portfolio_summary(pool=Depends(get_pool)):
             total_realized_pnl=combined_realized.quantize(Decimal("0.01")),
             total_unrealized_pnl=combined_unrealized.quantize(Decimal("0.01")),
             positions=positions,
-            as_of=datetime.utcnow(),
+            as_of=datetime.now(timezone.utc),
         )
     except Exception as exc:
         logger.error("portfolio summary error: %s", exc)

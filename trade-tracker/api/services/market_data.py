@@ -10,7 +10,7 @@ import asyncio
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -87,7 +87,7 @@ def _cash_quote(symbol: str) -> PriceQuote:
         change_pct=None,
         previous_close=None,
         source="cash",
-        as_of=datetime.utcnow(),
+        as_of=datetime.now(timezone.utc),
     )
 
 
@@ -154,7 +154,7 @@ def _fetch_quote_yfinance(symbol: str) -> Optional[PriceQuote]:
             change_pct=round(change_pct, 4) if change_pct else None,
             previous_close=Decimal(str(round(prev_close, 4))) if prev_close else None,
             source="yfinance",
-            as_of=datetime.utcnow(),
+            as_of=datetime.now(timezone.utc),
         )
         _store_quote(symbol, quote)
         logger.debug("yfinance price for %s: %s", symbol, price)
@@ -448,7 +448,7 @@ def _fetch_quote_ibkr(symbol: str) -> Optional[PriceQuote]:
         change_pct=None,
         previous_close=None,
         source="ibkr",
-        as_of=datetime.utcnow(),
+        as_of=datetime.now(timezone.utc),
     )
     _store_quote(sym, quote)
     logger.debug("quote_source=ibkr symbol=%s price=%s", sym, price)
