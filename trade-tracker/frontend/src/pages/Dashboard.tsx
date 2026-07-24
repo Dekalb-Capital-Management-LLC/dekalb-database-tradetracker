@@ -333,7 +333,7 @@ export default function Dashboard() {
           <div className="hidden sm:block min-w-0" style={{ borderLeft: '1px solid #e2e8f0', paddingLeft: 16 }}>
             <h2 className="text-base font-semibold truncate" style={{ color: '#1a2744' }}>Portfolio Overview</h2>
             <p className="text-xs truncate" style={{ color: '#9ca3af' }}>
-              {summary ? `As of ${new Date(summary.as_of).toLocaleString()}` : ' '}
+              {summary ? `As of ${new Date(summary.as_of).toLocaleString('en-US', { timeZone: 'America/Chicago', timeZoneName: 'short' })}` : ' '}
             </p>
           </div>
         </div>
