@@ -4,7 +4,10 @@ import type { Trade, TradeLabel } from '../types'
 import { del, get, patch } from '../api/client'
 import LabelBadge from '../components/LabelBadge'
 
-const LABELS: TradeLabel[] = ['event-driven', 'hedge', 'long-term', 'short-term', 'unclassified']
+const LABELS: TradeLabel[] = [
+  'event-driven', 'hedge', 'long-term', 'short-term', 'unclassified',
+  'tech', 'energy', 'financials', 'healthcare', 'consumer', 'industrials',
+]
 
 function fmt$(n: number) {
   const abs = Math.abs(Number(n))

@@ -41,6 +41,10 @@ export interface PerformancePoint {
   spy_pct_change: number | null
   spy_cumulative_pct: number | null
   portfolio_cumulative_pct: number | null
+  /** Selected-ticker period TWR (same method as portfolio trade replay) */
+  watchlist_cumulative_pct?: number | null
+  /** Symbols whose first BUY is this date (x-axis markers) */
+  purchase_markers?: string[] | null
 }
 
 export interface PortfolioMetrics {
@@ -158,7 +162,10 @@ export interface CashFlow {
 
 export type Period = '1m' | '3m' | '6m' | 'ytd' | '1y'
 
-export type TradeLabel = 'event-driven' | 'hedge' | 'long-term' | 'short-term' | 'unclassified'
+export type TradeLabel =
+  | 'event-driven' | 'hedge' | 'long-term' | 'short-term' | 'unclassified'
+  | 'tech' | 'energy' | 'financials' | 'healthcare' | 'consumer' | 'industrials'
+
 
 export interface IBKRStatus {
   enabled: boolean

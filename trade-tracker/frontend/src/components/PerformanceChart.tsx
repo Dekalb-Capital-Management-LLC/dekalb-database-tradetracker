@@ -32,14 +32,22 @@ export default function PerformanceChart({ data, benchmarkSymbol = 'SPY' }: Prop
     )
   }
 
+  const hasWatch = data.some((p) => p.watchlist_cumulative_pct != null)
+
+  const purchaseMarks = data.flatMap((p) =>
+    (p.purchase_markers ?? []).map((symbol) => ({ date: p.date, symbol })),
+  )
+
   const chartData = data.map((p) => ({
     date: p.date,
     Portfolio: p.portfolio_cumulative_pct != null ? +Number(p.portfolio_cumulative_pct).toFixed(3) : null,
+    'My stocks': p.watchlist_cumulative_pct != null
+      ? +Number(p.watchlist_cumulative_pct).toFixed(3)
+      : null,
     Benchmark: p.spy_cumulative_pct != null ? +Number(p.spy_cumulative_pct).toFixed(3) : null,
   }))
 
-  // Dual Y-axes keep the benchmark visible when the portfolio has a much
-  // wider return range.
+  // Shared Y-axis so portfolio / my stocks / SPY are comparable.
   return (
     <ResponsiveContainer width="100%" height={260}>
       <LineChart data={chartData} margin={{ top: 5, right: 20, left: 5, bottom: 5 }}>
@@ -54,23 +62,28 @@ export default function PerformanceChart({ data, benchmarkSymbol = 'SPY' }: Prop
           minTickGap={60}
         />
         <YAxis
-          yAxisId="portfolio"
           tickFormatter={(v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`}
-          tick={{ fill: '#2563eb', fontSize: 11 }}
+          tick={{ fill: '#6b7a99', fontSize: 11 }}
           tickLine={false}
           axisLine={false}
           width={58}
         />
-        <YAxis
-          yAxisId="benchmark"
-          orientation="right"
-          tickFormatter={(v) => `${v >= 0 ? '+' : ''}${v.toFixed(1)}%`}
-          tick={{ fill: '#f97316', fontSize: 11 }}
-          tickLine={false}
-          axisLine={false}
-          width={50}
-        />
-        <ReferenceLine yAxisId="portfolio" y={0} stroke="#d0dce8" strokeDasharray="4 2" />
+        <ReferenceLine y={0} stroke="#d0dce8" strokeDasharray="4 2" />
+        {purchaseMarks.map((m) => (
+          <ReferenceLine
+            key={`${m.date}-${m.symbol}`}
+            x={m.date}
+            stroke="#059669"
+            strokeDasharray="3 3"
+            strokeOpacity={0.55}
+            label={{
+              value: m.symbol,
+              position: 'insideTopRight',
+              fill: '#059669',
+              fontSize: 10,
+            }}
+          />
+        ))}
         <Tooltip
           contentStyle={{
             backgroundColor: '#ffffff',
@@ -84,11 +97,14 @@ export default function PerformanceChart({ data, benchmarkSymbol = 'SPY' }: Prop
             `${value >= 0 ? '+' : ''}${value.toFixed(2)}%`,
             name,
           ]}
-          labelFormatter={fmtDate}
+          labelFormatter={(label: string) => {
+            const buys = purchaseMarks.filter((m) => m.date === label).map((m) => m.symbol)
+            const base = fmtDate(label)
+            return buys.length ? `${base} · bought ${buys.join(', ')}` : base
+          }}
         />
         <Legend wrapperStyle={{ fontSize: 12, color: '#6b7a99', paddingTop: 12 }} />
         <Line
-          yAxisId="portfolio"
           type="monotone"
           dataKey="Portfolio"
           stroke="#2563eb"
@@ -96,8 +112,17 @@ export default function PerformanceChart({ data, benchmarkSymbol = 'SPY' }: Prop
           strokeWidth={2}
           connectNulls
         />
+        {hasWatch && (
+          <Line
+            type="monotone"
+            dataKey="My stocks"
+            stroke="#059669"
+            dot={false}
+            strokeWidth={2}
+            connectNulls
+          />
+        )}
         <Line
-          yAxisId="benchmark"
           type="monotone"
           dataKey="Benchmark"
           name={benchmarkSymbol}

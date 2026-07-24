@@ -14,11 +14,20 @@ import type {
 } from '../types'
 import { get, post } from '../api/client'
 import { useAuth } from '../auth/AuthContext'
+import {
+  isCashSymbol,
+  matchesDashboardView,
+  unknownHeldSymbols,
+  useAnalyst,
+  type Analyst,
+} from '../auth/AnalystContext'
 import MetricCard from '../components/MetricCard'
 import PerformanceChart from '../components/PerformanceChart'
 import PositionsTable from '../components/PositionsTable'
 import FidelityUpdateWizard from '../components/FidelityUpdateWizard'
 import CashFlowModal from '../components/CashFlowModal'
+import AnalystSettingsModal from '../components/AnalystSettingsModal'
+import NewTickerPrompt from '../components/NewTickerPrompt'
 import FactorAnalysisPanel from '../components/FactorAnalysisPanel'
 import ErrorBoundary from '../components/ErrorBoundary'
 import Trades from './Trades'
@@ -34,6 +43,31 @@ const PERIODS: { value: Period; label: string }[] = [
 ]
 
 type TabKey = 'ibkr' | 'fidelity' | 'ironbeam' | 'trades'
+
+/** Symbols for the chart's "My stocks" overlay (held names, analyst-filtered). */
+function watchlistSymbols(
+  analyst: Analyst | null,
+  positions: PositionSummary[],
+): string[] {
+  const held = positions
+    .filter((p) => {
+      const sym = p.symbol.toUpperCase()
+      if (!sym || isCashSymbol(sym)) return false
+      return matchesDashboardView(p.symbol, p.label, analyst)
+    })
+    .sort((a, b) => Math.abs(Number(b.market_value ?? 0)) - Math.abs(Number(a.market_value ?? 0)))
+    .map((p) => p.symbol.toUpperCase())
+
+  // Cap at 6 (same as factor-analysis top holdings) so the chart stays readable.
+  const unique = [...new Set(held)].slice(0, 6)
+  if (unique.length) return unique
+
+  // Tickers mode with selections but no open lots yet — still chart selected names.
+  if (analyst?.onboarded && analyst.view_mode === 'tickers') {
+    return analyst.tickers.filter((t) => t.visible).map((t) => t.symbol.toUpperCase()).slice(0, 6)
+  }
+  return []
+}
 
 const TABS: { key: TabKey; label: string; disabled?: boolean }[] = [
   { key: 'ibkr', label: 'IBKR' },
@@ -123,6 +157,7 @@ function Card({
 
 export default function Dashboard() {
   const { signOut } = useAuth()
+  const { analyst } = useAnalyst()
   const [period, setPeriod] = useState<Period>('ytd')
   const [selectedTab, setSelectedTab] = useState<TabKey>('ibkr')
   const [symbolSearch, setSymbolSearch] = useState('')
@@ -141,6 +176,7 @@ export default function Dashboard() {
   const [marketDataStatus, setMarketDataStatus] = useState<MarketDataStatus | null>(null)
   const [showFidelityWizard, setShowFidelityWizard] = useState(false)
   const [showCashFlowModal, setShowCashFlowModal] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
 
   const accounts: AccountSummary[] = summary?.accounts ?? []
 
@@ -157,13 +193,23 @@ export default function Dashboard() {
       .finally(() => setLoading(false))
   }, [])
 
+  const watchSymbols = watchlistSymbols(
+    analyst,
+    (summary?.positions ?? []).filter(
+      (p) => !brokerAccountId || p.account_id === brokerAccountId,
+    ),
+  )
+
   const loadAnalytics = useCallback(() => {
     if (selectedTab === 'trades') return Promise.resolve()
     const param = brokerAccountId ? `&account_id=${encodeURIComponent(brokerAccountId)}` : ''
+    const symParam = watchSymbols.length
+      ? `&symbols=${encodeURIComponent(watchSymbols.join(','))}`
+      : ''
     setChartLoading(true)
     return Promise.allSettled([
       get<PortfolioMetrics>(`/portfolio/metrics?period=${period}${param}`),
-      get<PerformancePoint[]>(`/portfolio/performance?period=${period}${param}`),
+      get<PerformancePoint[]>(`/portfolio/performance?period=${period}${param}${symParam}`),
     ])
       .then(([metricsResult, perfResult]) => {
         if (metricsResult.status === 'fulfilled') setMetrics(metricsResult.value)
@@ -172,7 +218,7 @@ export default function Dashboard() {
         else setPerformance([])
       })
       .finally(() => setChartLoading(false))
-  }, [period, selectedTab, brokerAccountId])
+  }, [period, selectedTab, brokerAccountId, watchSymbols.join(',')])
 
   async function updatePortfolio() {
     setUpdating(true)
@@ -298,8 +344,10 @@ export default function Dashboard() {
     const matchSymbol = symbolSearch.trim()
       ? p.symbol.toUpperCase().includes(symbolSearch.trim().toUpperCase())
       : true
-    return matchAccount && matchSymbol
+    const matchView = matchesDashboardView(p.symbol, p.label, analyst)
+    return matchAccount && matchSymbol && matchView
   })
+  const promptSymbols = unknownHeldSymbols(allPositions, analyst)
 
   const ibkrDotColor = !ibkrStatus?.enabled
     ? '#c0ccd8'
@@ -389,11 +437,16 @@ export default function Dashboard() {
             <div
               className="flex items-center justify-center rounded-full transition-transform duration-150 hover:scale-105 cursor-pointer"
               style={{ width: 34, height: 34, backgroundColor: '#d1dce8' }}
-              title="Account"
+              title={analyst?.display_name ?? 'Account'}
+              onClick={() => setShowSettings(true)}
             >
               <User size={16} color="#6b7a99" />
             </div>
-            <button className="p-2 rounded-lg hover:bg-gray-50 transition-colors" title="Settings">
+            <button
+              className="p-2 rounded-lg hover:bg-gray-50 transition-colors"
+              title="Settings"
+              onClick={() => setShowSettings(true)}
+            >
               <Settings size={16} color="#9ca3af" strokeWidth={1.8} />
             </button>
             <button className="p-2 rounded-lg hover:bg-gray-50 transition-colors" title="Notifications">
@@ -522,6 +575,12 @@ export default function Dashboard() {
           />
         )}
 
+        {showSettings && (
+          <AnalystSettingsModal onClose={() => setShowSettings(false)} />
+        )}
+
+        <NewTickerPrompt symbols={promptSymbols} />
+
         {/* Error bar */}
         {error && (
           <div
@@ -627,7 +686,7 @@ export default function Dashboard() {
             <Card
               title="Performance Graph"
               delay={0}
-              action={<span className="text-xs" style={{ color: '#9ca3af' }}>Cumulative % vs {metrics?.benchmark_symbol ?? 'SPY'}</span>}
+              action={<span className="text-xs" style={{ color: '#9ca3af' }}>Portfolio · My stocks (TWR) · {metrics?.benchmark_symbol ?? 'SPY'}</span>}
             >
               <div style={{ height: 360 }}>
                 {chartLoading ? (
@@ -675,7 +734,22 @@ export default function Dashboard() {
               {loading ? (
                 <div className="text-sm" style={{ color: '#9ca3af' }}>Loading...</div>
               ) : (
-                <PositionsTable positions={filteredPositions} />
+                <PositionsTable
+                  positions={filteredPositions}
+                  onLabelChange={(accountId, symbol, label) => {
+                    setSummary((prev) => {
+                      if (!prev) return prev
+                      return {
+                        ...prev,
+                        positions: prev.positions.map((p) =>
+                          p.account_id === accountId && p.symbol === symbol
+                            ? { ...p, label }
+                            : p,
+                        ),
+                      }
+                    })
+                  }}
+                />
               )}
             </Card>
           </div>

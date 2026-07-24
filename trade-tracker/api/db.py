@@ -163,6 +163,41 @@ async def _apply_migrations(conn: asyncpg.Connection) -> None:
         WHERE account_id IS NOT NULL
     """)
 
+    # Analyst profiles: shared Google login → pick name → ticker or category view
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS analysts (
+            id            SERIAL PRIMARY KEY,
+            display_name  VARCHAR(80)  NOT NULL UNIQUE,
+            view_mode     VARCHAR(20)  NOT NULL DEFAULT 'tickers',
+            categories    TEXT[]       NOT NULL DEFAULT '{}',
+            onboarded     BOOLEAN      NOT NULL DEFAULT FALSE,
+            created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+        )
+    """)
+    # Upgrade older WIP analysts table (CREATE IF NOT EXISTS won't add columns)
+    await conn.execute("""
+        ALTER TABLE analysts
+        ADD COLUMN IF NOT EXISTS view_mode  VARCHAR(20) NOT NULL DEFAULT 'tickers',
+        ADD COLUMN IF NOT EXISTS categories TEXT[] NOT NULL DEFAULT '{}',
+        ADD COLUMN IF NOT EXISTS onboarded  BOOLEAN NOT NULL DEFAULT FALSE
+    """)
+    # Drop obsolete WIP columns if present
+    await conn.execute("ALTER TABLE analysts DROP COLUMN IF EXISTS preferences")
+    await conn.execute("ALTER TABLE analysts DROP COLUMN IF EXISTS followed_symbols")
+    await conn.execute("ALTER TABLE analysts DROP COLUMN IF EXISTS dismissed_symbols")
+    # Per-ticker category labels (dashboard positions click-to-edit).
+    # Trades rows are also updated so Trades page / filters stay in sync.
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS symbol_labels (
+            account_id  TEXT         NOT NULL,
+            symbol      VARCHAR(20)  NOT NULL,
+            label       VARCHAR(40)  NOT NULL,
+            updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (account_id, symbol)
+        )
+    """)
+
 
 def missing_required_tables(existing_tables: Iterable[str]) -> list[str]:
     return sorted(REQUIRED_TABLES.difference(existing_tables))
