@@ -268,9 +268,16 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
                         if unreal_d is not None and cost_basis and cost_basis != 0:
                             unreal_pct = (unreal_d / abs(cost_basis) * 100).quantize(Decimal("0.0001"))
 
-                    # pull label from trades table
+                    # Prefer explicit ticker label; fall back to trades MAX(label)
                     label_row = await pool.fetchrow(
-                        "SELECT MAX(label) AS label FROM trades WHERE account_id=$1 AND symbol=$2",
+                        """
+                        SELECT COALESCE(
+                            (SELECT label FROM symbol_labels
+                             WHERE account_id = $1 AND UPPER(symbol) = UPPER($2)),
+                            (SELECT MAX(label) FROM trades
+                             WHERE account_id = $1 AND UPPER(symbol) = UPPER($2))
+                        ) AS label
+                        """,
                         account_id, symbol,
                     )
                     positions.append(PositionSummary(
@@ -326,12 +333,14 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
         SELECT ip.symbol, ip.account_id, ip.quantity, ip.last_price,
                ip.current_value, ip.total_gain_loss, ip.total_gl_pct,
                ip.cost_basis_total, ip.avg_cost,
-               t.label
+               COALESCE(sl.label, t.label) AS label
         FROM imported_positions ip
+        LEFT JOIN symbol_labels sl
+          ON sl.account_id = ip.account_id AND UPPER(sl.symbol) = UPPER(ip.symbol)
         LEFT JOIN LATERAL (
             SELECT MAX(label) AS label
             FROM trades
-            WHERE account_id = ip.account_id AND symbol = ip.symbol
+            WHERE account_id = ip.account_id AND UPPER(symbol) = UPPER(ip.symbol)
         ) t ON TRUE
         {"WHERE ip.account_id = $1" if account_id else ""}
         ORDER BY ip.symbol
@@ -400,6 +409,13 @@ async def _compute_positions(pool, account_id: Optional[str] = None) -> list[Pos
         sym = row["symbol"].upper()
         if row["label"]:
             labels_by_acct_sym[(acct, sym)] = row["label"]
+
+    # Explicit ticker labels win over trade MAX(label)
+    sl_rows = await pool.fetch(
+        "SELECT account_id, UPPER(symbol) AS symbol, label FROM symbol_labels"
+    )
+    for r in sl_rows:
+        labels_by_acct_sym[(r["account_id"], r["symbol"])] = r["label"]
 
     all_symbols: list[str] = []
     open_by_acct: dict[str, dict[str, list[list[float]]]] = {}
@@ -563,6 +579,23 @@ async def _account_summary(pool, account_id: str) -> AccountSummary:
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+@router.get("/symbols")
+async def list_book_symbols(pool=Depends(get_pool)):
+    """Fast distinct symbols for analyst ticker onboarding (no IBKR/pricing)."""
+    rows = await pool.fetch(
+        """
+        SELECT DISTINCT UPPER(symbol) AS symbol FROM (
+            SELECT symbol FROM trades
+            UNION
+            SELECT symbol FROM imported_positions
+        ) s
+        WHERE symbol IS NOT NULL AND BTRIM(symbol) <> ''
+        ORDER BY 1
+        """
+    )
+    return [r["symbol"] for r in rows]
+
 
 @router.get("/summary", response_model=PortfolioSummary)
 async def get_portfolio_summary(pool=Depends(get_pool)):
@@ -779,12 +812,19 @@ async def update_all(pool=Depends(get_pool)):
 async def get_performance(
     period: str = Query("ytd"),
     account_id: Optional[str] = Query(None),
+    symbols: Optional[str] = Query(
+        None,
+        description="Comma-separated tickers for analyst watchlist overlay",
+    ),
     pool=Depends(get_pool),
 ):
     from services.portfolio_metrics import _period_bounds, get_performance_series
     start, end = _period_bounds(period)
+    sym_list = [s.strip().upper() for s in (symbols or "").split(",") if s.strip()] or None
     try:
-        return await get_performance_series(pool, start, end, account_id, period=period)
+        return await get_performance_series(
+            pool, start, end, account_id, period=period, symbols=sym_list,
+        )
     except Exception as exc:
         logger.error("performance series error: %s", exc)
         raise HTTPException(status_code=500, detail="Error computing performance series")

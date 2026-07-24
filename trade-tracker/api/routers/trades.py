@@ -4,6 +4,7 @@ Trade log router.
 Endpoints:
   GET  /trades                  - paginated trade list with filters
   GET  /trades/{id}             - single trade detail
+  PATCH /trades/symbol-label   - set category for all trades of a ticker
   PATCH /trades/{id}/label      - assign label + hedge flag
   DELETE /trades/reset          - wipe all trades + snapshots (use before switching accounts)
 """
@@ -18,7 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 import db
-from models.schemas import TradeLabelUpdate, TradeResponse
+from models.schemas import SymbolLabelUpdate, TradeLabelUpdate, TradeResponse
 
 router = APIRouter(prefix="/trades", tags=["trades"])
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ async def reset_all_data(pool=Depends(get_pool)):
         await pool.execute("DELETE FROM trades")
         await pool.execute("DELETE FROM portfolio_snapshots")
         await pool.execute("DELETE FROM imported_positions")
+        await pool.execute("DELETE FROM symbol_labels")
         await pool.execute("DELETE FROM fidelity_imports")
         logger.info("Data reset: all trades and snapshots cleared")
         return {"message": "All trades and snapshots deleted.", "trades_remaining": 0}
@@ -129,6 +131,62 @@ async def list_trades(
         raise HTTPException(status_code=500, detail="Database error fetching trades")
 
 
+@router.patch("/symbol-label")
+async def update_symbol_label(body: SymbolLabelUpdate, pool=Depends(get_pool)):
+    """
+    Set the category label for a ticker in an account.
+    Upserts symbol_labels and updates all matching trades rows.
+    """
+    account_id = (body.account_id or "").strip()
+    symbol = (body.symbol or "").strip().upper()
+    if not account_id or not symbol:
+        raise HTTPException(status_code=422, detail="account_id and symbol required")
+
+    try:
+        await pool.execute(
+            """
+            INSERT INTO symbol_labels (account_id, symbol, label, updated_at)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (account_id, symbol) DO UPDATE
+            SET label = EXCLUDED.label, updated_at = NOW()
+            """,
+            account_id,
+            symbol,
+            body.label,
+        )
+        status = await pool.execute(
+            """
+            UPDATE trades
+            SET label = $1, updated_at = NOW()
+            WHERE account_id = $2 AND UPPER(symbol) = $3
+            """,
+            body.label,
+            account_id,
+            symbol,
+        )
+    except Exception as exc:
+        logger.error("update_symbol_label error: %s", exc)
+        raise HTTPException(status_code=500, detail="Database error updating symbol label")
+
+    # asyncpg status like "UPDATE 3"
+    trades_updated = 0
+    try:
+        trades_updated = int(str(status).split()[-1])
+    except (ValueError, IndexError):
+        pass
+
+    logger.info(
+        "Symbol label %s/%s -> %s (trades_updated=%s)",
+        account_id, symbol, body.label, trades_updated,
+    )
+    return {
+        "account_id": account_id,
+        "symbol": symbol,
+        "label": body.label,
+        "trades_updated": trades_updated,
+    }
+
+
 @router.get("/{trade_id}", response_model=TradeResponse)
 async def get_trade(trade_id: int, pool=Depends(get_pool)):
     row = await pool.fetchrow(
@@ -183,6 +241,22 @@ async def update_trade_label(
 
     if not row:
         raise HTTPException(status_code=404, detail=f"Trade {trade_id} not found")
+
+    # Keep ticker-level label in sync (dashboard positions read symbol_labels first)
+    try:
+        await pool.execute(
+            """
+            INSERT INTO symbol_labels (account_id, symbol, label, updated_at)
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (account_id, symbol) DO UPDATE
+            SET label = EXCLUDED.label, updated_at = NOW()
+            """,
+            row["account_id"],
+            str(row["symbol"]).upper(),
+            body.label,
+        )
+    except Exception as exc:
+        logger.warning("symbol_labels sync after trade label failed: %s", exc)
 
     logger.info("Trade %d labelled as '%s'", trade_id, body.label)
     return dict(row)

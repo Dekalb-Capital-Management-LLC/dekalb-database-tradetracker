@@ -17,7 +17,10 @@ from pydantic import BaseModel, Field
 
 TradeSource = Literal["ibkr", "fidelity", "portfolio"]  # "portfolio" is legacy/deprecated — new rows use "fidelity"; kept here so old un-migrated rows still validate
 TradeSide = Literal["BUY", "SELL"]
-TradeLabel = Literal["event-driven", "hedge", "long-term", "short-term", "unclassified"]
+TradeLabel = Literal[
+    "event-driven", "hedge", "long-term", "short-term", "unclassified",
+    "tech", "energy", "financials", "healthcare", "consumer", "industrials",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +64,13 @@ class TradeLabelUpdate(BaseModel):
     label: TradeLabel
     is_hedge: Optional[bool] = None
     notes: Optional[str] = None
+
+
+class SymbolLabelUpdate(BaseModel):
+    """Set category label for every trade of a ticker in an account."""
+    account_id: str
+    symbol: str
+    label: TradeLabel
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +124,11 @@ class PerformancePoint(BaseModel):
     spy_pct_change: Optional[Decimal]         # benchmark daily % return (legacy field name)
     spy_cumulative_pct: Optional[Decimal]     # benchmark cumulative return (legacy field name)
     portfolio_cumulative_pct: Optional[Decimal]
+    # Equal-weight selected-ticker TWR for the period (same method as portfolio
+    # trade-replay path). Null before the basket has holdings in-window.
+    watchlist_cumulative_pct: Optional[Decimal] = None
+    # Symbols whose first BUY lands on this date (x-axis markers)
+    purchase_markers: Optional[list[str]] = None
 
 
 class PortfolioMetrics(BaseModel):
@@ -303,3 +318,37 @@ class CashFlowCreate(BaseModel):
 class CashFlowResponse(CashFlowCreate):
     id: int
     created_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# Analyst profiles (shared login → pick name → ticker or category view)
+# ---------------------------------------------------------------------------
+
+AnalystViewMode = Literal["tickers", "categories"]
+
+
+class AnalystCreate(BaseModel):
+    display_name: str = Field(..., min_length=1, max_length=80)
+
+
+class AnalystTickerPref(BaseModel):
+    symbol: str
+    visible: bool
+
+
+class AnalystUpdate(BaseModel):
+    view_mode: Optional[AnalystViewMode] = None
+    categories: Optional[list[str]] = None
+    tickers: Optional[list[AnalystTickerPref]] = None  # upsert visibility rows
+    onboarded: Optional[bool] = None
+
+
+class AnalystResponse(BaseModel):
+    id: int
+    display_name: str
+    view_mode: AnalystViewMode
+    categories: list[str]
+    tickers: list[AnalystTickerPref]
+    onboarded: bool
+    created_at: datetime
+    updated_at: datetime

@@ -278,6 +278,15 @@ async def upsert_snapshot(
     Upsert a portfolio NAV snapshot.
     Also fetches the benchmark close and stores it in the legacy spy_* columns.
     """
+    # ponytail: never stamp a wipeout NAV — empty IBKR sessions wrote $0 and
+    # made Today’s P&L = −prior_nav (−100%). Skip; keep the last good row.
+    if total_nav is None or total_nav <= 0:
+        logger.warning(
+            "Skipping snapshot %s account=%s — nav=%s (refusing non-positive NAV)",
+            snapshot_date, account_id, total_nav,
+        )
+        return
+
     benchmark_symbol = config.BENCHMARK_SYMBOL
     # get_historical_bars can fall back to a blocking IBKR request; keep it off
     # the event loop so a slow/degraded IBKR session doesn't stall every other
@@ -396,8 +405,11 @@ async def backfill_snapshots(pool: asyncpg.Pool) -> dict:
             """,
             acct_id, today,
         )
-        await upsert_snapshot(pool, today, nav, acct_id, nav,
-                              Decimal(str(prev["total_nav"])) if prev else None)
+        await upsert_snapshot(
+            pool, today, nav, acct_id,
+            equity_value=nav,
+            prev_nav=Decimal(str(prev["total_nav"])) if prev else None,
+        )
         combined_nav += nav
         written += 1
 
@@ -409,8 +421,11 @@ async def backfill_snapshots(pool: asyncpg.Pool) -> dict:
         """,
         today,
     )
-    await upsert_snapshot(pool, today, combined_nav, None, combined_nav,
-                          Decimal(str(prev_comb["total_nav"])) if prev_comb else None)
+    await upsert_snapshot(
+        pool, today, combined_nav, None,
+        equity_value=combined_nav,
+        prev_nav=Decimal(str(prev_comb["total_nav"])) if prev_comb else None,
+    )
     logger.info("backfill_snapshots: wrote %d account snapshot(s), combined_nav=%s", written, combined_nav)
     return {"accounts_written": written, "combined_nav": float(combined_nav)}
 
@@ -449,10 +464,12 @@ async def get_performance_series(
     end: date,
     account_id: Optional[str] = None,
     period: Optional[str] = None,
+    symbols: Optional[list[str]] = None,
 ) -> list[PerformancePoint]:
     # IBKR only: Portfolio Analyst TWR (real deposits/withdrawals). Never run
     # PA for Fidelity/other accounts — they use trade-replay TWR below with the
     # same prior-close windowing.
+    main: list[PerformancePoint] = []
     if (
         _is_ibkr_account(account_id)
         and config.IBKR_ENABLED
@@ -463,38 +480,99 @@ async def get_performance_series(
             None, _ibkr_pa_performance_series, account_id, period.lower(), start, end
         )
         if pa_pts:
-            return pa_pts
+            main = pa_pts
 
     # Fidelity (and IBKR fallback): trade replay TWR + cash_flows / implicit
     # deposits, prior-close baseline matching PA period windows.
-    if account_id and await _has_trades(pool, account_id):
+    if not main and account_id and await _has_trades(pool, account_id):
         trade_pts = await _trades_performance_series(pool, account_id, start, end)
         if trade_pts:
-            return trade_pts
+            main = trade_pts
 
-    rows = await _fetch_snapshots(pool, start, end, account_id)
-    # Only trust snapshots when they cover the requested window (main's
-    # coverage check). Otherwise prefer IBKR/trade replay below.
-    if len(rows) >= 2 and (rows[0]["snapshot_date"] - start) <= timedelta(days=3):
-        return _performance_from_snapshots(rows)
+    if not main:
+        rows = await _fetch_snapshots(pool, start, end, account_id)
+        # Only trust snapshots when they cover the requested window (main's
+        # coverage check). Otherwise prefer IBKR/trade replay below.
+        if len(rows) >= 2 and (rows[0]["snapshot_date"] - start) <= timedelta(days=3):
+            main = _performance_from_snapshots(rows)
 
-    if (
-        config.IBKR_ENABLED
-        and config.IBKR_ACCOUNT_ID
-        and (not account_id or account_id == config.IBKR_ACCOUNT_ID)
-        and not (account_id and await _has_trades(pool, account_id))
-    ):
-        loop = asyncio.get_event_loop()
-        ibkr_pts = await loop.run_in_executor(None, _ibkr_performance_series, start, end)
-        if ibkr_pts:
-            return ibkr_pts
+    if not main:
+        if (
+            config.IBKR_ENABLED
+            and config.IBKR_ACCOUNT_ID
+            and (not account_id or account_id == config.IBKR_ACCOUNT_ID)
+            and not (account_id and await _has_trades(pool, account_id))
+        ):
+            loop = asyncio.get_event_loop()
+            ibkr_pts = await loop.run_in_executor(None, _ibkr_performance_series, start, end)
+            if ibkr_pts:
+                main = ibkr_pts
 
-    # Nothing richer available — fall back to whatever real snapshot rows
-    # exist, even if they don't fully cover the requested window.
-    if rows:
-        return _performance_from_snapshots(rows)
+    if not main:
+        # Nothing richer available — fall back to whatever real snapshot rows
+        # exist, even if they don't fully cover the requested window.
+        rows = await _fetch_snapshots(pool, start, end, account_id)
+        if rows:
+            main = _performance_from_snapshots(rows)
 
-    return []
+    if not main:
+        return []
+
+    # Overlay: same trade-replay TWR as the portfolio path, but only the
+    # selected tickers (lot-only basket). Keeps purchase-date markers for UI.
+    sym_set = {s.strip().upper() for s in (symbols or []) if s and s.strip()}
+    if sym_set and account_id and await _has_trades(pool, account_id):
+        watch = await _trades_performance_series(
+            pool, account_id, start, end, symbols=sym_set,
+        )
+        by_date = {p.date: p.portfolio_cumulative_pct for p in watch}
+        markers = await _purchase_markers(pool, account_id, sym_set)
+        main_dates = {p.date for p in main}
+        # Forward-fill across empty-holding days / calendar mismatches so the
+        # chart doesn't show gaps (not weekends — those aren't in the series).
+        last_watch: Optional[Decimal] = None
+        merged = []
+        for p in main:
+            v = by_date.get(p.date)
+            if v is not None:
+                last_watch = v
+            merged.append(
+                p.model_copy(update={
+                    "watchlist_cumulative_pct": last_watch,
+                    "purchase_markers": (
+                        markers[p.date] if p.date in markers and p.date in main_dates else None
+                    ),
+                })
+            )
+        main = merged
+
+    return main
+
+
+async def _purchase_markers(
+    pool: asyncpg.Pool,
+    account_id: str,
+    symbols: set[str],
+) -> dict[date, list[str]]:
+    """First BUY date per symbol → marker labels on the performance chart."""
+    if not symbols:
+        return {}
+    rows = await pool.fetch(
+        """
+        SELECT UPPER(symbol) AS symbol, MIN(trade_date::date) AS first_buy
+        FROM trades
+        WHERE account_id = $1
+          AND side = 'BUY'
+          AND UPPER(symbol) = ANY($2::text[])
+        GROUP BY UPPER(symbol)
+        """,
+        account_id,
+        sorted(symbols),
+    )
+    out: dict[date, list[str]] = defaultdict(list)
+    for r in rows:
+        out[r["first_buy"]].append(r["symbol"])
+    return {d: sorted(syms) for d, syms in out.items()}
 
 
 def _apply_trade_cash(
@@ -552,6 +630,7 @@ async def _trades_performance_series(
     account_id: str,
     start: date,
     end: date,
+    symbols: Optional[set[str]] = None,
 ) -> list[PerformancePoint]:
     """
     Replay synced trades → daily holdings, mark-to-market, time-weighted return.
@@ -561,6 +640,9 @@ async def _trades_performance_series(
     otherwise drive cash negative) is excluded from daily return so deposits
     don't look like investment gains. Period windows use a prior-close
     baseline — same convention as IBKR PA period pickers.
+
+    When ``symbols`` is set, only those tickers are replayed as an equity
+    basket (lot-only) for the analyst "my stocks" overlay.
     """
     rows = await pool.fetch(
         """
@@ -572,15 +654,20 @@ async def _trades_performance_series(
         account_id,
         end,
     )
+    basket = bool(symbols)
+    if symbols:
+        want = {s.upper() for s in symbols}
+        rows = [r for r in rows if r["symbol"].upper() in want]
     if not rows:
         return []
 
     # Lot-only sheets (all BUYs, no SELLs, no cash ledger): value equity only
     # and treat each buy cost as an implicit deposit.
+    # Symbol-filtered baskets always use lot-only (ignore account cash flows).
     has_sells = any(r["side"] == "SELL" for r in rows)
-    lot_only = not has_sells
+    lot_only = (not has_sells) or basket
 
-    symbols = sorted({r["symbol"].upper() for r in rows})
+    hist_symbols = sorted({r["symbol"].upper() for r in rows})
     loop = asyncio.get_event_loop()
     spy_bars = await loop.run_in_executor(None, get_spy_history, start, end)
     if not spy_bars:
@@ -594,13 +681,15 @@ async def _trades_performance_series(
     hist_start = min(start, first_trade_d)
 
     batch = await loop.run_in_executor(
-        None, get_historical_bars_batch, symbols, hist_start, end
+        None, get_historical_bars_batch, hist_symbols, hist_start, end
     )
     closes: dict[str, dict[date, float]] = {
         sym: {b.date: float(b.close) for b in batch.get(sym, [])}
-        for sym in symbols
+        for sym in hist_symbols
     }
-    flows_by_date = await _cash_flows_by_date(pool, account_id, hist_start, end)
+    flows_by_date = (
+        {} if basket else await _cash_flows_by_date(pool, account_id, hist_start, end)
+    )
 
     # Replay calendar = SPY bars from hist_start (trading days only)
     all_spy = await loop.run_in_executor(None, get_spy_history, hist_start, end)
@@ -616,6 +705,7 @@ async def _trades_performance_series(
     prev_spy: Optional[float] = None
     cum_factor = 1.0
     spy_base: Optional[float] = None
+    last_port_cum: Optional[float] = None
 
     for bar in all_spy:
         d = bar.date
@@ -632,10 +722,17 @@ async def _trades_performance_series(
             commission = float(t["commission"] or 0)
             if lot_only:
                 if t["side"] == "BUY":
+                    # Deposit funding the purchase (excluded from return).
                     flow_today += qty * price + commission
                     holdings[sym] += qty
                 else:
+                    # Withdrawal of sale proceeds (excluded from return).
+                    # Without this, NAV dropping on a sell looks like a loss —
+                    # basket overlays with round-trips then cliff to ~-100%.
+                    flow_today -= qty * price - commission
                     holdings[sym] -= qty
+                    if abs(holdings[sym]) < 1e-9:
+                        holdings[sym] = 0.0
             else:
                 if t["side"] == "BUY":
                     cash, implicit = _apply_trade_cash(cash, "BUY", qty, price, commission)
@@ -654,6 +751,29 @@ async def _trades_performance_series(
         equity = _mark_equity(holdings, closes, last_close, d)
         port_val = equity if lot_only else cash + equity
         if port_val <= 0:
+            # Flat / empty book: break the TWR chain so the next buy doesn't
+            # compare against a stale pre-exit NAV.
+            prev_port = None
+            # Basket overlay: keep emitting a flat cum % so the chart has no gaps
+            # while capital is out of the market (weekends already excluded via SPY calendar).
+            if (
+                basket
+                and d >= start
+                and spy_base is not None
+                and last_port_cum is not None
+            ):
+                spy_cum = (float(bar.close) - spy_base) / spy_base * 100
+                points.append(
+                    PerformancePoint(
+                        date=d,
+                        portfolio_nav=Decimal("0"),
+                        portfolio_pct_change=Decimal("0"),
+                        spy_pct_change=None,
+                        spy_cumulative_pct=Decimal(str(round(spy_cum, 4))),
+                        portfolio_cumulative_pct=Decimal(str(round(last_port_cum, 4))),
+                    )
+                )
+                prev_spy = float(bar.close)
             continue
 
         # Warm holdings/cash/prev before the window; do not publish yet.
@@ -702,6 +822,7 @@ async def _trades_performance_series(
 
         prev_port = port_val
         prev_spy = float(bar.close)
+        last_port_cum = port_cum
 
         points.append(
             PerformancePoint(
